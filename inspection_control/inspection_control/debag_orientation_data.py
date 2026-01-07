@@ -24,8 +24,8 @@ def generate_orientation_plots(csv_filepath):
     # Convert timestamps to seconds relative to start
     timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6))
-    #fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(4, 1, figsize=(10, 12))
+    # fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes[0].plot(timestamps_sec, df['error_x'], label='Error X')
     axes[0].plot(timestamps_sec, df['error_y'], label='Error Y')
     axes[0].plot(timestamps_sec, df['error_z'], label='Error Z')
@@ -41,6 +41,21 @@ def generate_orientation_plots(csv_filepath):
     axes[1].set_xlabel('Time (s)')
     axes[1].set_ylabel('Torque (Nm)')
     axes[1].legend()
+    # Add Cam Force and Torque plots
+    axes[2].plot(timestamps_sec, df['cam_force_x'], label='Cam Force X')
+    axes[2].plot(timestamps_sec, df['cam_force_y'], label='Cam Force Y')
+    axes[2].plot(timestamps_sec, df['cam_force_z'], label='Cam Force Z')
+    axes[2].set_title('Camera Force Commands Over Time')
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_ylabel('Force (N)')
+    axes[2].legend()
+    axes[3].plot(timestamps_sec, df['cam_torque_x'], label='Cam Torque X')
+    axes[3].plot(timestamps_sec, df['cam_torque_y'], label='Cam Torque Y')
+    axes[3].plot(timestamps_sec, df['cam_torque_z'], label='Cam Torque Z')
+    axes[3].set_title('Camera Torque Commands Over Time')
+    axes[3].set_xlabel('Time (s)')
+    axes[3].set_ylabel('Torque (Nm)')
+    axes[3].legend()
     # # --- Rotational error (rotvec_error) ---
     # ax = axes[0, 0]
     # ax.plot(timestamps_sec, df['error_x'], label='Error X')
@@ -187,7 +202,12 @@ def debag(bag_file):
         'torque_x',
         'torque_y',
         'torque_z',
-    
+        'cam_force_x',
+        'cam_force_y',
+        'cam_force_z',
+        'cam_torque_x',
+        'cam_torque_y',
+        'cam_torque_z',
         'k_p',
         'k_d',
         'k_i',
@@ -216,7 +236,12 @@ def debag(bag_file):
         first_msg.torque_cmd.x,
         first_msg.torque_cmd.y,
         first_msg.torque_cmd.z,
-   
+        first_msg.cam_force_cmd.x,
+        first_msg.cam_force_cmd.y,
+        first_msg.cam_force_cmd.z,
+        first_msg.cam_torque_cmd.x,
+        first_msg.cam_torque_cmd.y,
+        first_msg.cam_torque_cmd.z,
         first_msg.k_p,
         first_msg.k_d,
         first_msg.k_i,
@@ -266,7 +291,12 @@ def debag(bag_file):
             msg.torque_cmd.x,
             msg.torque_cmd.y,
             msg.torque_cmd.z,
-           
+            msg.cam_force_cmd.x,
+            msg.cam_force_cmd.y,
+            msg.cam_force_cmd.z,
+            msg.cam_torque_cmd.x,
+            msg.cam_torque_cmd.y,
+            msg.cam_torque_cmd.z,
             msg.k_p,
             msg.k_d,
             msg.k_i,
