@@ -23,7 +23,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from viewpoint_generation_interfaces.msg import OrientationControlData
-from geometry_msgs.msg import Point, Vector3
+from geometry_msgs.msg import PointStamped, Point, Vector3
 
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
 from rclpy.serialization import serialize_message
@@ -303,6 +303,8 @@ class OrientationControlNode(Node):
             WrenchStamped, f'/{self.get_name()}/wrench_cmds', 10
         )
 
+        self.force = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.tau_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
         # keep a “last torque” handy so we can report it in the bundle
         self._last_tau = np.zeros(3, dtype=np.float32)
         self._last_force = np.zeros(3, dtype=np.float32)   # <<< NEW
@@ -654,8 +656,8 @@ class OrientationControlNode(Node):
                             tau_out = tau.copy()                                                     # <<< NEW
                             self._last_tau = tau.copy()                                              # <<< NEW
                             Inertia_A = self.inertia + self.mass * d**2 # rotational inertia for torque control
-                            force = (self.mass/Inertia_A) * np.cross(tau,cen_s)  # simple proportional model for force command based on torque command
-                            tau_cam = (self.inertia/Inertia_A) * tau  # torque about camera origin
+                            self.force = 3 * (self.mass/Inertia_A) * np.cross(tau,-cen_s)  # simple proportional model for force command based on torque command
+                            self.tau_cam = (self.inertia/Inertia_A) * tau  # torque about camera origin
                             # Saturation (optional)
                             # lim = self.torque_limit
                             # tau = np.clip(tau, -lim, lim)
@@ -664,12 +666,12 @@ class OrientationControlNode(Node):
                             w = WrenchStamped()
                             w.header = self.depth_msg.header
                             w.header.frame_id = self.main_camera_frame
-                            w.wrench.force.x = float(force[0])
-                            w.wrench.force.y = float(force[1])
-                            w.wrench.force.z = float(force[2])
-                            w.wrench.torque.x = float(tau_cam[0])
-                            w.wrench.torque.y = float(tau_cam[1])
-                            w.wrench.torque.z = float(tau_cam[2])  # will be ~0 for Z-only error
+                            w.wrench.force.x = float(self.force[0])
+                            w.wrench.force.y = float(self.force[1])
+                            w.wrench.force.z = float(self.force[2])
+                            w.wrench.torque.x = float(self.tau_cam[0])
+                            w.wrench.torque.y = float(self.tau_cam[1])
+                            w.wrench.torque.z = float(self.tau_cam[2])  # will be ~0 for Z-only error
                             self.pub_wrench_cmd.publish(w)
                         else:
                             tau_out = np.zeros(3, dtype=np.float32)
@@ -724,6 +726,8 @@ class OrientationControlNode(Node):
         # Use the torque we computed this cycle; if none, fall back to last commanded (zeros otherwise)
         tau_for_msg = tau_out if measurement_ok else self._last_tau
         self.ocd.torque_cmd = Vector3(x=float(tau_for_msg[0]), y=float(tau_for_msg[1]), z=float(tau_for_msg[2]))
+        self.ocd.cam_force_cmd = Vector3(x=float(self.force[0]), y=float(self.force[1]), z=float(self.force[2]))  # <<< NEW
+        self.ocd.cam_torque_cmd = Vector3(x=float(self.tau_cam[0]), y=float(self.tau_cam[1]), z=float(self.tau_cam[2]))  # <<< NEW
 
        # self.ocd.force_cmd = Vector3(x=float(force[0]),y=float(force[1]),z=float(force[2]),)  # <<< NEW
        # self.ocd.torque_cmd_cam = Vector3(x=float(tau_cam[0]), y=float(tau_cam[1]), z=float(tau_cam[2]))  # <<< NEW
