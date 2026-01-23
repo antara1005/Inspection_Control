@@ -266,10 +266,10 @@ class OrientationControlNode(Node):
             serialization_format='cdr')
         
         
-        self.mass = float(self.get_parameter('sphere_mass').value)  # mass of the object in kg for force control   # <<< NEW
+        self.mass_B = float(self.get_parameter('sphere_mass').value)  # mass of the object in kg for force control   # <<< NEW
         self.sphere_radius = float(self.get_parameter('sphere_radius').value)
         self.fluid_viscosity = float(self.get_parameter('fluid_viscosity').value)
-        self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+        self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
 
         # QoS profile
         qos = QoSProfile(
@@ -330,10 +330,10 @@ class OrientationControlNode(Node):
         )
         self.distance_pub = self.create_publisher(Float64, f'/{self.get_name()}/focal_distance_m', 10)
 
-        self.force = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.force_B = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.lin_vel_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.rot_vel_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
-        self.tau_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.tau_B = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.force_teleop = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.torque_teleop = np.zeros(3, dtype=np.float32)  # <<< NEW
         # keep a “last torque” handy so we can report it in the bundle
@@ -372,7 +372,7 @@ class OrientationControlNode(Node):
         """Update inertia and drag coefficients based on mass, radius, and fluid viscosity."""
         # Inertia for solid sphere: I = 2/5 m r²
         I = (2.0 / 5.0) * mass * (radius ** 2)
-        self.inertia = I
+        self.inertia_B = I
 
         # Linear drag coefficients: D = 6πμr
         self.linear_drag = 6.0 * 3.141592653589793 * fluid_viscosity * radius
@@ -381,7 +381,7 @@ class OrientationControlNode(Node):
         self.angular_drag = 2.4 * 3.141592653589793 * fluid_viscosity * (radius ** 3)
 
         self.get_logger().info(
-            f'Updated inertia to {self.inertia} kg·m² and drag to {self.linear_drag} N·s/m, {self.angular_drag} N·m·s/rad'
+            f'Updated inertia to {self.inertia_B} kg·m² and drag to {self.linear_drag} N·s/m, {self.angular_drag} N·m·s/rad'
         )
 
     def joy_callback(self, msg):
@@ -741,18 +741,22 @@ class OrientationControlNode(Node):
                             Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
                             Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
                             Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
-                            tau = (Kp_vec * omega + Ki_vec * self._int_rotvec_err + Kd_vec * domega).astype(np.float32)                # <<< NEW
+                            tau_A = (Kp_vec * omega + Ki_vec * self._int_rotvec_err + Kd_vec * domega).astype(np.float32)                # <<< NEW
                             tau_max = self.linear_drag*d*self.v_max
-                            tau = np.clip(tau, -tau_max, tau_max)
-                            Inertia_A = self.inertia + self.mass * d**2 # rotational inertia for torque control
-                            self.ang_acc = (self.linear_drag * np.cross(self.lin_vel_cam, r) + tau+ np.cross(r, self.force_teleop))/ Inertia_A  # <<< NEW
-                            tau_out = tau.copy()                                                     # <<< NEW
-                            self._last_tau = tau.copy()                                              # <<< NEW
-                            self.force = self.mass * np.cross(self.ang_acc,r) + self.linear_drag * self.lin_vel_cam - self.force_teleop  # simple proportional model for force command based on torque command
+                            tau_A = np.clip(tau_A, -tau_max, tau_max)
+                            inertia_A = self.inertia_B + self.mass_B * d**2 # rotational inertia for torque control
+                            moment_tele_A = np.cross(r, self.force_teleop)
+                            force_drag_B = -self.linear_drag * self.lin_vel_cam
+                            moment_drag_B = -self.angular_drag * self.rot_vel_cam
+                            moment_dragB_A = np.cross(r, force_drag_B)
+                            self.ang_acc = (moment_dragB_A + tau_A + moment_tele_A)/ inertia_A  # <<< NEW
+                            tau_out = tau_A.copy()                                                     # <<< NEW
+                            self._last_tau = tau_A.copy()                                              # <<< NEW
+                            self.force_B = self.mass_B * np.cross(self.ang_acc,r) - force_drag_B - self.force_teleop  # simple proportional model for force command based on torque command
                             # Centripetal force command
                             # self.force[2] = self.mass * np.linalg.norm(self.lin_vel_cam)**2 / np.linalg.norm(cen_s)
-                            self.tau_cam = self.inertia * self.ang_acc + self.angular_drag * self.rot_vel_cam - self.torque_teleop  # torque about camera origin
-                            
+                            self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop  # torque about camera origin
+
                             self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
                             # Saturation (optional)
                             # lim = self.torque_limit
@@ -762,12 +766,12 @@ class OrientationControlNode(Node):
                             w = WrenchStamped()
                             w.header = self.depth_msg.header
                             w.header.frame_id = self.main_camera_frame
-                            w.wrench.force.x = float(self.force[0])
-                            w.wrench.force.y = float(self.force[1])
-                            w.wrench.force.z = float(self.force[2]) # Centripetal force command
-                            w.wrench.torque.x = float(self.tau_cam[0])
-                            w.wrench.torque.y = float(self.tau_cam[1])
-                            w.wrench.torque.z = float(self.tau_cam[2])  # will be ~0 for Z-only error
+                            w.wrench.force.x = float(self.force_B[0])
+                            w.wrench.force.y = float(self.force_B[1])
+                            w.wrench.force.z = float(self.force_B[2]) # Centripetal force command
+                            w.wrench.torque.x = float(self.tau_B[0])
+                            w.wrench.torque.y = float(self.tau_B[1])
+                            w.wrench.torque.z = float(self.tau_B[2])  # will be ~0 for Z-only error
                             self.pub_wrench_cmd.publish(w)
                         else:
                             tau_out = np.zeros(3, dtype=np.float32)
@@ -822,8 +826,8 @@ class OrientationControlNode(Node):
         # Use the torque we computed this cycle; if none, fall back to last commanded (zeros otherwise)
         tau_for_msg = tau_out if measurement_ok else self._last_tau
         self.ocd.torque_cmd = Vector3(x=float(tau_for_msg[0]), y=float(tau_for_msg[1]), z=float(tau_for_msg[2]))
-        self.ocd.cam_force_cmd = Vector3(x=float(self.force[0]), y=float(self.force[1]), z=float(self.force[2]))  # <<< NEW
-        self.ocd.cam_torque_cmd = Vector3(x=float(self.tau_cam[0]), y=float(self.tau_cam[1]), z=float(self.tau_cam[2]))  # <<< NEW
+        self.ocd.cam_force_cmd = Vector3(x=float(self.force_B[0]), y=float(self.force_B[1]), z=float(self.force_B[2]))  # <<< NEW
+        self.ocd.cam_torque_cmd = Vector3(x=float(self.tau_B[0]), y=float(self.tau_B[1]), z=float(self.tau_B[2]))  # <<< NEW
 
        # self.ocd.force_cmd = Vector3(x=float(force[0]),y=float(force[1]),z=float(force[2]),)  # <<< NEW
        # self.ocd.torque_cmd_cam = Vector3(x=float(tau_cam[0]), y=float(tau_cam[1]), z=float(tau_cam[2]))  # <<< NEW
@@ -948,17 +952,17 @@ class OrientationControlNode(Node):
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
             elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
-                self.mass = float(p.value)
-                self.get_logger().info(f'Updated sphere_mass to {self.mass:.3f} kg')
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.mass_B = float(p.value)
+                self.get_logger().info(f'Updated sphere_mass to {self.mass_B:.3f} kg')
+                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
             elif p.name == 'sphere_radius' and p.type_ == p.Type.DOUBLE:
                 self.sphere_radius = float(p.value)
                 self.get_logger().info(f'Updated sphere_radius to {self.sphere_radius:.3f} m')
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
             elif p.name == 'fluid_viscosity' and p.type_ == p.Type.DOUBLE:
                 self.fluid_viscosity = float(p.value)
                 self.get_logger().info(f'Updated fluid_viscosity to {self.fluid_viscosity:.6f} Pa·s')
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
         
         result = SetParametersResult()
         result.successful = True
