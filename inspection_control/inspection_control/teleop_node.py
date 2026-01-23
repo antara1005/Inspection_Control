@@ -4,6 +4,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
+from rcl_interfaces.msg import SetParametersResult
+
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import Header
@@ -133,6 +135,9 @@ class TeleopNode(Node):
         self.get_logger().info(f'Publishing at {self.publish_rate} Hz')
         self.get_logger().info(f'Enable button: {self.enable_button}')
 
+        # ---------------- Parameter update callback ----------------
+        self.add_on_set_parameters_callback(self._on_param_update)
+
     def joy_callback(self, msg):
         """
         Process incoming Joy messages and update wrench command.
@@ -242,12 +247,17 @@ class TeleopNode(Node):
         # Publish the message
         self.wrench_pub.publish(self.current_wrench)
 
-        # Optional: Log current velocities (uncomment for debugging)
-        # self.get_logger().debug(
-        #     f'Publishing: linear={self.current_twist.twist.linear.x:.2f}, '
-        #     f'angular={self.current_twist.twist.angular.z:.2f}'
-        # )
+    def _on_param_update(self, params):
+        for p in params:
+            if p.name == 'force_scale' and p.type_ == p.Type.DOUBLE:
+                self.force_scale = p.value
+            elif p.name == 'torque_scale' and p.type_ == p.Type.DOUBLE:
+                self.torque_scale = p.value
+                
+        result = SetParametersResult()
+        result.successful = True
 
+        return result
 
 def main(args=None):
     """Main entry point."""

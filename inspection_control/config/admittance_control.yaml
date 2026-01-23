@@ -1,5 +1,5 @@
 # Space Mouse Configuration for TeleopTwistStampedJoy
-admittance_control_combine:
+admittance_control:
   ros__parameters:
     # Publishing rate (Hz)
     publish_rate: 10.0
@@ -7,17 +7,19 @@ admittance_control_combine:
     # Scaling factors
    # force_scale: 1.0      # Max linear velocity (m/s)
     #torque_scale: 1.0     # Max angular velocity (rad/s)
-    mass: 10.0
-    inertia_x: 10.0
-    inertia_y: 10.0
-    inertia_z: 10.0
-    linear_drag_x: 50.0
-    linear_drag_y: 50.0
-    linear_drag_z: 50.0
-    rotational_drag_x: 50.0
-    rotational_drag_y: 50.0
-    rotational_drag_z: 50.0
-  
+    sphere_mass: 2.5 # mass of the object in kg for force control (kg)
+    # inertia_x: 10.0
+    # inertia_y: 10.0
+    # inertia_z: 10.0
+    # linear_drag_x: 100.0
+    # linear_drag_y: 100.0
+    # linear_drag_z: 100.0
+    # rotational_drag_x: 100.0
+    # rotational_drag_y: 100.0
+    # rotational_drag_z: 100.0
+    sphere_radius: 0.65  # Radius of the virtual sphere for admittance control (meters)
+    fluid_viscosity: 1.0  # Viscosity coefficient for damping (Pa·s)
+
     
     # Frame ID for the twist messages
     frame_id: "eoat_camera_link"

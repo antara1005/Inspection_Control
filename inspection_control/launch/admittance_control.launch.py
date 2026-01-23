@@ -101,7 +101,7 @@ def generate_launch_description():
     admittance_control_combine_node = Node(
         package='inspection_control',
         executable='admittance_control_combine',
-        name='admittance_control_combine',
+        name='admittance_control',
         parameters=[admittance_control_combine_config],
         output='screen',
         emulate_tty=True

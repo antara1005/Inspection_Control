@@ -5,8 +5,8 @@ teleop:
     publish_rate: 10.0
     
     # Scaling factors
-    force_scale: 50.0      # Max linear velocity (m/s)
-    torque_scale: 50.0     # Max angular velocity (rad/s)
+    force_scale: 5.0      # Max linear velocity (m/s)
+    torque_scale: 5.0     # Max angular velocity (rad/s)
     
     x_axis: 0         # Camera pan left/right (Stick X)
     y_axis: 1         # Camera pan up/down (Stick Z)
@@ -14,7 +14,7 @@ teleop:
     z_axis_push: 5         # Camera push (Stick Y)
     z_axis_pull: 2         # Camera pull (Stick Y)
     roll_axis_positive: 3       # Camera roll along positive Z-axis
-    roll_axis_negative: 0       # Camera roll along negative Z-axis
+    roll_axis_negative: 2       # Camera roll along negative Z-axis
     pitch_axis: 4       # Camera pitch along x-axis
     yaw_axis: 3         # Camera yaw along yaxis
     enable_button: -1       # Safety button to enable/disable control (-1 fr no safety button)

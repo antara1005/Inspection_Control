@@ -11,11 +11,12 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.duration import Duration
 from geometry_msgs.msg import Vector3Stamped
-from geometry_msgs.msg import WrenchStamped, Wrench
+from geometry_msgs.msg import WrenchStamped, TwistStamped 
 
+from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float64
 from cv_bridge import CvBridge
 from builtin_interfaces.msg import Time
 from visualization_msgs.msg import Marker
@@ -136,6 +137,7 @@ def _z_axis_rotvec_error(z_goal: np.ndarray) -> np.ndarray:
 
     c = float(np.clip(np.dot(zc, zg), -1.0, 1.0))         # cos(theta)
     theta = math.acos(c)
+    print(f'Debug: theta={math.degrees(theta):.2f}°')
 
     axis = np.cross(zc, zg)
     n = LA.norm(axis)
@@ -161,53 +163,59 @@ class OrientationControlNode(Node):
         timer_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ---- Parameters ----
-        self.declare_parameter('depth_topic', '/camera/d405_camera/depth/image_rect_raw')
-        self.declare_parameter('camera_info_topic', '/camera/d405_camera/depth/camera_info')
-        self.declare_parameter('bounding_box_topic', '/viewpoint_generation/bounding_box_marker')
-        self.declare_parameter('dmap_filter_min', 0.07)
-        self.declare_parameter('dmap_filter_max', 0.50)
-        self.declare_parameter('viz_enable', True)
-        self.declare_parameter('publish_pointcloud', True)
-        self.declare_parameter('pcd_downsampling_stride', 4)
-        self.declare_parameter('target_frame', 'object_frame')
-        # Bounding Box Parameters
-        self.declare_parameter('main_camera_frame', 'eoat_camera_link')
-        # Cropping parameters (cylindrical crop in eoat_camera_link frame)
-        self.declare_parameter('crop_radius', 0.05)               # m, radial bound about +Z
-        self.declare_parameter('crop_z_min', 0.05)                # m, slab start in +Z
-        self.declare_parameter('crop_z_max', 0.40)
-        # EOAT desired pose parameters
-        self.declare_parameter('standoff_m', 0.10)                # used when mode=fixed
-        self.declare_parameter('standoff_mode', 'euclidean')      # 'fixed'|'euclidean'|'along_normal'
-        # ---- Smoothing params ----
-        self.declare_parameter('ema_enable', True)     # on/off
-        self.declare_parameter('ema_tau', 0.25)        # seconds; try 0.2–0.5 s
-        # Orientation P gains (Nm/rad) in main_camera_frame
-        self.declare_parameter('Kp', 200.0)   # torque gain about camera X
-        # Derivative gains for PD control                                         # <<< NEW
-        self.declare_parameter('Ki', 5.0)    # derivative gain about camera Z  # <<< NEW
-        self.declare_parameter('Kd', 5.0)    # derivative gain about camera X  # <<< NEW
-        self.declare_parameter('no_target_timeout_s', 0.25)  # after this, reset EMA & declare "lost"
-        self.declare_parameter('publish_zero_when_lost', True)
-        self.declare_parameter('orientation_control_enabled', False)
-        self.declare_parameter('save_data', False)
-        self.declare_parameter('data_path', '/tmp')
-        self.declare_parameter('object', '')
-        self.declare_parameter('mass', 10.0)  # mass of the object in kg for force control   # <<< NEW
-        self.declare_parameter('inertia', 10.0) # rotational inertia for torque control   # <<< NEW
-        # Optional torque saturation (Nm)
-        # self.declare_parameter('torque_limit', 3.0)
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('depth_topic', '/camera/d405_camera/depth/image_rect_raw'),
+                ('camera_info_topic', '/camera/d405_camera/depth/camera_info'),
+                ('bounding_box_topic', '/viewpoint_generation/bounding_box_marker'),
+                ('joy_topic', 'joy'),  # Topic for incoming Joy messages
+                ('enable_button', 0),  # Button index to enable orientation control
+                ('dmap_filter_min', 0.07),
+                ('dmap_filter_max', 0.50),
+                ('viz_enable', True),
+                ('publish_pointcloud', True),
+                ('pcd_downsampling_stride', 4),
+                ('target_frame', 'object_frame'),
+                ('main_camera_frame', 'eoat_camera_link'),
+                ('crop_radius', 0.05),
+                ('crop_z_min', 0.05),
+                ('crop_z_max', 0.40),
+                ('standoff_m', 0.10),
+                ('standoff_mode', 'euclidean'),
+                ('ema_enable', True),
+                ('ema_tau', 0.25),
+                ('no_target_timeout_s', 0.25),
+                ('publish_zero_when_lost', True),
+                ('orientation_control_enabled', False),
+                ('save_data', False),
+                ('data_path', '/tmp'),
+                ('object', ''),
+                ('sphere_mass', 5.0),                      # kg
+                ('sphere_radius', 0.1),                    # m (for inertia and drag calc)
+                ('fluid_viscosity', 0.0010016),                  # Pa·s (for drag calc)
+                ('d_min', 0.15),
+                ('d_max', 0.30),
+                ('v_max', 0.40),
+                ('Kp', 200.0),
+                ('Ki', 5.0),
+                ('Kd', 5.0),
+            ]
+        )
 
         # Get parameters
         self.depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         self.bounding_box_topic = self.get_parameter('bounding_box_topic').get_parameter_value().string_value
+        joy_topic = self.get_parameter('joy_topic').get_parameter_value().string_value
+        self.enable_button = int(self.get_parameter('enable_button').value)
         self.dmap_filter_min = float(self.get_parameter('dmap_filter_min').value)
         self.dmap_filter_max = float(self.get_parameter('dmap_filter_max').value)
         self.viz_enable = bool(self.get_parameter('viz_enable').value)
         self.publish_pointcloud = bool(self.get_parameter('publish_pointcloud').value)
         self.pcd_downsampling_stride = int(self.get_parameter('pcd_downsampling_stride').value)
         self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+        
         # Crop reads
         self.crop_radius   = float(self.get_parameter('crop_radius').value)
         self.crop_z_min    = float(self.get_parameter('crop_z_min').value)
@@ -228,16 +236,21 @@ class OrientationControlNode(Node):
         self.bbox_max = np.array([ float('inf'),  float('inf'),  float('inf')], dtype=float)  # [xmax, ymax, zmax]
         self.main_camera_frame = self.get_parameter('main_camera_frame').get_parameter_value().string_value
 
+        self.d_min = float(self.get_parameter('d_min').value) # Minimum focal distance (meters)
+        self.d_max = float(self.get_parameter('d_max').value) # Maximum focal distance (meters)
+        self.v_max = float(self.get_parameter('v_max').value) # Maximum linear velocity (meters/second)
+
         self.Kp = float(self.get_parameter('Kp').value)
         self.Ki = float(self.get_parameter('Ki').value)    # integral gain about camera Z  # <<< NEW
         self.Kd = float(self.get_parameter('Kd').value)  # <<< NEW
-        # self.torque_limit = float(self.get_parameter('torque_limit').value)
         self.no_target_timeout_s = float(self.get_parameter('no_target_timeout_s').value)
         self.publish_zero_when_lost = bool(self.get_parameter('publish_zero_when_lost').value)
+        
         # Loss tracking
         self._had_target_last_cycle = False
         self._last_target_time_s = None  # float seconds of last valid crop/pose
         self.orientation_control_enabled = bool(self.get_parameter('orientation_control_enabled').value)
+        
         # save data parameters
         self.save_data = bool(self.get_parameter('save_data').value)
         self.data_path = self.get_parameter('data_path').get_parameter_value().string_value
@@ -251,10 +264,13 @@ class OrientationControlNode(Node):
             name='orientation_control_data',
             type='viewpoint_generation_interfaces/msg/OrientationControlData',
             serialization_format='cdr')
-        self.mass = float(self.get_parameter('mass').value)  # mass of the object in kg for force control   # <<< NEW
-        self.inertia = float(self.get_parameter('inertia').value) # rotational inertia for torque control   # <<< NEW
-        # Live tuning
-        self.add_on_set_parameters_callback(self._on_param_update)
+        
+        
+        self.mass = float(self.get_parameter('sphere_mass').value)  # mass of the object in kg for force control   # <<< NEW
+        self.sphere_radius = float(self.get_parameter('sphere_radius').value)
+        self.fluid_viscosity = float(self.get_parameter('fluid_viscosity').value)
+        self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+
         # QoS profile
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -279,6 +295,16 @@ class OrientationControlNode(Node):
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_info, qos)
         self.sub_depth = self.create_subscription(Image, self.depth_topic, self.on_depth, 1, callback_group=sub_cb_group)
         self.bbox = self.create_subscription(Marker, self.bounding_box_topic, self.on_bbox, qos)
+        self.create_subscription(TwistStamped, f'/servo_node/delta_twist_cmds', self.on_delta_twist, qos)
+        self.create_subscription(WrenchStamped, f'/teleop/wrench_cmds', self.on_wrench_cmd, qos)
+        # Joy sub
+        self.last_joy_msg = None
+        self.joy_sub = self.create_subscription(
+            Joy,
+            joy_topic,
+            self.joy_callback,
+            qos,
+        )
         self.depth_msg = None
         self.create_timer(0.1, self.process_dmap, callback_group=timer_cb_group)
 
@@ -302,9 +328,14 @@ class OrientationControlNode(Node):
         self.pub_wrench_cmd = self.create_publisher(
             WrenchStamped, f'/{self.get_name()}/wrench_cmds', 10
         )
+        self.distance_pub = self.create_publisher(Float64, f'/{self.get_name()}/focal_distance_m', 10)
 
         self.force = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.lin_vel_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.rot_vel_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.tau_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.force_teleop = np.zeros(3, dtype=np.float32)  # <<< NEW
+        self.torque_teleop = np.zeros(3, dtype=np.float32)  # <<< NEW
         # keep a “last torque” handy so we can report it in the bundle
         self._last_tau = np.zeros(3, dtype=np.float32)
         self._last_force = np.zeros(3, dtype=np.float32)   # <<< NEW
@@ -332,6 +363,63 @@ class OrientationControlNode(Node):
             f'  crop_radius={self.crop_radius:.3f}, crop_z=[{self.crop_z_min:.3f},{self.crop_z_max:.3f}]'
             f'  standoff_mode={self.standoff_mode}, standoff_m={self.standoff_m:.3f}'
         )
+
+        # ---------------- Parameter update callback ----------------
+        self.add_on_set_parameters_callback(self._on_param_update)
+
+
+    def update_inertia_and_drag(self, mass: float, radius: float, fluid_viscosity: float):
+        """Update inertia and drag coefficients based on mass, radius, and fluid viscosity."""
+        # Inertia for solid sphere: I = 2/5 m r²
+        I = (2.0 / 5.0) * mass * (radius ** 2)
+        self.inertia = I
+
+        # Linear drag coefficients: D = 6πμr
+        self.linear_drag = 6.0 * 3.141592653589793 * fluid_viscosity * radius
+
+        # Rotational drag coefficients: D_rot = 2.4πμr³ (breaks Stoke's Law but preserves v = rω)
+        self.angular_drag = 2.4 * 3.141592653589793 * fluid_viscosity * (radius ** 3)
+
+        self.get_logger().info(
+            f'Updated inertia to {self.inertia} kg·m² and drag to {self.linear_drag} N·s/m, {self.angular_drag} N·m·s/rad'
+        )
+
+    def joy_callback(self, msg):
+        """
+        Process incoming Joy messages and turn orientation control on/off.
+        """
+        if not self.last_joy_msg:
+            self.last_joy_msg = msg
+            return
+        
+        # Turn orientation control on/off based on button presses
+        if not self.last_joy_msg.buttons[self.enable_button]:
+            if msg.buttons[self.enable_button] and not self.orientation_control_enabled:
+                self.enable_orientation_control()
+            elif msg.buttons[self.enable_button] and self.orientation_control_enabled:
+                self.disable_orientation_control()
+
+        self.last_joy_msg = msg
+
+
+    def on_delta_twist(self, msg: TwistStamped):
+        # Receive delta twist commands from servo node
+        # We only care about torque (angular) components for orientation control
+        self.lin_vel_cam[0] = msg.twist.linear.x
+        self.lin_vel_cam[1] = msg.twist.linear.y
+        self.lin_vel_cam[2] = msg.twist.linear.z
+        self.rot_vel_cam[0] = msg.twist.angular.x
+        self.rot_vel_cam[1] = msg.twist.angular.y
+        self.rot_vel_cam[2] = msg.twist.angular.z
+
+    def on_wrench_cmd(self, msg: WrenchStamped):
+        # Receive wrench commands from teleop node
+        self.force_teleop[0] = msg.wrench.force.x
+        self.force_teleop[1] = msg.wrench.force.y
+        self.force_teleop[2] = msg.wrench.force.z
+        self.torque_teleop[0] = msg.wrench.torque.x
+        self.torque_teleop[1] = msg.wrench.torque.y
+        self.torque_teleop[2] = msg.wrench.torque.z 
 
     def enable_orientation_control(self):
         # Open the bag file for writing
@@ -495,7 +583,7 @@ class OrientationControlNode(Node):
                     R_out = _quat_to_R_xyzw(q_out.x, q_out.y, q_out.z, q_out.w)
                     t_out = T_out.transform.translation
                     t_vec_out = np.array([t_out.x, t_out.y, t_out.z], dtype=np.float32)
-                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out  # (N,3)
+                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out  # TODO: Fix pts_bbox not defined error (N,3)
 
                 except TransformException as e:
                     self.get_logger().warn(f'No TF {self.main_camera_frame} <- {self.target_frame}: {e}')
@@ -551,6 +639,8 @@ class OrientationControlNode(Node):
                         cen_s = self._ema_centroid
                         nrm_s = self._ema_normal
                         self._ema_last_t = now_s
+
+                        r = -cen_s
 
                         pose = PoseStamped()
                         pose.header = self.depth_msg.header
@@ -652,12 +742,18 @@ class OrientationControlNode(Node):
                             Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
                             Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
                             tau = (Kp_vec * omega + Ki_vec * self._int_rotvec_err + Kd_vec * domega).astype(np.float32)                # <<< NEW
-
+                            tau_max = self.linear_drag*d*self.v_max
+                            tau = np.clip(tau, -tau_max, tau_max)
+                            Inertia_A = self.inertia + self.mass * d**2 # rotational inertia for torque control
+                            self.ang_acc = (self.linear_drag * np.cross(self.lin_vel_cam, r) + tau+ np.cross(r, self.force_teleop))/ Inertia_A  # <<< NEW
                             tau_out = tau.copy()                                                     # <<< NEW
                             self._last_tau = tau.copy()                                              # <<< NEW
-                            Inertia_A = self.inertia + self.mass * d**2 # rotational inertia for torque control
-                            self.force = 3 * (self.mass/Inertia_A) * np.cross(tau,-cen_s)  # simple proportional model for force command based on torque command
-                            self.tau_cam = (self.inertia/Inertia_A) * tau  # torque about camera origin
+                            self.force = self.mass * np.cross(self.ang_acc,r) + self.linear_drag * self.lin_vel_cam - self.force_teleop  # simple proportional model for force command based on torque command
+                            # Centripetal force command
+                            # self.force[2] = self.mass * np.linalg.norm(self.lin_vel_cam)**2 / np.linalg.norm(cen_s)
+                            self.tau_cam = self.inertia * self.ang_acc + self.angular_drag * self.rot_vel_cam - self.torque_teleop  # torque about camera origin
+                            
+                            self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
                             # Saturation (optional)
                             # lim = self.torque_limit
                             # tau = np.clip(tau, -lim, lim)
@@ -668,7 +764,7 @@ class OrientationControlNode(Node):
                             w.header.frame_id = self.main_camera_frame
                             w.wrench.force.x = float(self.force[0])
                             w.wrench.force.y = float(self.force[1])
-                            w.wrench.force.z = float(self.force[2])
+                            w.wrench.force.z = float(self.force[2]) # Centripetal force command
                             w.wrench.torque.x = float(self.tau_cam[0])
                             w.wrench.torque.y = float(self.tau_cam[1])
                             w.wrench.torque.z = float(self.tau_cam[2])  # will be ~0 for Z-only error
@@ -851,11 +947,23 @@ class OrientationControlNode(Node):
                     self.enable_orientation_control()
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
-            elif p.name == 'mass':
-                self.mass = float(p.value)  # mass of the object in kg for force control   # <<< NEW
-            elif p.name == 'inertia':
-                self.inertia = float(p.value) # rotational inertia for torque control   # <<< NEW
-        return SetParametersResult(successful=True)
+            elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
+                self.mass = float(p.value)
+                self.get_logger().info(f'Updated sphere_mass to {self.mass:.3f} kg')
+                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+            elif p.name == 'sphere_radius' and p.type_ == p.Type.DOUBLE:
+                self.sphere_radius = float(p.value)
+                self.get_logger().info(f'Updated sphere_radius to {self.sphere_radius:.3f} m')
+                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+            elif p.name == 'fluid_viscosity' and p.type_ == p.Type.DOUBLE:
+                self.fluid_viscosity = float(p.value)
+                self.get_logger().info(f'Updated fluid_viscosity to {self.fluid_viscosity:.6f} Pa·s')
+                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+        
+        result = SetParametersResult()
+        result.successful = True
+
+        return result
 
 
 def main():
