@@ -36,6 +36,7 @@ orientation_controller:
     d_min: 0.15 # Minimum focal distance (meters)
     d_max: 0.30 # Maximum focal distance (meters)
     v_max: 0.40 # Maximum linear velocity (meters/second)
+    theta_max_deg: 30.0 # Maximum angular displacement (degrees)
 
     Kp: 2.8
     Ki: 0.0

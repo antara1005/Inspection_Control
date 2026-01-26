@@ -6,6 +6,8 @@ import numpy.linalg as LA
 import copy
 import os
 
+from sympy import zeta
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -197,6 +199,7 @@ class OrientationControlNode(Node):
                 ('d_min', 0.15),
                 ('d_max', 0.30),
                 ('v_max', 0.40),
+                ('theta_max_deg', 30.0),
                 ('Kp', 200.0),
                 ('Ki', 5.0),
                 ('Kd', 5.0),
@@ -239,6 +242,7 @@ class OrientationControlNode(Node):
         self.d_min = float(self.get_parameter('d_min').value) # Minimum focal distance (meters)
         self.d_max = float(self.get_parameter('d_max').value) # Maximum focal distance (meters)
         self.v_max = float(self.get_parameter('v_max').value) # Maximum linear velocity (meters/second)
+        self.theta_max_deg = float(self.get_parameter('theta_max_deg').value) # Maximum angular displacement (degrees)
 
         self.Kp = float(self.get_parameter('Kp').value)
         self.Ki = float(self.get_parameter('Ki').value)    # integral gain about camera Z  # <<< NEW
@@ -737,14 +741,23 @@ class OrientationControlNode(Node):
                                     self._int_rotvec_err, -int_limit, int_limit
                                 )
 
+                            
+
+                            
+                            inertia_A = self.inertia_B + self.mass_B * d**2 # rotational inertia for torque control
+                            tau_max = self.linear_drag*d*self.v_max
+                            omega_n_max = math.sqrt(tau_max/(inertia_A*self.theta_max_deg*3.141592653589793/180.0))  # max angular 
+                            omega_n = omega_n_max; # natural frequency for desired max torque
+                            p_1 = -omega_n
+                            p_2 = -omega_n
+                            self.Kp = inertia_A*p_1*p_2
+                            self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
                             # Elementwise PD: τ = Kp*ω + Kd*ω̇                                      # <<< NEW
                             Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
                             Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
                             Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
                             tau_A = (Kp_vec * omega + Ki_vec * self._int_rotvec_err + Kd_vec * domega).astype(np.float32)                # <<< NEW
-                            tau_max = self.linear_drag*d*self.v_max
                             tau_A = np.clip(tau_A, -tau_max, tau_max)
-                            inertia_A = self.inertia_B + self.mass_B * d**2 # rotational inertia for torque control
                             moment_tele_A = np.cross(r, self.force_teleop)
                             force_drag_B = -self.linear_drag * self.lin_vel_cam
                             moment_drag_B = -self.angular_drag * self.rot_vel_cam
@@ -963,6 +976,12 @@ class OrientationControlNode(Node):
                 self.fluid_viscosity = float(p.value)
                 self.get_logger().info(f'Updated fluid_viscosity to {self.fluid_viscosity:.6f} Pa·s')
                 self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
+            elif p.name == 'v_max' and p.type_ == p.Type.DOUBLE:
+                self.v_max = float(p.value)
+                self.get_logger().info(f'Updated v_max to {self.v_max:.3f} m/s')            
+            elif p.name == 'theta_max_deg' and p.type_ == p.Type.DOUBLE:
+                self.theta_max_deg = float(p.value)
+                self.get_logger().info(f'Updated theta_max_deg to {self.theta_max_deg:.3f} deg')
         
         result = SetParametersResult()
         result.successful = True
