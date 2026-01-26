@@ -72,14 +72,14 @@ def generate_launch_description():
         name='joy'
     )
 
-    autofocus_node = Node(
-        package="inspection_control",
-        executable="autofocus_node",
-        name="autofocus",
-        parameters=[autofocus_config],
-        output="screen",
-        emulate_tty=True
-    )
+    # autofocus_node = Node(
+    #     package="inspection_control",
+    #     executable="autofocus_node",
+    #     name="autofocus",
+    #     parameters=[autofocus_config],
+    #     output="screen",
+    #     emulate_tty=True
+    # )
 
     # Teleop node
     teleop_node = Node(
@@ -110,7 +110,7 @@ def generate_launch_description():
         orientation_config_file,
         orientation_control_node,
         autofocus_config_file,
-        autofocus_node,
+        # autofocus_node,
         joy_node,
         teleop_config_file,
         admittance_config_file,
