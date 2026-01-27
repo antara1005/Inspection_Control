@@ -737,6 +737,10 @@ class OrientationControlNode(Node):
                            # self._last_force = force.copy()                                            # <<< NEW FOR FORCE PID >>>
                             # --- PID control on rotation-vector error omega ---   # <<< NEW
                             # Compute error derivative (finite difference)         # <<< NEW
+                            self.aw_enable= True
+                            self.aw_Tt = 0.05
+                            self.int_limit = 1e3
+
                             if self._last_err_t is not None and self._last_rotvec_err is not None:  # <<< NEW
                                 dt_ctrl = max(1e-6, now_s - self._last_err_t)                      # <<< NEW
                                 domega = (omega - self._last_rotvec_err) / dt_ctrl                 # <<< NEW
@@ -747,13 +751,13 @@ class OrientationControlNode(Node):
                             self._last_err_t = now_s                                               # <<< NEW
                             self._last_rotvec_err = omega.copy()                                   # <<< NEW
                              # Integral of error
-                            if dt_ctrl > 0.0:
-                                self._int_rotvec_err += omega * dt_ctrl
+                            #if dt_ctrl > 0.0:
+                             #   self._int_rotvec_err += omega * dt_ctrl
                                 # Optional: simple anti-windup clamp
-                                int_limit = 1e3   # tune as needed
-                                self._int_rotvec_err = np.clip(
-                                    self._int_rotvec_err, -int_limit, int_limit
-                                )
+                              #  int_limit = 1e3   # tune as needed
+                               # self._int_rotvec_err = np.clip(
+                               #     self._int_rotvec_err, -int_limit, int_limit
+                               # )
 
                             
 
@@ -764,19 +768,39 @@ class OrientationControlNode(Node):
                             omega_n = omega_n_max; # natural frequency for desired max torque
                             p_1 = -omega_n
                             p_2 = -omega_n
-                            self.Kp = inertia_A*p_1*p_2
-                            self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
+                            p_3 =-5*omega_n
+                            self.Kp = inertia_A*(p_1*p_2+p_1*p_3+p_2*p_3)
+                            self.Ki = -inertia_A*(p_1*p_2*p_3)
+                            self.Kd = -inertia_A*(p_1 + p_2 + p_3) - self.linear_drag*d*d
+                            
+                            print(f"Updated gains: Kp={self.Kp}, Kd={self.Kd}" f"Ki={self.Ki}")
                             # Elementwise PD: τ = Kp*ω + Kd*ω̇                                      # <<< NEW
                             Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
                             Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
                             Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
                             tau_A = (Kp_vec * omega + Ki_vec * self._int_rotvec_err + Kd_vec * domega).astype(np.float32)                # <<< NEW
-                            tau_A = np.clip(tau_A, -tau_max, tau_max)
+                            tau_sat = np.clip(tau_A, -tau_max, tau_max)
+                            # --------- Anti-windup (back-calculation) ----------
+                               # i_dot = e + (u_sat - u)/(Ki*Tt)
+                            if (getattr(self, "aw_enable", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
+                                Tt = float(getattr(self, "aw_Tt", 0.05))
+                                i_dot = omega + (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
+                                self._int_rotvec_err += i_dot * dt_ctrl
+                            else:
+                                if dt_ctrl > 0.0:
+                                  self._int_rotvec_err += omega * dt_ctrl
+
+                            # Integrator clamp
+                            int_lim = float(getattr(self, "int_limit", 1e3))
+                            self._int_rotvec_err = np.clip(self._int_rotvec_err, -int_lim, int_lim)
+
+                            tau_A=tau_sat
                             moment_tele_A = np.cross(r, self.force_teleop)
                             force_drag_B = -self.linear_drag * self.lin_vel_cam
                             moment_drag_B = -self.angular_drag * self.rot_vel_cam
                             moment_dragB_A = np.cross(r, force_drag_B)
                             self.ang_acc = (moment_dragB_A + tau_A + moment_tele_A)/ inertia_A  # <<< NEW
+                            
                             tau_out = tau_A.copy()                                                     # <<< NEW
                             self._last_tau = tau_A.copy()                                              # <<< NEW
                             self.force_B = self.mass_B * np.cross(self.ang_acc,r) - force_drag_B - self.force_teleop  # simple proportional model for force command based on torque command

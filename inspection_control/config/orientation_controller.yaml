@@ -38,6 +38,6 @@ orientation_controller:
     v_max: 0.40 # Maximum linear velocity (meters/second)
     theta_max_deg: 30.0 # Maximum angular displacement (degrees)
 
-    Kp: 2.8
-    Ki: 0.0
-    Kd: 0.99 
+    Kp: 31.0
+    Ki: 37.7
+    Kd: 6.2
