@@ -1,6 +1,6 @@
 orientation_controller:
   ros__parameters:
-    depth_topic: /camera/d405_camera/depth/image_rect_raw
+    depth_topic: /camera/d405_camera/depth/image_rect_raw/compressedDepth
     camera_info_topic: /camera/d405_camera/depth/camera_info #intrinsics info
     bounding_box_topic: /viewpoint_generation/bounding_box_marker #bounding box topic
     #depth map filtering range

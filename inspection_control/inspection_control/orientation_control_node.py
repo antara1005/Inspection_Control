@@ -17,7 +17,7 @@ from geometry_msgs.msg import WrenchStamped, TwistStamped
 
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import SetParametersResult
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import Header, Float64
 from cv_bridge import CvBridge
 from builtin_interfaces.msg import Time
@@ -168,7 +168,7 @@ class OrientationControlNode(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('depth_topic', '/camera/d405_camera/depth/image_rect_raw'),
+                ('depth_topic', '/camera/d405_camera/depth/image_rect_raw/compressed'),
                 ('camera_info_topic', '/camera/d405_camera/depth/camera_info'),
                 ('bounding_box_topic', '/viewpoint_generation/bounding_box_marker'),
                 ('joy_topic', 'joy'),  # Topic for incoming Joy messages
@@ -297,7 +297,7 @@ class OrientationControlNode(Node):
 
         # Subs
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_info, qos)
-        self.sub_depth = self.create_subscription(Image, self.depth_topic, self.on_depth, 1, callback_group=sub_cb_group)
+        self.sub_depth = self.create_subscription(CompressedImage, self.depth_topic, self.on_depth, 1, callback_group=sub_cb_group)
         self.bbox = self.create_subscription(Marker, self.bounding_box_topic, self.on_bbox, qos)
         self.create_subscription(TwistStamped, f'/servo_node/delta_twist_cmds', self.on_delta_twist, qos)
         self.create_subscription(WrenchStamped, f'/teleop/wrench_cmds', self.on_wrench_cmd, qos)
@@ -497,10 +497,9 @@ class OrientationControlNode(Node):
             return x.copy()
         return (1.0 - alpha) * prev + alpha * x
 
-    def on_depth(self, msg: Image):
-        # Convert ROS Image -> numpy
+    def on_depth(self, msg: CompressedImage):
+        # Store compressed depth message for processing
         self.ocd.header = msg.header
-        self.ocd.depth_image = msg
         self.depth_msg = msg
 
     def process_dmap(self):
@@ -517,14 +516,29 @@ class OrientationControlNode(Node):
         rotvec_err_out = np.zeros(3, dtype=np.float32)
         tau_out = np.zeros(3, dtype=np.float32)
         force_out = np.zeros(3, dtype=np.float32)
-        # Convert ROS Image -> numpy
-        depth = self.bridge.imgmsg_to_cv2(self.depth_msg, desired_encoding='passthrough')
+        # Decompress compressedDepth format -> numpy
+        # compressedDepth has a 12-byte header: uint32 format + float32 depthQuantA + float32 depthQuantB
+        np_arr = np.frombuffer(self.depth_msg.data, np.uint8)
+        if np_arr.size <= 12:
+            self.get_logger().warn("Empty or invalid compressedDepth data, skipping frame")
+            return
+        # Skip the 12-byte header to get to the PNG data
+        png_data = np_arr[12:]
+        depth = cv2.imdecode(png_data, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            self.get_logger().warn("Failed to decode depth image, skipping frame")
+            return
 
-        # Normalize to meters
-        if self.depth_msg.encoding in ('16UC1', 'mono16'):
+        # Store decompressed image for ocd message
+        if depth.dtype == np.uint16:
+            self.ocd.depth_image = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
+        else:
+            self.ocd.depth_image = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
+        self.ocd.depth_image.header = self.depth_msg.header
+
+        # Normalize to meters (compressed depth is typically 16UC1 PNG)
+        if depth.dtype == np.uint16:
             depth_m = depth.astype(np.float32) * 1e-3
-        elif self.depth_msg.encoding == '32FC1':
-            depth_m = depth.astype(np.float32)
         else:
             depth_m = depth.astype(np.float32)
 
