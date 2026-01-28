@@ -2,6 +2,7 @@
 import math
 import numpy as np
 import cv2
+import open3d as o3d
 import numpy.linalg as LA
 import copy
 import os
@@ -48,6 +49,40 @@ def _quat_to_R_xyzw(x, y, z, w):
         [    2*(xz - wy),     2*(yz + wx),   1 - 2*(xx + yy)]
     ], dtype=np.float32)
 
+def _R_to_quat_xyzw(R: np.ndarray) -> Quaternion:
+    """Return xyzw quaternion from 3x3 rotation matrix R."""
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+
+    tr = m00 + m11 + m22
+
+    if tr > 0:
+        S = math.sqrt(tr + 1.0) * 2  # S=4*qw
+        qw = 0.25 * S
+        qx = (m21 - m12) / S
+        qy = (m02 - m20) / S
+        qz = (m10 - m01) / S
+    elif (m00 > m11) and (m00 > m22):
+        S = math.sqrt(1.0 + m00 - m11 - m22) * 2  # S=4*qx
+        qw = (m21 - m12) / S
+        qx = 0.25 * S
+        qy = (m01 + m10) / S
+        qz = (m02 + m20) / S
+    elif m11 > m22:
+        S = math.sqrt(1.0 + m11 - m00 - m22) * 2  # S=4*qy
+        qw = (m02 - m20) / S
+        qx = (m01 + m10) / S
+        qy = 0.25 * S
+        qz = (m12 + m21) / S
+    else:
+        S = math.sqrt(1.0 + m22 - m00 - m11) * 2  # S=4*qz
+        qw = (m10 - m01) / S
+        qx = (m02 + m20) / S
+        qy = (m12 + m21) / S
+        qz = 0.25 * S
+
+    return Quaternion(x=qx, y=qy, z=qz, w=qw)
 
 def make_pointcloud2(points_xyz: np.ndarray, frame_id: str, stamp) -> PointCloud2:
     """
@@ -72,8 +107,30 @@ def make_pointcloud2(points_xyz: np.ndarray, frame_id: str, stamp) -> PointCloud
 
 def _pca_plane_normal(pts_np: np.ndarray):
     """Return (centroid, unit normal) for best-fit plane to pts_np (N,3)."""
-    c = pts_np.mean(axis=0)
+    # Pick centroid as the point closest to the z-axis (min radial distance in XY)
+    r_xy = np.sqrt(pts_np[:, 0]**2 + pts_np[:, 1]**2)
+    c = pts_np[np.argmin(r_xy)]
+    print(f"Debug: PCA centroid at {c}")
     X = pts_np - c
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(X)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
+    cluster = pcd.cluster_dbscan(eps=0.02, min_points=10)
+    # Paint clusters
+    for i in range(len(cluster)):
+        if cluster[i] > 0:
+            pcd.colors.append([1, 0, 0])  # Red for inliers
+        else:
+            pcd.colors.append([0.5, 0.5, 0.5])  # Gray for outliers
+    # Get index of point closeset to origin
+    centroid_idx = np.argmin(np.linalg.norm(X, axis=1))
+    # Get normal at centroid
+    n = np.asarray(pcd.normals)[centroid_idx]
+    # Visualize PCA points
+    o3d.visualization.draw_geometries([pcd], window_name='PCA Points', width=800, height=600)
+    # Only use inliers for plane fitting
+    # inlier_indices = [i for i in range(len(cluster)) if cluster[i] > 0]
+    # X = X[inlier_indices]
     # 3x3 covariance; smallest eigenvalue's eigenvector is the plane normal
     C = (X.T @ X) / max(len(X) - 1, 1)
     w, v = LA.eigh(C)
@@ -82,20 +139,21 @@ def _pca_plane_normal(pts_np: np.ndarray):
     if n[2] < 0:
         n = -n
     n /= (LA.norm(n) + 1e-12)
+    
     return c, n
 
 
 def _quaternion_from_z(normal: np.ndarray) -> Quaternion:
     """Return quaternion with +Z aligned with normal."""
     z = normal / LA.norm(normal)
-    up = np.array([0, 1, 0])
+    up = np.array([0, 0, 1])
 
     if np.array_equal(z, up):
         x = np.array([1, 0, 0])
     elif np.array_equal(z, -up):
         x = np.array([-1, 0, 0])
     else:
-        x = np.cross(up, z)
+        x = np.cross(z, up)
         x /= LA.norm(x)
 
     y = np.cross(z, x)
@@ -155,6 +213,42 @@ def _z_axis_rotvec_error(z_goal: np.ndarray) -> np.ndarray:
     axis /= n
     return (theta * axis).astype(np.float32)
 
+def _x_axis_rotvec_error(x_goal: np.ndarray) -> np.ndarray:
+    """Return rotation-vector ω that rotates xc=[1,0,0] onto x_goal.
+    Both vectors must be expressed in the same frame."""
+    xc = np.array([1.0, 0.0, 0.0], dtype=np.float32)      # camera's current X
+    xg = x_goal.astype(np.float32)
+    xg /= (LA.norm(xg) + 1e-12)                           # normalize
+
+    c = float(np.clip(np.dot(xc, xg), -1.0, 1.0))         # cos(theta)
+    theta = math.acos(c)
+    print(f'Debug: theta_roll={math.degrees(theta):.2f}°')
+
+    axis = np.cross(xc, xg)
+    n = LA.norm(axis)
+
+    if n < 1e-9:
+        # xc and xg are parallel
+        if c > 0.0:
+            return np.zeros(3, dtype=np.float32)  # aligned
+        else:
+            # 180°: pick y-axis as arbitrary rotation axis
+            return np.array([0.0, theta, 0.0], dtype=np.float32)
+
+    axis /= n
+    return (theta * axis).astype(np.float32)
+
+def _roll_error(x_current_world) -> float:
+    """Return roll error (radians): angle between camera x-axis and world XY plane.
+
+    Positive when x-axis points above XY plane, negative when below.
+    """
+    xc = x_current_world / (LA.norm(x_current_world) + 1e-12)
+    # Angle to XY plane is arcsin of z-component for a unit vector
+    theta = math.asin(float(np.clip(xc[2], -1.0, 1.0)))
+    print(f"Debug: roll error={math.degrees(theta):.2f}°")
+    return theta
+
 
 class OrientationControlNode(Node):
     # Node that gives desired EOAT pose based on depth image, bounding box, and cropping
@@ -200,9 +294,11 @@ class OrientationControlNode(Node):
                 ('d_max', 0.30),
                 ('v_max', 0.40),
                 ('theta_max_deg', 30.0),
+                ('controller_type', 'PD'),
                 ('Kp', 200.0),
                 ('Ki', 5.0),
                 ('Kd', 5.0),
+                ('anti_windup_enabled', True),
             ]
         )
 
@@ -249,6 +345,7 @@ class OrientationControlNode(Node):
         self.Kd = float(self.get_parameter('Kd').value)  # <<< NEW
         self.no_target_timeout_s = float(self.get_parameter('no_target_timeout_s').value)
         self.publish_zero_when_lost = bool(self.get_parameter('publish_zero_when_lost').value)
+        self.controller_type = str(self.get_parameter('controller_type').value).upper()
         
         # Loss tracking
         self._had_target_last_cycle = False
@@ -420,7 +517,7 @@ class OrientationControlNode(Node):
         # Receive wrench commands from teleop node
         self.force_teleop[0] = msg.wrench.force.x
         self.force_teleop[1] = msg.wrench.force.y
-        self.force_teleop[2] = msg.wrench.force.z
+        # self.force_teleop[2] = msg.wrench.force.z
         self.torque_teleop[0] = msg.wrench.torque.x
         self.torque_teleop[1] = msg.wrench.torque.y
         self.torque_teleop[2] = msg.wrench.torque.z 
@@ -579,6 +676,7 @@ class OrientationControlNode(Node):
                 y = (ys.astype(np.float32) - cy) * z / fy
                 points1 = np.stack([x, y, z], axis=1)
                 src_frame = self.depth_msg.header.frame_id
+                pts_bbox = np.zeros((0, 3), dtype=np.float32)
                 try:
                     T = self.tf_buffer.lookup_transform(
                         self.target_frame, src_frame, Time(sec=0, nanosec=0), timeout=Duration(seconds=0.001))
@@ -603,7 +701,7 @@ class OrientationControlNode(Node):
                     R_out = _quat_to_R_xyzw(q_out.x, q_out.y, q_out.z, q_out.w)
                     t_out = T_out.transform.translation
                     t_vec_out = np.array([t_out.x, t_out.y, t_out.z], dtype=np.float32)
-                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out  # TODO: Fix pts_bbox not defined error (N,3)
+                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out  # (N,3)
 
                 except TransformException as e:
                     self.get_logger().warn(f'No TF {self.main_camera_frame} <- {self.target_frame}: {e}')
@@ -662,14 +760,25 @@ class OrientationControlNode(Node):
 
                         r = -cen_s
 
-                        pose = PoseStamped()
-                        pose.header = self.depth_msg.header
-                        pose.header.frame_id = self.main_camera_frame
-                        pose.pose.position.x = float(cen_s[0])
-                        pose.pose.position.y = float(cen_s[1])
-                        pose.pose.position.z = float(cen_s[2])
-                        pose.pose.orientation = _quaternion_from_z(nrm_s)
-                        self.normal_estimate_pub.publish(pose)
+                        # Transform centroid and normal to object_frame
+                        T = self.tf_buffer.lookup_transform(
+                            'object_frame', self.main_camera_frame, Time(sec=0, nanosec=0), timeout=Duration(seconds=0.001))
+                        q = T.transform.rotation
+                        R_tf = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
+                        x_cf, y_cf, z_cf = R_tf[:, 0], R_tf[:, 1], R_tf[:, 2]   # each is a length-3 unit vector
+                        t = T.transform.translation
+                        t_vec = np.array([t.x, t.y, t.z], dtype=np.float32)
+                        cen_s_obj = (R_tf @ cen_s) + t_vec
+                        nrm_s_obj = R_tf @ nrm_s
+
+                        surface_target_pose = PoseStamped()
+                        surface_target_pose.header = self.depth_msg.header
+                        surface_target_pose.header.frame_id = 'object_frame'
+                        surface_target_pose.pose.position.x = float(cen_s_obj[0])
+                        surface_target_pose.pose.position.y = float(cen_s_obj[1])
+                        surface_target_pose.pose.position.z = float(cen_s_obj[2])
+                        surface_target_pose.pose.orientation = _quaternion_from_z(nrm_s_obj)
+                        self.normal_estimate_pub.publish(surface_target_pose)
 
                         # ---- Compute standoff based on mode ----
                         if self.standoff_mode == 'euclidean':
@@ -681,7 +790,11 @@ class OrientationControlNode(Node):
 
                         # Desired EOAT pose: back off along normal by d; +Z aligned with normal
                         p_des_cf = cen_s - d*nrm_s
-                        q_des_cf = _quaternion_from_z(nrm_s)
+                        q_des_cf = _quaternion_from_z(nrm_s_obj)
+                        # Transform q_des_cf back to main_camera_frame
+                        R_des_cf = _quat_to_R_xyzw(q_des_cf.x, q_des_cf.y, q_des_cf.z, q_des_cf.w)
+                        R_cam = R_tf.T @ R_des_cf
+                        q_des_cf = _R_to_quat_xyzw(R_cam)
 
                         eoat_cf = PoseStamped()
                         eoat_cf.header = self.depth_msg.header
@@ -698,6 +811,10 @@ class OrientationControlNode(Node):
                         # --- Z-axis alignment error in main_camera_frame ---
                         rot_vec_error= _z_axis_rotvec_error(nrm_s.astype(np.float32))   # 3-vector [ωx, ωy, ωz]
 
+                        # Compute rotational error w.r.t. object_frame
+                        roll_error = _roll_error(x_cf)
+                        rot_vec_error[2] = roll_error
+
                         centroid_out = cen_s.astype(np.float32)
                         normal_out   = nrm_s.astype(np.float32)
                         rotvec_err_out = rot_vec_error.astype(np.float32)
@@ -710,6 +827,10 @@ class OrientationControlNode(Node):
                         self.pub_z_rotvec_err.publish(err_msg)
 
                         if self.orientation_control_enabled:
+                            # --- CONTROLLER ---
+                            # Compute control torques based on rot_vec_error
+
+
                             # ================== FORCE PID (translational) ====================  # <<< NEW FOR FORCE PID >>>
                             # Use p_des_cf as position error vector in main_camera_frame
                             #pos_err = p_des_cf.astype(np.float32)
@@ -739,7 +860,7 @@ class OrientationControlNode(Node):
                            # self._last_force = force.copy()                                            # <<< NEW FOR FORCE PID >>>
                             # --- PID control on rotation-vector error rot_vec_error---   # <<< NEW
                             # Compute error derivative (finite difference)         # <<< NEW
-                            self.aw_enable= True
+                            self.anti_windup_enabled = True
                             self.aw_Tt = 0.05
                             self.int_limit = 1e3
 
@@ -752,6 +873,7 @@ class OrientationControlNode(Node):
 
                             self._last_err_t = now_s                                               # <<< NEW
                             self._last_rotvec_err = rot_vec_error.copy()                                   # <<< NEW
+
                              # Integral of error
                             #if dt_ctrl > 0.0:
                              #   self._int_rotvec_err += rot_vec_error* dt_ctrl
@@ -760,20 +882,32 @@ class OrientationControlNode(Node):
                                # self._int_rotvec_err = np.clip(
                                #     self._int_rotvec_err, -int_limit, int_limit
                                # )
-
-                            
-
                             
                             inertia_A = self.inertia_B + self.mass_B * d**2 # rotational inertia for torque control
                             tau_max = self.linear_drag*d*self.v_max
                             omega_n_max = math.sqrt(tau_max/(inertia_A*self.theta_max_deg*3.141592653589793/180.0))  # max angular 
                             omega_n = omega_n_max; # natural frequency for desired max torque
+
                             p_1 = -omega_n
                             p_2 = -omega_n
                             p_3 =-5*omega_n
-                            self.Kp = inertia_A*(p_1*p_2+p_1*p_3+p_2*p_3)
-                            self.Ki = -inertia_A*(p_1*p_2*p_3)
-                            self.Kd = -inertia_A*(p_1 + p_2 + p_3) - self.linear_drag*d*d
+
+                            if self.controller_type == 'PD':
+                                # PD controller
+                                self.Kp = inertia_A*(p_1*p_2)
+                                self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
+                                self.Ki = 0.0
+                            elif self.controller_type == 'PID':
+                                # PID controller
+                                self.Kp = inertia_A*(p_1*p_2+p_1*p_3+p_2*p_3)
+                                self.Ki = -inertia_A*(p_1*p_2*p_3)
+                                self.Kd = -inertia_A*(p_1 + p_2 + p_3) - self.linear_drag*d*d
+                            else:
+                                self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
+                                # PD controller
+                                self.Kp = inertia_A*(p_1*p_2)
+                                self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
+                                self.Ki = 0.0
 
                             # self.Kp = inertia_A*(p_1*p_2)
                             # self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
@@ -796,7 +930,7 @@ class OrientationControlNode(Node):
                             print(f"Sat tau: {tau_sat}")
                             # --------- Anti-windup (back-calculation) ----------
                                # i_dot = e + (u_sat - u)/(Ki*Tt)
-                            if (getattr(self, "aw_enable", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
+                            if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
                                 Tt = float(getattr(self, "aw_Tt", 0.05))
                                 print(f"omega: {rot_vec_error}")
                                 i_dot = rot_vec_error+ (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
@@ -824,6 +958,7 @@ class OrientationControlNode(Node):
                             # Centripetal force command
                             # self.force[2] = self.mass * np.linalg.norm(self.lin_vel_cam)**2 / np.linalg.norm(cen_s)
                             self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop  # torque about camera origin
+                            self.tau_B[2] = roll_error * self.Kp  # add roll correction about Z-axis only
 
                             self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
                             # Saturation (optional)
@@ -1037,6 +1172,12 @@ class OrientationControlNode(Node):
             elif p.name == 'theta_max_deg' and p.type_ == p.Type.DOUBLE:
                 self.theta_max_deg = float(p.value)
                 self.get_logger().info(f'Updated theta_max_deg to {self.theta_max_deg:.3f} deg')
+            elif p.name == 'controller_type':
+                self.controller_type = str(p.value).upper()
+                self.get_logger().info(f'Updated controller_type to {self.controller_type}')
+            elif p.name == 'anti_windup_enabled':
+                self.anti_windup_enabled = bool(p.value)
+                self.get_logger().info(f'Updated anti_windup_enabled to {self.anti_windup_enabled}')
         
         result = SetParametersResult()
         result.successful = True

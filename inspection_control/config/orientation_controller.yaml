@@ -14,7 +14,7 @@ orientation_controller:
     target_frame: object_frame #frame of the target object
     main_camera_frame: eoat_camera_link #frame of the eoat camera
     #cropped parameters in eoat camera frame
-    crop_radius: 0.05
+    crop_radius: 0.025
     crop_z_min: 0.05
     crop_z_max: 0.40
     
