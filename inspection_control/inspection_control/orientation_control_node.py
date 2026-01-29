@@ -205,14 +205,15 @@ def _z_axis_rotvec_error(z_goal: np.ndarray) -> np.ndarray:
     if n < 1e-9:
         # zc and zg are parallel
         if c > 0.0:
-            return np.zeros(3, dtype=np.float32)  # aligned
+            #return np.zeros(3, dtype=np.float32)  # aligned
+            return np.float32(0.0), np.zeros(3, dtype=np.float32)
         else:
             # 180°: pick x-axis as arbitrary rotation axis
-            return np.array([theta, 0.0, 0.0], dtype=np.float32)
+            #return np.array([theta, 0.0, 0.0], dtype=np.float32)
+            return np.float32(theta), np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
     axis /= n
-    return (theta * axis).astype(np.float32)
-
+    return np.float32(theta), axis.astype(np.float32)
 def _x_axis_rotvec_error(x_goal: np.ndarray) -> np.ndarray:
     """Return rotation-vector ω that rotates xc=[1,0,0] onto x_goal.
     Both vectors must be expressed in the same frame."""
@@ -443,8 +444,9 @@ class OrientationControlNode(Node):
         # PD state: last rotation-vector error and timestamp                # <<< NEW
         self._last_rotvec_err = None                                       # <<< NEW
         self._last_err_t = None  
-        self._int_rotvec_err = np.zeros(3, dtype=np.float32)                                           # <<< NEW
-        
+        self._int_rotvec_err = np.zeros(3, dtype=np.float32)   
+        self.last_e = 0.0                                        # <<< NEW
+        self.int_e =0.0
 
         # PID state for force (position) control                         # <<< NEW FOR FORCE PID >>>
         #self._last_pos_err = None                                       # <<< NEW FOR FORCE PID >>>
@@ -534,8 +536,8 @@ class OrientationControlNode(Node):
             self.writer.open(self.storage_options, self.converter_options)
             self.writer.create_topic(self.topic_info)
 
-        self._int_rotvec_err = np.zeros(3, dtype=np.float32)
-
+        #self._int_rotvec_err = np.zeros(3, dtype=np.float32)
+        self.int_e = 0.0
         self.orientation_control_enabled = True
         self.get_logger().info('Orientation control ENABLED.')
 
@@ -809,7 +811,8 @@ class OrientationControlNode(Node):
                         xg, yg, zg = R_goal[:, 0], R_goal[:, 1], R_goal[:, 2]   # each is a length-3 unit vector
 
                         # --- Z-axis alignment error in main_camera_frame ---
-                        rot_vec_error= _z_axis_rotvec_error(nrm_s.astype(np.float32))   # 3-vector [ωx, ωy, ωz]
+                        theta_err, axis_err = _z_axis_rotvec_error(nrm_s.astype(np.float32))
+                        rot_vec_error = axis_err * theta_err  # 3-vector [ωx, ωy, ωz]
 
                         # Compute rotational error w.r.t. object_frame
                         roll_error = _roll_error(x_cf)
@@ -863,15 +866,17 @@ class OrientationControlNode(Node):
                             self.anti_windup_enabled = True
                             self.aw_Tt = 0.05
                             self.int_limit = 1e3
-
-                            if self._last_err_t is not None and self._last_rotvec_err is not None:  # <<< NEW
+                            self.e = -theta_err  # store for debugging
+                            dt_ctrl = 0.0
+                            if self._last_err_t is not None:  # <<< NEW
                                 dt_ctrl = max(1e-6, now_s - self._last_err_t)                      # <<< NEW
-                                drot_vec_error= (rot_vec_error- self._last_rotvec_err) / dt_ctrl                 # <<< NEW
+                                self.de = (self.e - self.last_e) / dt_ctrl                 # <<< NEW
                             else:  
                                 dt_ctrl = 0.0                                                                 # <<< NEW
-                                drot_vec_error= np.zeros(3, dtype=np.float32)                             # <<< NEW
+                                self.de = 0.0                             # <<< NEW
 
-                            self._last_err_t = now_s                                               # <<< NEW
+                            self._last_err_t = now_s   
+                            self.last_e = float(self.e)                                          # <<< NEW
                             self._last_rotvec_err = rot_vec_error.copy()                                   # <<< NEW
 
                              # Integral of error
@@ -914,46 +919,48 @@ class OrientationControlNode(Node):
                             # self.Ki = 0.0
                             # print(f"Updated gains: Kp={self.Kp}, Kd={self.Kd}" f"Ki={self.Ki}")
                             # Elementwise PD: τ = Kp*ω + Kd*ω̇                                      # <<< NEW
-                            Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
-                            Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
-                            Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
-                            tau_A = (Kp_vec * rot_vec_error+ Ki_vec * self._int_rotvec_err - Kd_vec * drot_vec_error).astype(np.float32)                # <<< NEW
+                           # Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
+                          #  Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
+                          #  Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
+                            #tau_A = (Kp_vec * rot_vec_error+ Ki_vec * self._int_rotvec_err - Kd_vec * drot_vec_error).astype(np.float32)                # <<< NEW
+                            tau_A = (self.Kp * self.e + self.Ki * self.int_e + self.Kd * self.de)               # <<< NEW
                             print(f"Pre-sat tau: {tau_A}")
                             # Saturation
                             tau_sat = np.clip(tau_A, -tau_max, tau_max)
-                            mag = np.linalg.norm(tau_A)
-                            if mag > tau_max:
-                                tau_sat = tau_A * (tau_max / mag)
-                            else:
-                                tau_sat = tau_A
+                          #  mag = np.linalg.norm(tau_A)
+                         #   if mag > tau_max:
+                           #     tau_sat = tau_A * (tau_max / mag)
+                           # else:
+                            #    tau_sat = tau_A
+
 
                             print(f"Sat tau: {tau_sat}")
                             # --------- Anti-windup (back-calculation) ----------
                                # i_dot = e + (u_sat - u)/(Ki*Tt)
                             if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
                                 Tt = float(getattr(self, "aw_Tt", 0.05))
-                                print(f"omega: {rot_vec_error}")
-                                i_dot = rot_vec_error+ (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
+                                print(f"theta_err: {self.e}")
+                                i_dot = self.e + (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
                                 print(f"i_dot: {i_dot}")
-                                self._int_rotvec_err += i_dot * dt_ctrl
-                                print(self._int_rotvec_err)
+                                self.int_e += i_dot * dt_ctrl
+                                print(self.int_e)
                             else:
                                 if dt_ctrl > 0.0:
-                                  self._int_rotvec_err += rot_vec_error* dt_ctrl
+                                  self.int_e += self.e * dt_ctrl
 
                             # Integrator clamp
                             int_lim = float(getattr(self, "int_limit", 1e3))
-                            self._int_rotvec_err = np.clip(self._int_rotvec_err, -int_lim, int_lim)
-
-                            tau_A=tau_sat
+                            self.int_e = np.clip(self.int_e, -int_lim, int_lim)
+                            tau_A=tau_sat 
+                            tau_A_vec = tau_A * axis_err  # scale by error axis to get full 3-vector
                             moment_tele_A = np.cross(r, self.force_teleop)
                             force_drag_B = -self.linear_drag * self.lin_vel_cam
                             moment_drag_B = -self.angular_drag * self.rot_vel_cam
                             moment_dragB_A = np.cross(r, force_drag_B)
-                            self.ang_acc = (moment_dragB_A + tau_A + moment_tele_A)/ inertia_A  # <<< NEW
-                            
-                            tau_out = tau_A.copy()                                                     # <<< NEW
-                            self._last_tau = tau_A.copy()                                              # <<< NEW
+                            self.ang_acc = (moment_dragB_A + tau_A_vec + moment_tele_A)/ inertia_A  # <<< NEW
+
+                            tau_out = tau_A_vec.copy()                                                     # <<< NEW
+                            self._last_tau = tau_A_vec.copy()                                              # <<< NEW
                             self.force_B = self.mass_B * np.cross(self.ang_acc,r) - force_drag_B - self.force_teleop  # simple proportional model for force command based on torque command
                             # Centripetal force command
                             # self.force[2] = self.mass * np.linalg.norm(self.lin_vel_cam)**2 / np.linalg.norm(cen_s)
