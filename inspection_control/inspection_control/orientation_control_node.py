@@ -110,7 +110,6 @@ def _pca_plane_normal(pts_np: np.ndarray):
     # Pick centroid as the point closest to the z-axis (min radial distance in XY)
     r_xy = np.sqrt(pts_np[:, 0]**2 + pts_np[:, 1]**2)
     c = pts_np[np.argmin(r_xy)]
-    print(f"Debug: PCA centroid at {c}")
     X = pts_np - c
     # pcd = o3d.geometry.PointCloud()
     # pcd.points = o3d.utility.Vector3dVector(X)
