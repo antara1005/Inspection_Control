@@ -112,22 +112,22 @@ def _pca_plane_normal(pts_np: np.ndarray):
     c = pts_np[np.argmin(r_xy)]
     print(f"Debug: PCA centroid at {c}")
     X = pts_np - c
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(X)
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
-    cluster = pcd.cluster_dbscan(eps=0.02, min_points=10)
-    # Paint clusters
-    for i in range(len(cluster)):
-        if cluster[i] > 0:
-            pcd.colors.append([1, 0, 0])  # Red for inliers
-        else:
-            pcd.colors.append([0.5, 0.5, 0.5])  # Gray for outliers
-    # Get index of point closeset to origin
-    centroid_idx = np.argmin(np.linalg.norm(X, axis=1))
-    # Get normal at centroid
-    n = np.asarray(pcd.normals)[centroid_idx]
-    # Visualize PCA points
-    o3d.visualization.draw_geometries([pcd], window_name='PCA Points', width=800, height=600)
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(X)
+    # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
+    # cluster = pcd.cluster_dbscan(eps=0.02, min_points=10)
+    # # Paint clusters
+    # for i in range(len(cluster)):
+    #     if cluster[i] > 0:
+    #         pcd.colors.append([1, 0, 0])  # Red for inliers
+    #     else:
+    #         pcd.colors.append([0.5, 0.5, 0.5])  # Gray for outliers
+    # # Get index of point closeset to origin
+    # centroid_idx = np.argmin(np.linalg.norm(X, axis=1))
+    # # Get normal at centroid
+    # n = np.asarray(pcd.normals)[centroid_idx]
+    # # Visualize PCA points
+    # o3d.visualization.draw_geometries([pcd], window_name='PCA Points', width=800, height=600)
     # Only use inliers for plane fitting
     # inlier_indices = [i for i in range(len(cluster)) if cluster[i] > 0]
     # X = X[inlier_indices]
@@ -300,6 +300,7 @@ class OrientationControlNode(Node):
                 ('Ki', 5.0),
                 ('Kd', 5.0),
                 ('anti_windup_enabled', True),
+                ('integral_alpha', 5.0),
             ]
         )
 
@@ -347,6 +348,7 @@ class OrientationControlNode(Node):
         self.no_target_timeout_s = float(self.get_parameter('no_target_timeout_s').value)
         self.publish_zero_when_lost = bool(self.get_parameter('publish_zero_when_lost').value)
         self.controller_type = str(self.get_parameter('controller_type').value).upper()
+        self.integral_alpha = float(self.get_parameter('integral_alpha').value)
         
         # Loss tracking
         self._had_target_last_cycle = False
@@ -387,8 +389,9 @@ class OrientationControlNode(Node):
 
 
         # TF2 for transforms to target_frame
-        self.tf_buffer = Buffer(cache_time=Duration(seconds=0.5))
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=2.0))  # Increased cache for startup
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._tf_ready = False  # Flag to track TF availability
 
         # Orientation control data msg
         self.ocd = OrientationControlData()
@@ -408,7 +411,13 @@ class OrientationControlNode(Node):
             qos,
         )
         self.depth_msg = None
-        self.create_timer(0.1, self.process_dmap, callback_group=timer_cb_group)
+
+        # Store callback group for later timer creation
+        self._timer_cb_group = timer_cb_group
+        self._process_timer = None
+
+        # Start with a TF readiness check timer instead of processing timer
+        self._startup_timer = self.create_timer(0.5, self._check_tf_ready, callback_group=timer_cb_group)
 
         # Pubs
         self.eoat_pointcloud_publisher = self.create_publisher(
@@ -486,6 +495,53 @@ class OrientationControlNode(Node):
         self.get_logger().info(
             f'Updated inertia to {self.inertia_B} kg·m² and drag to {self.linear_drag} N·s/m, {self.angular_drag} N·m·s/rad'
         )
+
+    def _check_tf_ready(self):
+        """Check if required TF frames are available before starting main processing."""
+        if self._tf_ready:
+            return
+
+        # Check if we have camera info (needed to know the depth frame)
+        if self.depth_frame_id is None:
+            self.get_logger().info(
+                'Waiting for camera info to determine depth frame...',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        # Required transform pairs to check
+        tf_checks = [
+            (self.target_frame, self.main_camera_frame),
+            (self.target_frame, self.depth_frame_id),
+        ]
+
+        all_ready = True
+        for target, source in tf_checks:
+            try:
+                # Use a longer timeout for startup checks
+                self.tf_buffer.lookup_transform(
+                    target, source,
+                    Time(sec=0, nanosec=0),
+                    timeout=Duration(seconds=0.1)
+                )
+            except TransformException as e:
+                self.get_logger().info(
+                    f'Waiting for TF: {target} <- {source}',
+                    throttle_duration_sec=2.0
+                )
+                all_ready = False
+                break
+
+        if all_ready:
+            self._tf_ready = True
+            self.get_logger().info(
+                'TF tree ready. Starting orientation control processing.'
+            )
+            # Cancel startup timer and start the main processing timer
+            self._startup_timer.cancel()
+            self._process_timer = self.create_timer(
+                0.1, self.process_dmap, callback_group=self._timer_cb_group
+            )
 
     def joy_callback(self, msg):
         """
@@ -866,7 +922,7 @@ class OrientationControlNode(Node):
                             self.anti_windup_enabled = True
                             self.aw_Tt = 0.05
                             self.int_limit = 1e3
-                            self.e = -theta_err  # store for debugging
+                            self.e = theta_err  # store for debugging
                             dt_ctrl = 0.0
                             if self._last_err_t is not None:  # <<< NEW
                                 dt_ctrl = max(1e-6, now_s - self._last_err_t)                      # <<< NEW
@@ -895,7 +951,7 @@ class OrientationControlNode(Node):
 
                             p_1 = -omega_n
                             p_2 = -omega_n
-                            p_3 =-5*omega_n
+                            p_3 =-self.integral_alpha*omega_n
 
                             if self.controller_type == 'PD':
                                 # PD controller
@@ -1185,6 +1241,9 @@ class OrientationControlNode(Node):
             elif p.name == 'anti_windup_enabled':
                 self.anti_windup_enabled = bool(p.value)
                 self.get_logger().info(f'Updated anti_windup_enabled to {self.anti_windup_enabled}')
+            elif p.name == 'integral_alpha':
+                self.integral_alpha = float(p.value)
+                self.get_logger().info(f'Updated integral_alpha to {self.integral_alpha}')
         
         result = SetParametersResult()
         result.successful = True
