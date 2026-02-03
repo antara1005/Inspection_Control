@@ -6,6 +6,7 @@ import open3d as o3d
 import numpy.linalg as LA
 import copy
 import os
+import threading
 
 from sympy import zeta
 
@@ -32,7 +33,8 @@ from geometry_msgs.msg import PointStamped, Point, Vector3
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
 from rclpy.serialization import serialize_message
 
-from tf2_ros import Buffer, TransformListener, TransformException
+from tf2_ros import Buffer, TransformListener, TransformException, TransformBroadcaster
+from geometry_msgs.msg import TransformStamped
 from inspection_control.debag_orientation_data import debag
 
 
@@ -105,31 +107,96 @@ def make_pointcloud2(points_xyz: np.ndarray, frame_id: str, stamp) -> PointCloud
     return msg
 
 
-def _pca_plane_normal(pts_np: np.ndarray):
+def _visualize_normal_estimation(pts_np: np.ndarray, centroid: np.ndarray, normal: np.ndarray,
+                                  inlier_mask: np.ndarray = None, title: str = 'Normal Estimation'):
+    """
+    Visualize the normal estimation results using Open3D.
+
+    Args:
+        pts_np: (N, 3) array of all input points
+        centroid: (3,) array of the selected centroid point
+        normal: (3,) unit normal vector
+        inlier_mask: Optional boolean mask for inliers (None = all points are inliers)
+        title: Window title
+    """
+    geometries = []
+
+    # Create point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_np)
+
+    # Color points: green for inliers, red for outliers
+    if inlier_mask is not None:
+        colors = np.zeros((len(pts_np), 3))
+        colors[inlier_mask] = [0.0, 0.8, 0.0]  # Green for inliers
+        colors[~inlier_mask] = [0.8, 0.0, 0.0]  # Red for outliers
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    else:
+        # All points are inliers (PCA case)
+        pcd.paint_uniform_color([0.0, 0.8, 0.0])
+
+    geometries.append(pcd)
+
+    # Create centroid sphere (blue)
+    centroid_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
+    centroid_sphere.translate(centroid)
+    centroid_sphere.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
+    geometries.append(centroid_sphere)
+
+    # Create normal arrow (cyan)
+    arrow_length = 0.05
+    arrow = o3d.geometry.TriangleMesh.create_arrow(
+        cylinder_radius=0.002,
+        cone_radius=0.004,
+        cylinder_height=arrow_length * 0.8,
+        cone_height=arrow_length * 0.2
+    )
+    # Rotate arrow to align with normal (default arrow points in +Z)
+    z_axis = np.array([0.0, 0.0, 1.0])
+    rotation_axis = np.cross(z_axis, normal)
+    rotation_axis_norm = LA.norm(rotation_axis)
+    if rotation_axis_norm > 1e-6:
+        rotation_axis = rotation_axis / rotation_axis_norm
+        angle = np.arccos(np.clip(np.dot(z_axis, normal), -1.0, 1.0))
+        R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
+        arrow.rotate(R, center=[0, 0, 0])
+    arrow.translate(centroid)
+    arrow.paint_uniform_color([0.0, 0.8, 0.8])  # Cyan
+    geometries.append(arrow)
+
+    # Create fitted plane (semi-transparent gray)
+    plane_size = 0.08
+    plane_mesh = o3d.geometry.TriangleMesh.create_box(width=plane_size, height=plane_size, depth=0.001)
+    plane_mesh.translate([-plane_size / 2, -plane_size / 2, -0.0005])
+    # Rotate plane to align with normal
+    if rotation_axis_norm > 1e-6:
+        plane_mesh.rotate(R, center=[0, 0, 0])
+    plane_mesh.translate(centroid)
+    plane_mesh.paint_uniform_color([0.5, 0.5, 0.5])
+    geometries.append(plane_mesh)
+
+    # Create coordinate frame at origin
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03, origin=[0, 0, 0])
+    geometries.append(coord_frame)
+
+    # Visualize
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name=title,
+        width=800,
+        height=600,
+        point_show_normal=False
+    )
+
+
+def _pca_plane_normal(pts_np: np.ndarray, visualize: bool = False):
     """Return (centroid, unit normal) for best-fit plane to pts_np (N,3)."""
     # Pick centroid as the point closest to the z-axis (min radial distance in XY)
     r_xy = np.sqrt(pts_np[:, 0]**2 + pts_np[:, 1]**2)
-    c = pts_np[np.argmin(r_xy)]
+    centroid_idx = np.argmin(r_xy)
+    c = pts_np[centroid_idx]
     X = pts_np - c
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(X)
-    # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
-    # cluster = pcd.cluster_dbscan(eps=0.02, min_points=10)
-    # # Paint clusters
-    # for i in range(len(cluster)):
-    #     if cluster[i] > 0:
-    #         pcd.colors.append([1, 0, 0])  # Red for inliers
-    #     else:
-    #         pcd.colors.append([0.5, 0.5, 0.5])  # Gray for outliers
-    # # Get index of point closeset to origin
-    # centroid_idx = np.argmin(np.linalg.norm(X, axis=1))
-    # # Get normal at centroid
-    # n = np.asarray(pcd.normals)[centroid_idx]
-    # # Visualize PCA points
-    # o3d.visualization.draw_geometries([pcd], window_name='PCA Points', width=800, height=600)
-    # Only use inliers for plane fitting
-    # inlier_indices = [i for i in range(len(cluster)) if cluster[i] > 0]
-    # X = X[inlier_indices]
+
     # 3x3 covariance; smallest eigenvalue's eigenvector is the plane normal
     C = (X.T @ X) / max(len(X) - 1, 1)
     w, v = LA.eigh(C)
@@ -138,8 +205,101 @@ def _pca_plane_normal(pts_np: np.ndarray):
     if n[2] < 0:
         n = -n
     n /= (LA.norm(n) + 1e-12)
-    
+
+    if visualize:
+        _visualize_normal_estimation(
+            pts_np, c, n,
+            inlier_mask=None,  # PCA uses all points
+            title='PCA Normal Estimation'
+        )
+
     return c, n
+
+
+def _ransac_plane_normal(pts_np: np.ndarray, n_iterations: int = 100, distance_threshold: float = 0.005, visualize: bool = False):
+    """
+    Return (centroid, unit normal) for RANSAC-fit plane to pts_np (N,3).
+
+    RANSAC is more robust to outliers than PCA by iteratively fitting planes
+    to random point samples and selecting the one with most inliers.
+
+    Args:
+        pts_np: (N, 3) array of 3D points
+        n_iterations: Number of RANSAC iterations
+        distance_threshold: Max distance from plane for a point to be an inlier (meters)
+        visualize: If True, show Open3D visualization of the results
+
+    Returns:
+        (centroid, normal): centroid is the inlier point closest to z-axis,
+                           normal is the unit normal vector pointing toward camera
+    """
+    n_points = pts_np.shape[0]
+    if n_points < 3:
+        # Not enough points, return default
+        return np.zeros(3, dtype=np.float32), np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    best_inlier_count = 0
+    best_normal = None
+    best_inlier_mask = None
+
+    for _ in range(n_iterations):
+        # Randomly sample 3 points to define a plane
+        idx = np.random.choice(n_points, size=3, replace=False)
+        p1, p2, p3 = pts_np[idx[0]], pts_np[idx[1]], pts_np[idx[2]]
+
+        # Compute plane normal from two edge vectors
+        v1 = p2 - p1
+        v2 = p3 - p1
+        n = np.cross(v1, v2)
+        norm_mag = LA.norm(n)
+        if norm_mag < 1e-12:
+            # Degenerate case (collinear points), skip
+            continue
+        n = n / norm_mag
+
+        # Compute signed distance of all points to the plane
+        # Plane equation: n · (x - p1) = 0
+        distances = np.abs((pts_np - p1) @ n)
+
+        # Count inliers
+        inlier_mask = distances < distance_threshold
+        inlier_count = np.sum(inlier_mask)
+
+        if inlier_count > best_inlier_count:
+            best_inlier_count = inlier_count
+            best_normal = n
+            best_inlier_mask = inlier_mask
+
+    if best_normal is None or best_inlier_count < 3:
+        # RANSAC failed, fall back to PCA on all points
+        return _pca_plane_normal(pts_np, visualize=visualize)
+
+    # Refine normal using PCA on inliers only
+    inlier_pts = pts_np[best_inlier_mask]
+
+    # Pick centroid as the inlier point closest to the z-axis (min radial distance in XY)
+    r_xy = np.sqrt(inlier_pts[:, 0]**2 + inlier_pts[:, 1]**2)
+    c = inlier_pts[np.argmin(r_xy)]
+
+    # Refine plane normal using PCA on inliers
+    X = inlier_pts - c
+    C = (X.T @ X) / max(len(X) - 1, 1)
+    w, v = LA.eigh(C)
+    n = v[:, 0]  # Eigenvector with smallest eigenvalue
+
+    # Make direction consistent (toward camera, +Z in depth cam frame)
+    if n[2] < 0:
+        n = -n
+    n = n / (LA.norm(n) + 1e-12)
+
+    if visualize:
+        _visualize_normal_estimation(
+            pts_np, c, n,
+            inlier_mask=best_inlier_mask,
+            title='RANSAC Normal Estimation'
+        )
+
+    return c.astype(np.float32), n.astype(np.float32)
 
 
 def _quaternion_from_z(normal: np.ndarray) -> Quaternion:
@@ -213,30 +373,6 @@ def _z_axis_rotvec_error(z_goal: np.ndarray) -> np.ndarray:
 
     axis /= n
     return np.float32(theta), axis.astype(np.float32)
-def _x_axis_rotvec_error(x_goal: np.ndarray) -> np.ndarray:
-    """Return rotation-vector ω that rotates xc=[1,0,0] onto x_goal.
-    Both vectors must be expressed in the same frame."""
-    xc = np.array([1.0, 0.0, 0.0], dtype=np.float32)      # camera's current X
-    xg = x_goal.astype(np.float32)
-    xg /= (LA.norm(xg) + 1e-12)                           # normalize
-
-    c = float(np.clip(np.dot(xc, xg), -1.0, 1.0))         # cos(theta)
-    theta = math.acos(c)
-    print(f'Debug: theta_roll={math.degrees(theta):.2f}°')
-
-    axis = np.cross(xc, xg)
-    n = LA.norm(axis)
-
-    if n < 1e-9:
-        # xc and xg are parallel
-        if c > 0.0:
-            return np.zeros(3, dtype=np.float32)  # aligned
-        else:
-            # 180°: pick y-axis as arbitrary rotation axis
-            return np.array([0.0, theta, 0.0], dtype=np.float32)
-
-    axis /= n
-    return (theta * axis).astype(np.float32)
 
 def _roll_error(x_current_world) -> float:
     """Return roll error (radians): angle between camera x-axis and world XY plane.
@@ -246,9 +382,7 @@ def _roll_error(x_current_world) -> float:
     xc = x_current_world / (LA.norm(x_current_world) + 1e-12)
     # Angle to XY plane is arcsin of z-component for a unit vector
     theta = math.asin(float(np.clip(xc[2], -1.0, 1.0)))
-    print(f"Debug: roll error={math.degrees(theta):.2f}°")
     return theta
-
 
 class OrientationControlNode(Node):
     # Node that gives desired EOAT pose based on depth image, bounding box, and cropping
@@ -281,8 +415,9 @@ class OrientationControlNode(Node):
                 ('standoff_mode', 'euclidean'),
                 ('ema_enable', True),
                 ('ema_tau', 0.25),
+                ('normal_estimation_method', 'PCA'),
+                ('visualize_normal_estimation', False),
                 ('no_target_timeout_s', 0.25),
-                ('publish_zero_when_lost', True),
                 ('orientation_control_enabled', False),
                 ('save_data', False),
                 ('data_path', '/tmp'),
@@ -300,6 +435,7 @@ class OrientationControlNode(Node):
                 ('Kd', 5.0),
                 ('anti_windup_enabled', True),
                 ('integral_alpha', 5.0),
+                ('surface_target_frame', 'surface_target'),
             ]
         )
 
@@ -336,6 +472,10 @@ class OrientationControlNode(Node):
         self.bbox_max = np.array([ float('inf'),  float('inf'),  float('inf')], dtype=float)  # [xmax, ymax, zmax]
         self.main_camera_frame = self.get_parameter('main_camera_frame').get_parameter_value().string_value
 
+        self.normal_estimation_method = self.get_parameter('normal_estimation_method').get_parameter_value().string_value.upper()
+        self.visualize_normal_estimation = bool(self.get_parameter('visualize_normal_estimation').value)
+        self._orientation_control_before_viz = False  # Stores orientation_control state before visualization
+
         self.d_min = float(self.get_parameter('d_min').value) # Minimum focal distance (meters)
         self.d_max = float(self.get_parameter('d_max').value) # Maximum focal distance (meters)
         self.v_max = float(self.get_parameter('v_max').value) # Maximum linear velocity (meters/second)
@@ -345,7 +485,6 @@ class OrientationControlNode(Node):
         self.Ki = float(self.get_parameter('Ki').value)    # integral gain about camera Z  # <<< NEW
         self.Kd = float(self.get_parameter('Kd').value)  # <<< NEW
         self.no_target_timeout_s = float(self.get_parameter('no_target_timeout_s').value)
-        self.publish_zero_when_lost = bool(self.get_parameter('publish_zero_when_lost').value)
         self.controller_type = str(self.get_parameter('controller_type').value).upper()
         self.integral_alpha = float(self.get_parameter('integral_alpha').value)
         
@@ -432,13 +571,19 @@ class OrientationControlNode(Node):
         self.pub_eoat_pose_crop = self.create_publisher(
             PoseStamped, f'/{self.get_name()}/eoat_desired_pose_in_{self.main_camera_frame}', 10
         )
+
+        # TF broadcaster for surface target pose
+        self.surface_target_frame = self.get_parameter('surface_target_frame').get_parameter_value().string_value
+        self.tf_broadcaster = TransformBroadcaster(self)
         self.pub_z_rotvec_err = self.create_publisher(
             Vector3Stamped, f'/{self.get_name()}/z_axis_rotvec_error_in_{self.main_camera_frame}', 10
         )
         self.pub_wrench_cmd = self.create_publisher(
             WrenchStamped, f'/{self.get_name()}/wrench_cmds', 10
         )
-        self.distance_pub = self.create_publisher(Float64, f'/{self.get_name()}/focal_distance_m', 10)
+        self.distance_pub = self.create_publisher(
+            Float64, f'/{self.get_name()}/focal_distance_m', 10
+        )
 
         self.force_B = np.zeros(3, dtype=np.float32)  # <<< NEW
         self.lin_vel_cam = np.zeros(3, dtype=np.float32)  # <<< NEW
@@ -460,6 +605,23 @@ class OrientationControlNode(Node):
         #self._last_pos_err = None                                       # <<< NEW FOR FORCE PID >>>
         #self._last_pos_t = None                                         # <<< NEW FOR FORCE PID >>>
         #self._int_pos_err = np.zeros(3, dtype=np.float32)               # <<< NEW FOR FORCE PID >>>
+
+        # Thread-safe state for depth→timer communication
+        self._measurement_lock = threading.Lock()
+        self._latest_measurement = {
+            'valid': False,
+            'centroid': np.zeros(3, dtype=np.float32),  # Smoothed, in main_camera_frame
+            'normal': np.zeros(3, dtype=np.float32),    # Smoothed, in main_camera_frame
+            'timestamp': 0.0,
+            'pts_crop': None,       # For visualization/debug
+            'pts_bbox': None,       # For visualization/debug
+            'rot_vec_error': np.zeros(3, dtype=np.float32),
+            'theta_err': 0.0,
+            'axis_err': np.zeros(3, dtype=np.float32),
+            'd': 0.0,               # Focal distance for controller
+            'roll_error': 0.0,      # Roll error about Z-axis
+            'r': np.zeros(3, dtype=np.float32),  # Vector from centroid to origin
+        }
 
         self.get_logger().info(
             'Background remover running:\n'
@@ -539,7 +701,7 @@ class OrientationControlNode(Node):
             # Cancel startup timer and start the main processing timer
             self._startup_timer.cancel()
             self._process_timer = self.create_timer(
-                0.1, self.process_dmap, callback_group=self._timer_cb_group
+                0.1, self.process_controller, callback_group=self._timer_cb_group
             )
 
     def joy_callback(self, msg):
@@ -556,6 +718,12 @@ class OrientationControlNode(Node):
                 self.enable_orientation_control()
             elif msg.buttons[self.enable_button] and self.orientation_control_enabled:
                 self.disable_orientation_control()
+        # Turn on normal_estimation_visualization on button 9 press
+        if not self.last_joy_msg.buttons[9]:
+            if msg.buttons[9] and not self.visualize_normal_estimation:
+                self.enable_normal_estimation_viz()
+            elif msg.buttons[9] and self.visualize_normal_estimation:
+                self.disable_normal_estimation_viz()
 
         self.last_joy_msg = msg
 
@@ -606,18 +774,6 @@ class OrientationControlNode(Node):
             debag(self.storage_options.uri)
             # Update parameters or state as needed
 
-    def _publish_zero_wrench(self):
-        w = WrenchStamped()
-        # use the latest header if available; otherwise make a minimal header
-        if self.depth_msg is not None:
-            w.header = self.depth_msg.header
-            w.header.frame_id = self.main_camera_frame
-        else:
-            w.header.frame_id = self.main_camera_frame
-        w.wrench.force.x = 0.0; w.wrench.force.y = 0.0; w.wrench.force.z = 0.0
-        w.wrench.torque.x = 0.0; w.wrench.torque.y = 0.0; w.wrench.torque.z = 0.0
-        self.pub_wrench_cmd.publish(w)
-
     # Camera intrinsics
     def on_info(self, msg: CameraInfo):
         self.K = np.array(msg.k, dtype=np.float32).reshape(3, 3)
@@ -654,31 +810,31 @@ class OrientationControlNode(Node):
         return (1.0 - alpha) * prev + alpha * x
 
     def on_depth(self, msg: CompressedImage):
-        # Store compressed depth message for processing
+        """Depth image callback - process pointcloud and estimate normal."""
         self.ocd.header = msg.header
-        self.depth_msg = msg
+        self.depth_msg = msg  # Keep for backwards compatibility
+        self.process_depth(msg)
 
-    def process_dmap(self):
-        if not self.depth_msg:
-            return
+    def process_depth(self, msg: CompressedImage):
+        """Process depth image: decompress, build pointcloud, estimate normal.
+
+        This runs at depth camera rate (~25Hz) and stores results for the controller.
+        """
         # --- Time bookkeeping for watchdog ---
-        stamp = self.depth_msg.header.stamp
+        stamp = msg.header.stamp
         now_s = float(stamp.sec) + 1e-9 * float(stamp.nanosec)
         measurement_ok = False
 
         centroid_out = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        normal_out   = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        goal_pose_out = None  # will become a PoseStamped if we have one
+        normal_out = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        goal_pose_out = None
         rotvec_err_out = np.zeros(3, dtype=np.float32)
-        tau_out = np.zeros(3, dtype=np.float32)
-        force_out = np.zeros(3, dtype=np.float32)
+
         # Decompress compressedDepth format -> numpy
-        # compressedDepth has a 12-byte header: uint32 format + float32 depthQuantA + float32 depthQuantB
-        np_arr = np.frombuffer(self.depth_msg.data, np.uint8)
+        np_arr = np.frombuffer(msg.data, np.uint8)
         if np_arr.size <= 12:
             self.get_logger().warn("Empty or invalid compressedDepth data, skipping frame")
             return
-        # Skip the 12-byte header to get to the PNG data
         png_data = np_arr[12:]
         depth = cv2.imdecode(png_data, cv2.IMREAD_UNCHANGED)
         if depth is None:
@@ -690,9 +846,9 @@ class OrientationControlNode(Node):
             self.ocd.depth_image = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
         else:
             self.ocd.depth_image = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
-        self.ocd.depth_image.header = self.depth_msg.header
+        self.ocd.depth_image.header = msg.header
 
-        # Normalize to meters (compressed depth is typically 16UC1 PNG)
+        # Normalize to meters
         if depth.dtype == np.uint16:
             depth_m = depth.astype(np.float32) * 1e-3
         else:
@@ -702,26 +858,30 @@ class OrientationControlNode(Node):
         valid = np.isfinite(depth_m) & (depth_m > 0.0)
         mask = valid & (depth_m >= self.dmap_filter_min) & (depth_m <= self.dmap_filter_max)
 
-        # Build filtered depth (32FC1) - invalid pixels set to NaN
+        # Build filtered depth
         depth_filtered = depth_m.copy()
         depth_filtered[~mask] = np.nan
 
-        # Convert to ROS
         self.ocd.depth_filtered_image = self.bridge.cv2_to_imgmsg(depth_filtered.astype(np.float32), encoding='32FC1')
         self.ocd.dmap_filter_min = self.dmap_filter_min
         self.ocd.dmap_filter_max = self.dmap_filter_max
-        # Defaults for pointcloud outputs
+
         points1 = np.zeros((0, 3), dtype=np.float32)
         points2 = np.zeros((0, 3), dtype=np.float32)
+
+        # Local variables for measurement storage
+        theta_err = 0.0
+        axis_err = np.zeros(3, dtype=np.float32)
+        d = 0.0
+        roll_error = 0.0
+        r = np.zeros(3, dtype=np.float32)
 
         # Point cloud (if enabled and we have intrinsics)
         if self.K is not None:
             fx, fy = self.K[0, 0], self.K[1, 1]
             cx, cy = self.K[0, 2], self.K[1, 2]
 
-            h, w = depth_m.shape
             stride = max(1, self.pcd_downsampling_stride)
-
             ys, xs = np.where(mask)
 
             if stride > 1:
@@ -732,7 +892,7 @@ class OrientationControlNode(Node):
                 x = (xs.astype(np.float32) - cx) * z / fx
                 y = (ys.astype(np.float32) - cy) * z / fy
                 points1 = np.stack([x, y, z], axis=1)
-                src_frame = self.depth_msg.header.frame_id
+                src_frame = msg.header.frame_id
                 pts_bbox = np.zeros((0, 3), dtype=np.float32)
                 try:
                     T = self.tf_buffer.lookup_transform(
@@ -741,13 +901,12 @@ class OrientationControlNode(Node):
                     R = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
                     t = T.transform.translation
                     t_vec = np.array([t.x, t.y, t.z], dtype=np.float32)
-                    pts_tgt = (R @ points1.T).T + t_vec  # (N,3)
+                    pts_tgt = (R @ points1.T).T + t_vec
 
                 except TransformException as e:
                     self.get_logger().warn(f'No TF {self.target_frame} <- {src_frame} at stamp: {e}')
                     pts_tgt = np.zeros((0, 3), dtype=np.float32)
                 else:
-                    # --- Axis-aligned bounding-box filter in target_frame ---
                     sel = np.all((pts_tgt >= self.bbox_min) & (pts_tgt <= self.bbox_max), axis=1)
                     pts_bbox = np.ascontiguousarray(pts_tgt[sel])
 
@@ -758,7 +917,7 @@ class OrientationControlNode(Node):
                     R_out = _quat_to_R_xyzw(q_out.x, q_out.y, q_out.z, q_out.w)
                     t_out = T_out.transform.translation
                     t_vec_out = np.array([t_out.x, t_out.y, t_out.z], dtype=np.float32)
-                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out  # (N,3)
+                    pts_bbox_out = (R_out @ pts_bbox.T).T + t_vec_out
 
                 except TransformException as e:
                     self.get_logger().warn(f'No TF {self.main_camera_frame} <- {self.target_frame}: {e}')
@@ -777,37 +936,40 @@ class OrientationControlNode(Node):
                     pts_crop = np.ascontiguousarray(pts_bbox_out[sel_crop])
                     points2 = pts_crop
 
-                    # Compute PCA normal
                     if pts_crop.shape[0] >= 10:
-                        centroid, normal = _pca_plane_normal(pts_crop)
+                        # ---------------- NORMAL ESTIMATION --------------- #
+                        if self.normal_estimation_method == 'PCA':
+                            centroid, normal = _pca_plane_normal(pts_crop, visualize=self.visualize_normal_estimation)
+                        elif self.normal_estimation_method == 'RANSAC':
+                            centroid, normal = _ransac_plane_normal(pts_crop, visualize=self.visualize_normal_estimation)
+
+                        # Restore state after visualization window is closed
+                        if self.visualize_normal_estimation:
+                            self.visualize_normal_estimation = False
+                            if self._orientation_control_before_viz:
+                                self.orientation_control_enabled = True
+                                self.get_logger().info('Re-enabling orientation_control_enabled after visualization closed')
+                            self._orientation_control_before_viz = False
 
                         if not self.ema_enable:
                             cen_s = centroid
                             nrm_s = normal
                             self._ema_centroid = centroid
-                            self._ema_normal   = normal
-                            self._ema_last_t   = now_s
+                            self._ema_normal = normal
+                            self._ema_last_t = now_s
                         else:
                             if self._ema_last_t is None:
-                                # First sample initializes the EMA
                                 self._ema_centroid = centroid.copy()
-                                self._ema_normal   = normal.copy()
-                                self._ema_last_t   = now_s
-
-                            # Keep a consistent normal hemisphere to avoid ± flips
-                            # if self._ema_normal is not None and np.dot(normal, self._ema_normal) < 0.0:
-                            #     normal = -normal
+                                self._ema_normal = normal.copy()
+                                self._ema_last_t = now_s
 
                         dt = max(0.0, now_s - (self._ema_last_t if self._ema_last_t is not None else now_s))
-                        # α from time-constant τ (handles variable frame rate)
                         alpha = 1.0 - math.exp(-dt / max(1e-3, self.ema_tau))
                         alpha = min(1.0, max(0.0, alpha))
 
-                        # EMA updates
                         self._ema_centroid = self._ema_update(self._ema_centroid, centroid, alpha)
-                        self._ema_normal   = self._ema_update(self._ema_normal,   normal,   alpha)
+                        self._ema_normal = self._ema_update(self._ema_normal, normal, alpha)
 
-                        # Renormalize the smoothed normal
                         n = LA.norm(self._ema_normal) + 1e-12
                         self._ema_normal /= n
 
@@ -822,14 +984,15 @@ class OrientationControlNode(Node):
                             'object_frame', self.main_camera_frame, Time(sec=0, nanosec=0), timeout=Duration(seconds=0.001))
                         q = T.transform.rotation
                         R_tf = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
-                        x_cf, y_cf, z_cf = R_tf[:, 0], R_tf[:, 1], R_tf[:, 2]   # each is a length-3 unit vector
+                        x_cf, y_cf, z_cf = R_tf[:, 0], R_tf[:, 1], R_tf[:, 2]
                         t = T.transform.translation
                         t_vec = np.array([t.x, t.y, t.z], dtype=np.float32)
                         cen_s_obj = (R_tf @ cen_s) + t_vec
                         nrm_s_obj = R_tf @ nrm_s
 
+                        # Publish surface target pose (at depth rate)
                         surface_target_pose = PoseStamped()
-                        surface_target_pose.header = self.depth_msg.header
+                        surface_target_pose.header = msg.header
                         surface_target_pose.header.frame_id = 'object_frame'
                         surface_target_pose.pose.position.x = float(cen_s_obj[0])
                         surface_target_pose.pose.position.y = float(cen_s_obj[1])
@@ -837,24 +1000,34 @@ class OrientationControlNode(Node):
                         surface_target_pose.pose.orientation = _quaternion_from_z(nrm_s_obj)
                         self.normal_estimate_pub.publish(surface_target_pose)
 
-                        # ---- Compute standoff based on mode ----
+                        # Broadcast surface target transform (at depth rate)
+                        tf_msg = TransformStamped()
+                        tf_msg.header = surface_target_pose.header
+                        tf_msg.child_frame_id = self.surface_target_frame
+                        tf_msg.transform.translation.x = surface_target_pose.pose.position.x
+                        tf_msg.transform.translation.y = surface_target_pose.pose.position.y
+                        tf_msg.transform.translation.z = surface_target_pose.pose.position.z
+                        tf_msg.transform.rotation = surface_target_pose.pose.orientation
+                        self.tf_broadcaster.sendTransform(tf_msg)
+
+                        # Compute standoff
                         if self.standoff_mode == 'euclidean':
-                            d = float(LA.norm(cen_s))  # ||c||
+                            d = float(LA.norm(cen_s))
                         elif self.standoff_mode == 'along_normal':
                             d = float(max(0.0, float(np.dot(nrm_s, cen_s))))
-                        else:  # 'fixed' or anything else
+                        else:
                             d = self.standoff_m
 
-                        # Desired EOAT pose: back off along normal by d; +Z aligned with normal
+                        # Desired EOAT pose
                         p_des_cf = cen_s - d*nrm_s
                         q_des_cf = _quaternion_from_z(nrm_s_obj)
-                        # Transform q_des_cf back to main_camera_frame
                         R_des_cf = _quat_to_R_xyzw(q_des_cf.x, q_des_cf.y, q_des_cf.z, q_des_cf.w)
                         R_cam = R_tf.T @ R_des_cf
                         q_des_cf = _R_to_quat_xyzw(R_cam)
 
+                        # Publish desired EOAT pose (at depth rate)
                         eoat_cf = PoseStamped()
-                        eoat_cf.header = self.depth_msg.header
+                        eoat_cf.header = msg.header
                         eoat_cf.header.frame_id = self.main_camera_frame
                         eoat_cf.pose.position.x = float(p_des_cf[0])
                         eoat_cf.pose.position.y = float(p_des_cf[1])
@@ -862,270 +1035,69 @@ class OrientationControlNode(Node):
                         eoat_cf.pose.orientation = q_des_cf
                         self.pub_eoat_pose_crop.publish(eoat_cf)
 
-                        R_goal = _quat_to_R_xyzw(q_des_cf.x, q_des_cf.y, q_des_cf.z, q_des_cf.w)
-                        xg, yg, zg = R_goal[:, 0], R_goal[:, 1], R_goal[:, 2]   # each is a length-3 unit vector
-
-                        # --- Z-axis alignment error in main_camera_frame ---
+                        # Z-axis alignment error
                         theta_err, axis_err = _z_axis_rotvec_error(nrm_s.astype(np.float32))
-                        rot_vec_error = axis_err * theta_err  # 3-vector [ωx, ωy, ωz]
+                        rot_vec_error = axis_err * theta_err
 
-                        # Compute rotational error w.r.t. object_frame
+                        # Roll error
                         roll_error = _roll_error(x_cf)
                         rot_vec_error[2] = roll_error
 
                         centroid_out = cen_s.astype(np.float32)
-                        normal_out   = nrm_s.astype(np.float32)
+                        normal_out = nrm_s.astype(np.float32)
                         rotvec_err_out = rot_vec_error.astype(np.float32)
-                        goal_pose_out = eoat_cf  # PoseStamped already filled
+                        goal_pose_out = eoat_cf
 
+                        # Publish rotation error (at depth rate)
                         err_msg = Vector3Stamped()
-                        err_msg.header = self.depth_msg.header
+                        err_msg.header = msg.header
                         err_msg.header.frame_id = self.main_camera_frame
                         err_msg.vector.x, err_msg.vector.y, err_msg.vector.z = map(float, rot_vec_error)
                         self.pub_z_rotvec_err.publish(err_msg)
 
-                        if self.orientation_control_enabled:
-                            # --- CONTROLLER ---
-                            # Compute control torques based on rot_vec_error
-
-
-                            # ================== FORCE PID (translational) ====================  # <<< NEW FOR FORCE PID >>>
-                            # Use p_des_cf as position error vector in main_camera_frame
-                            #pos_err = p_des_cf.astype(np.float32)
-
-                            #if self._last_pos_t is not None and self._last_pos_err is not None:
-                              #  dt_pos = max(1e-6, now_s - self._last_pos_t)
-                              #  dpos = (pos_err - self._last_pos_err) / dt_pos
-                            #else:
-                             #   dt_pos = 0.0
-                             #   dpos = np.zeros(3, dtype=np.float32)
-
-                           # self._last_pos_t = now_s
-                            #self._last_pos_err = pos_err.copy()
-
-                            # Integrate position error
-                           # if dt_pos > 0.0:
-                           #     self._int_pos_err += pos_err * dt_pos
-
-                           # Kp_lin = np.array([self.Kp, self.Kp, self.Kp], dtype=np.float32)
-                           # Kd_lin = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)
-                           # Ki_lin = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)
-
-                           # force = (Kp_lin * pos_err +
-                                   #  Kd_lin * dpos +
-                                 #    Ki_lin * self._int_pos_err).astype(np.float32)
-                           # force_out = force.copy()
-                           # self._last_force = force.copy()                                            # <<< NEW FOR FORCE PID >>>
-                            # --- PID control on rotation-vector error rot_vec_error---   # <<< NEW
-                            # Compute error derivative (finite difference)         # <<< NEW
-                            self.anti_windup_enabled = True
-                            self.aw_Tt = 0.05
-                            self.int_limit = 1e3
-                            self.e = theta_err  # store for debugging
-                            dt_ctrl = 0.0
-                            if self._last_err_t is not None:  # <<< NEW
-                                dt_ctrl = max(1e-6, now_s - self._last_err_t)                      # <<< NEW
-                                self.de = (self.e - self.last_e) / dt_ctrl                 # <<< NEW
-                            else:  
-                                dt_ctrl = 0.0                                                                 # <<< NEW
-                                self.de = 0.0                             # <<< NEW
-
-                            self._last_err_t = now_s   
-                            self.last_e = float(self.e)                                          # <<< NEW
-                            self._last_rotvec_err = rot_vec_error.copy()                                   # <<< NEW
-
-                             # Integral of error
-                            #if dt_ctrl > 0.0:
-                             #   self._int_rotvec_err += rot_vec_error* dt_ctrl
-                                # Optional: simple anti-windup clamp
-                              #  int_limit = 1e3   # tune as needed
-                               # self._int_rotvec_err = np.clip(
-                               #     self._int_rotvec_err, -int_limit, int_limit
-                               # )
-                            
-                            inertia_A = self.inertia_B + self.mass_B * d**2 # rotational inertia for torque control
-                            tau_max = self.linear_drag*d*self.v_max
-                            omega_n_max = math.sqrt(tau_max/(inertia_A*self.theta_max_deg*3.141592653589793/180.0))  # max angular 
-                            omega_n = omega_n_max; # natural frequency for desired max torque
-
-                            p_1 = -omega_n
-                            p_2 = -omega_n
-                            p_3 =-self.integral_alpha*omega_n
-
-                            if self.controller_type == 'PD':
-                                # PD controller
-                                self.Kp = inertia_A*(p_1*p_2)
-                                self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
-                                self.Ki = 0.0
-                            elif self.controller_type == 'PID':
-                                # PID controller
-                                self.Kp = inertia_A*(p_1*p_2+p_1*p_3+p_2*p_3)
-                                self.Ki = -inertia_A*(p_1*p_2*p_3)
-                                self.Kd = -inertia_A*(p_1 + p_2 + p_3) - self.linear_drag*d*d
-                            else:
-                                self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
-                                # PD controller
-                                self.Kp = inertia_A*(p_1*p_2)
-                                self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
-                                self.Ki = 0.0
-
-                            # self.Kp = inertia_A*(p_1*p_2)
-                            # self.Kd = -inertia_A*(p_1 + p_2) - self.linear_drag*d*d
-                            # self.Ki = 0.0
-                            # print(f"Updated gains: Kp={self.Kp}, Kd={self.Kd}" f"Ki={self.Ki}")
-                            # Elementwise PD: τ = Kp*ω + Kd*ω̇                                      # <<< NEW
-                           # Kp_vec = np.array([self.Kp,  self.Kp,  self.Kp],  dtype=np.float32)  # <<< NEW
-                          #  Ki_vec = np.array([self.Ki, self.Ki, self.Ki], dtype=np.float32)   # <<< NEW
-                          #  Kd_vec = np.array([self.Kd, self.Kd, self.Kd], dtype=np.float32)  # <<< NEW
-                            #tau_A = (Kp_vec * rot_vec_error+ Ki_vec * self._int_rotvec_err - Kd_vec * drot_vec_error).astype(np.float32)                # <<< NEW
-                            tau_A = (self.Kp * self.e + self.Ki * self.int_e + self.Kd * self.de)               # <<< NEW
-                            print(f"Pre-sat tau: {tau_A}")
-                            # Saturation
-                            tau_sat = np.clip(tau_A, -tau_max, tau_max)
-                          #  mag = np.linalg.norm(tau_A)
-                         #   if mag > tau_max:
-                           #     tau_sat = tau_A * (tau_max / mag)
-                           # else:
-                            #    tau_sat = tau_A
-
-
-                            print(f"Sat tau: {tau_sat}")
-                            # --------- Anti-windup (back-calculation) ----------
-                               # i_dot = e + (u_sat - u)/(Ki*Tt)
-                            if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
-                                Tt = float(getattr(self, "aw_Tt", 0.05))
-                                print(f"theta_err: {self.e}")
-                                i_dot = self.e + (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
-                                print(f"i_dot: {i_dot}")
-                                self.int_e += i_dot * dt_ctrl
-                                print(self.int_e)
-                            else:
-                                if dt_ctrl > 0.0:
-                                  self.int_e += self.e * dt_ctrl
-
-                            # Integrator clamp
-                            int_lim = float(getattr(self, "int_limit", 1e3))
-                            self.int_e = np.clip(self.int_e, -int_lim, int_lim)
-                            tau_A=tau_sat 
-                            tau_A_vec = tau_A * axis_err  # scale by error axis to get full 3-vector
-                            moment_tele_A = np.cross(r, self.force_teleop)
-                            force_drag_B = -self.linear_drag * self.lin_vel_cam
-                            moment_drag_B = -self.angular_drag * self.rot_vel_cam
-                            moment_dragB_A = np.cross(r, force_drag_B)
-                            self.ang_acc = (moment_dragB_A + tau_A_vec + moment_tele_A)/ inertia_A  # <<< NEW
-
-                            tau_out = tau_A_vec.copy()                                                     # <<< NEW
-                            self._last_tau = tau_A_vec.copy()                                              # <<< NEW
-                            self.force_B = self.mass_B * np.cross(self.ang_acc,r) - force_drag_B - self.force_teleop  # simple proportional model for force command based on torque command
-                            # Centripetal force command
-                            # self.force[2] = self.mass * np.linalg.norm(self.lin_vel_cam)**2 / np.linalg.norm(cen_s)
-                            self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop  # torque about camera origin
-                            self.tau_B[2] = roll_error * self.Kp  # add roll correction about Z-axis only
-
-                            self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
-                            # Saturation (optional)
-                            # lim = self.torque_limit
-                            # tau = np.clip(tau, -lim, lim)
-
-                            # Publish as Wrench (torque only; set forces to 0 or add your own position control)
-                            w = WrenchStamped()
-                            w.header = self.depth_msg.header
-                            w.header.frame_id = self.main_camera_frame
-                            w.wrench.force.x = float(self.force_B[0])
-                            w.wrench.force.y = float(self.force_B[1])
-                            w.wrench.force.z = float(self.force_B[2]) # Centripetal force command
-                            w.wrench.torque.x = float(self.tau_B[0])
-                            w.wrench.torque.y = float(self.tau_B[1])
-                            w.wrench.torque.z = float(self.tau_B[2])  # will be ~0 for Z-only error
-                            self.pub_wrench_cmd.publish(w)
-                        else:
-                            tau_out = np.zeros(3, dtype=np.float32)
-                            force_out = np.zeros(3, dtype=np.float32)   # <<< NEW
-                            self._last_tau = tau_out.copy()
-                            self._last_force = force_out.copy()
-                            self._publish_zero_wrench()
-
-                        # Mark this cycle as valid
                         measurement_ok = True
                         self._had_target_last_cycle = True
                         self._last_target_time_s = now_s
 
-        # Publish pointclouds
-        pcd2_msg = make_pointcloud2(
-            points1, frame_id=self.main_camera_frame, stamp=self.depth_msg.header.stamp
-        )
+        # Publish pointclouds (at depth rate)
+        pcd2_msg = make_pointcloud2(points1, frame_id=self.main_camera_frame, stamp=msg.header.stamp)
         self.eoat_pointcloud_publisher.publish(pcd2_msg)
 
-        pcd2_msg_final = make_pointcloud2(
-            points2, frame_id=self.main_camera_frame, stamp=self.depth_msg.header.stamp
-        )
+        pcd2_msg_final = make_pointcloud2(points2, frame_id=self.main_camera_frame, stamp=msg.header.stamp)
         self.fov_pointcloud_publisher.publish(pcd2_msg_final)
 
-        # cloud after bbox (in main_camera_frame) — reuse the message you just published
-        cloud_bbox_msg = make_pointcloud2(points1, frame_id=self.main_camera_frame, stamp=self.depth_msg.header.stamp)
-        self.ocd.cloud_bbox = cloud_bbox_msg
-
-        # cloud after cylindrical crop (in main_camera_frame)
-        cloud_crop_msg = make_pointcloud2(points2, frame_id=self.main_camera_frame, stamp=self.depth_msg.header.stamp)
-        self.ocd.cloud_crop = cloud_crop_msg
-
-        # Also publish those clouds to your existing topics (keep your current behavior)
-        self.eoat_pointcloud_publisher.publish(cloud_bbox_msg)
-        self.fov_pointcloud_publisher.publish(cloud_crop_msg)
-
-        # Geometry and pose data (smoothed centroid & normal, and EOAT goal pose if available)
+        # Store in ocd
+        self.ocd.cloud_bbox = pcd2_msg
+        self.ocd.cloud_crop = pcd2_msg_final
         self.ocd.centroid = Point(x=float(centroid_out[0]), y=float(centroid_out[1]), z=float(centroid_out[2]))
-        self.ocd.normal   = Vector3(x=float(normal_out[0]),   y=float(normal_out[1]),   z=float(normal_out[2]))
+        self.ocd.normal = Vector3(x=float(normal_out[0]), y=float(normal_out[1]), z=float(normal_out[2]))
 
         if goal_pose_out is not None:
             self.ocd.goal_pose = goal_pose_out
         else:
-            # Fill a PoseStamped with just the header so field is valid even when not tracking
             empty_pose = PoseStamped()
             empty_pose.header = self.ocd.header
             self.ocd.goal_pose = empty_pose
 
-        # Control data (rotvec error, torque command, gains)
         self.ocd.rotvec_error = Vector3(x=float(rotvec_err_out[0]), y=float(rotvec_err_out[1]), z=float(rotvec_err_out[2]))
 
-        # Use the torque we computed this cycle; if none, fall back to last commanded (zeros otherwise)
-        tau_for_msg = tau_out if measurement_ok else self._last_tau
-        self.ocd.torque_cmd = Vector3(x=float(tau_for_msg[0]), y=float(tau_for_msg[1]), z=float(tau_for_msg[2]))
-        self.ocd.cam_force_cmd = Vector3(x=float(self.force_B[0]), y=float(self.force_B[1]), z=float(self.force_B[2]))  # <<< NEW
-        self.ocd.cam_torque_cmd = Vector3(x=float(self.tau_B[0]), y=float(self.tau_B[1]), z=float(self.tau_B[2]))  # <<< NEW
+        # Store results thread-safely for controller timer
+        with self._measurement_lock:
+            self._latest_measurement['valid'] = measurement_ok
+            self._latest_measurement['centroid'] = centroid_out.copy()
+            self._latest_measurement['normal'] = normal_out.copy()
+            self._latest_measurement['timestamp'] = now_s
+            self._latest_measurement['rot_vec_error'] = rotvec_err_out.copy()
+            self._latest_measurement['theta_err'] = float(theta_err)
+            self._latest_measurement['axis_err'] = axis_err.copy()
+            self._latest_measurement['pts_crop'] = points2
+            self._latest_measurement['pts_bbox'] = points1
+            self._latest_measurement['d'] = float(d)
+            self._latest_measurement['roll_error'] = float(roll_error)
+            self._latest_measurement['r'] = r.copy()
 
-       # self.ocd.force_cmd = Vector3(x=float(force[0]),y=float(force[1]),z=float(force[2]),)  # <<< NEW
-       # self.ocd.torque_cmd_cam = Vector3(x=float(tau_cam[0]), y=float(tau_cam[1]), z=float(tau_cam[2]))  # <<< NEW
-
-        
-      #  force_for_msg = force_out if measurement_ok else self._last_force    # <<< NEW
-      #  self.ocd.force_cmd = Vector3(x=float(force_for_msg[0]), y=float(force_for_msg[1]), z=float(force_for_msg[2]))  # <<< NEW
-
-        self.ocd.k_p = float(self.Kp)
-        self.ocd.k_d = float(self.Kd)
-        if hasattr(self.ocd, 'k_i'):                             # <<< NEW
-            self.ocd.k_i = float(self.Ki)
-
-
-        # Frames
-        self.ocd.main_camera_frame = str(self.main_camera_frame)
-        self.ocd.target_frame      = str(self.target_frame)
-
-        # EMA & safety config
-        self.ocd.ema_enable            = bool(self.ema_enable)
-        self.ocd.ema_tau_s             = float(self.ema_tau)                # note: msg field is *_tau_s
-        self.ocd.no_target_timeout_s   = float(self.no_target_timeout_s)
-        self.ocd.publish_zero_when_lost = bool(self.publish_zero_when_lost)
-
-        if self.save_data:
-            self.bag_orientation_control_data()
-
-        # ---- Watchdog / fallback when no valid target this cycle ----
+        # Handle watchdog when no valid target
         if not measurement_ok:
-            if self.publish_zero_when_lost:
-                self._publish_zero_wrench()
-                self._last_tau = np.zeros(3, dtype=np.float32)
-                self._last_force = np.zeros(3, dtype=np.float32)   # <<< NEW
             if (self._last_target_time_s is None) or ((now_s - self._last_target_time_s) > self.no_target_timeout_s):
                 if self._had_target_last_cycle:
                     self.get_logger().warn('No valid target: lost')
@@ -1133,13 +1105,171 @@ class OrientationControlNode(Node):
                 self._ema_centroid = None
                 self._ema_last_t = None
                 self._had_target_last_cycle = False
-                # Reset PD error history when we lose the target         # <<< NEW
-                self._last_rotvec_err = None                              # <<< NEW
-                self._last_err_t = None                                   # <<< NEW
-                self._int_rotvec_err = np.zeros(3, dtype=np.float32)     # <<< NEW
-               # self._last_pos_err = None                        # <<< NEW FOR FORCE PID >>>
-               # self._last_pos_t = None                          # <<< NEW FOR FORCE PID >>>
-              #  self._int_pos_err = np.zeros(3, dtype=np.float32)  # <<< NEW FOR FORCE PID >>>
+
+    def _handle_no_measurement(self):
+        """Handle case when no valid measurement available - publish zero wrench."""
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        print("No valid measurement available.")
+
+        if self._had_target_last_cycle:
+            self._last_target_time_s = now_s
+            self._had_target_last_cycle = False
+
+        time_since_target = 0.0 if self._last_target_time_s is None else (now_s - self._last_target_time_s)
+
+        if time_since_target > self.no_target_timeout_s:
+            self._last_rotvec_err = None
+            self._last_err_t = None
+            self._int_rotvec_err = np.zeros(3, dtype=np.float32)
+            self.int_e = 0.0
+            self.last_e = 0.0
+
+        # Publish zero wrench
+        w = WrenchStamped()
+        w.header.stamp = self.get_clock().now().to_msg()
+        w.header.frame_id = self.main_camera_frame
+        self.pub_wrench_cmd.publish(w)
+
+    def process_controller(self):
+        """Timer callback - run controller at fixed rate (~10Hz)."""
+        # Read latest measurement thread-safely
+        with self._measurement_lock:
+            if not self._latest_measurement['valid']:
+                self._handle_no_measurement()
+                return
+
+            cen_s = self._latest_measurement['centroid'].copy()
+            nrm_s = self._latest_measurement['normal'].copy()
+            rot_vec_error = self._latest_measurement['rot_vec_error'].copy()
+            theta_err = self._latest_measurement['theta_err']
+            axis_err = self._latest_measurement['axis_err'].copy()
+            meas_time = self._latest_measurement['timestamp']
+            d = self._latest_measurement['d']
+            roll_error = self._latest_measurement['roll_error']
+            r = self._latest_measurement['r'].copy()
+
+        # Check staleness
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        # if (now_s - meas_time) > self.no_target_timeout_s:
+        #     self._handle_no_measurement()
+        #     return
+
+        tau_out = np.zeros(3, dtype=np.float32)
+
+        if self.orientation_control_enabled:
+            # --- PID control ---
+            self.anti_windup_enabled = True
+            self.aw_Tt = 0.05
+            self.int_limit = 1e3
+            self.e = theta_err
+            dt_ctrl = 0.0
+            if self._last_err_t is not None:
+                dt_ctrl = max(1e-6, now_s - self._last_err_t)
+                self.de = (self.e - self.last_e) / dt_ctrl
+            else:
+                dt_ctrl = 0.0
+                self.de = 0.0
+
+            self._last_err_t = now_s
+            self.last_e = float(self.e)
+            self._last_rotvec_err = rot_vec_error.copy()
+
+            inertia_A = self.inertia_B + self.mass_B * d**2
+            tau_max = self.linear_drag * d * self.v_max
+            omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * 3.141592653589793 / 180.0))
+            omega_n = omega_n_max
+
+            p_1 = -omega_n
+            p_2 = -omega_n
+            p_3 = -self.integral_alpha * omega_n
+
+            if self.controller_type == 'PD':
+                self.Kp = inertia_A * (p_1 * p_2)
+                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Ki = 0.0
+            elif self.controller_type == 'PID':
+                self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
+                self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+                self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
+            else:
+                self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
+                self.Kp = inertia_A * (p_1 * p_2)
+                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Ki = 0.0
+
+            print(f"e: {self.e}, de: {self.de}, int_e: {self.int_e}")
+            print(f"Kp*e: {self.Kp * self.e}, Ki*int_e: {self.Ki * self.int_e}, Kd*de: {self.Kd * self.de}")
+            tau_A = (self.Kp * self.e + self.Ki * self.int_e + self.Kd * self.de)
+            tau_sat = np.clip(tau_A, -tau_max, tau_max)
+
+            # Anti-windup
+            if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
+                Tt = float(getattr(self, "aw_Tt", 0.05))
+                print(f"self.e + (tau_sat - tau_A): {self.e + (tau_sat - tau_A)}")
+                print(f"Ki * Tt: {self.Ki * Tt}")
+                i_dot = self.e + (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
+                self.int_e += i_dot * dt_ctrl
+            else:
+                if dt_ctrl > 0.0:
+                    self.int_e += self.e * dt_ctrl
+
+            int_lim = float(getattr(self, "int_limit", 1e3))
+            self.int_e = np.clip(self.int_e, -int_lim, int_lim)
+            tau_A = tau_sat
+            tau_A_vec = tau_A * axis_err
+            moment_tele_A = np.cross(r, self.force_teleop)
+            force_drag_B = -self.linear_drag * self.lin_vel_cam
+            moment_drag_B = -self.angular_drag * self.rot_vel_cam
+            moment_dragB_A = np.cross(r, force_drag_B)
+            self.ang_acc = (moment_dragB_A + tau_A_vec + moment_tele_A) / inertia_A
+
+            tau_out = tau_A_vec.copy()
+            self._last_tau = tau_A_vec.copy()
+            self.force_B = self.mass_B * np.cross(self.ang_acc, r) - force_drag_B - self.force_teleop
+            self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop
+            self.tau_B[2] = roll_error * self.Kp
+
+            self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
+
+            w = WrenchStamped()
+            w.header.stamp = self.get_clock().now().to_msg()
+            w.header.frame_id = self.main_camera_frame
+            w.wrench.force.x = float(self.force_B[0])
+            w.wrench.force.y = float(self.force_B[1])
+            w.wrench.force.z = float(self.force_B[2])
+            w.wrench.torque.x = float(self.tau_B[0])
+            w.wrench.torque.y = float(self.tau_B[1])
+            w.wrench.torque.z = float(self.tau_B[2])
+            self.pub_wrench_cmd.publish(w)
+        else:
+            # Control disabled - publish zero wrench
+            tau_out = np.zeros(3, dtype=np.float32)
+            self._last_tau = tau_out.copy()
+            self._last_force = np.zeros(3, dtype=np.float32)
+
+            w = WrenchStamped()
+            w.header.stamp = self.get_clock().now().to_msg()
+            w.header.frame_id = self.main_camera_frame
+            self.pub_wrench_cmd.publish(w)
+
+        # Update OCD with controller outputs
+        self.ocd.torque_cmd = Vector3(x=float(tau_out[0]), y=float(tau_out[1]), z=float(tau_out[2]))
+        self.ocd.cam_force_cmd = Vector3(x=float(self.force_B[0]), y=float(self.force_B[1]), z=float(self.force_B[2]))
+        self.ocd.cam_torque_cmd = Vector3(x=float(self.tau_B[0]), y=float(self.tau_B[1]), z=float(self.tau_B[2]))
+
+        self.ocd.k_p = float(self.Kp)
+        self.ocd.k_d = float(self.Kd)
+        if hasattr(self.ocd, 'k_i'):
+            self.ocd.k_i = float(self.Ki)
+
+        self.ocd.main_camera_frame = str(self.main_camera_frame)
+        self.ocd.target_frame = str(self.target_frame)
+        self.ocd.ema_enable = bool(self.ema_enable)
+        self.ocd.ema_tau_s = float(self.ema_tau)
+        self.ocd.no_target_timeout_s = float(self.no_target_timeout_s)
+
+        if self.save_data:
+            self.bag_orientation_control_data()
 
 
     def bag_orientation_control_data(self):
@@ -1149,6 +1279,27 @@ class OrientationControlNode(Node):
                 serialize_message(self.ocd),
                 self.get_clock().now().nanoseconds
             )
+
+    def enable_normal_estimation_viz(self):
+        if not self.visualize_normal_estimation:
+            self.visualize_normal_estimation = True
+            self._orientation_control_before_viz = self.orientation_control_enabled
+            # Publish zero wrench to stop motion during visualization
+            w = WrenchStamped()
+            w.header.stamp = self.get_clock().now().to_msg()
+            w.header.frame_id = self.main_camera_frame
+            self.pub_wrench_cmd.publish(w)
+            if self.orientation_control_enabled:
+                self.orientation_control_enabled = False
+                self.get_logger().info('Disabling orientation_control_enabled for normal estimation visualization')
+
+    def disable_normal_estimation_viz(self):
+        if self.visualize_normal_estimation:
+            self.visualize_normal_estimation = False
+            if self._orientation_control_before_viz:
+                self.orientation_control_enabled = True
+                self.get_logger().info('Re-enabling orientation_control_enabled after normal estimation visualization closed')
+            self._orientation_control_before_viz = False
 
     # Param updates
     def _on_param_update(self, params):
@@ -1202,8 +1353,6 @@ class OrientationControlNode(Node):
             #     self.torque_limit = float(p.value)
             elif p.name == 'no_target_timeout_s':
                 self.no_target_timeout_s = float(p.value)
-            elif p.name == 'publish_zero_when_lost':
-                self.publish_zero_when_lost = bool(p.value)
             # Save Data Parameters
             elif p.name == 'object':
                 self.object = p.value
@@ -1243,7 +1392,17 @@ class OrientationControlNode(Node):
             elif p.name == 'integral_alpha':
                 self.integral_alpha = float(p.value)
                 self.get_logger().info(f'Updated integral_alpha to {self.integral_alpha}')
-        
+            elif p.name == 'normal_estimation_method':
+                self.normal_estimation_method = str(p.value).upper()
+                self.get_logger().info(f'Updated normal_estimation_method to {self.normal_estimation_method}')
+            elif p.name == 'visualize_normal_estimation':
+                self.visualize_normal_estimation = bool(p.value)
+                if self.visualize_normal_estimation:
+                   self.enable_normal_estimation_viz()
+                else:
+                    self.disable_normal_estimation_viz()
+                self.get_logger().info(f'Updated visualize_normal_estimation to {self.visualize_normal_estimation}')
+
         result = SetParametersResult()
         result.successful = True
 
