@@ -358,7 +358,7 @@ def _z_axis_rotvec_error(z_goal: np.ndarray) -> np.ndarray:
     theta = math.acos(c)
     print(f'Debug: theta={math.degrees(theta):.2f}°')
 
-    axis = np.cross(zc, zg)
+    axis = np.cross(zg, zc)
     n = LA.norm(axis)
 
     if n < 1e-9:
@@ -759,6 +759,10 @@ class OrientationControlNode(Node):
             self.writer.open(self.storage_options, self.converter_options)
             self.writer.create_topic(self.topic_info)
 
+        # Reset controller internal state so first dt_ctrl is not "time since last enable"
+        self._last_err_t = None
+        self.last_e = 0.0
+        self.de = 0.0
         #self._int_rotvec_err = np.zeros(3, dtype=np.float32)
         self.int_e = 0.0
         self.orientation_control_enabled = True
@@ -1161,10 +1165,12 @@ class OrientationControlNode(Node):
             self.anti_windup_enabled = True
             self.aw_Tt = 0.05
             self.int_limit = 1e3
-            self.e = theta_err
+            self.e = -theta_err
             dt_ctrl = 0.0
             if self._last_err_t is not None:
                 dt_ctrl = max(1e-6, now_s - self._last_err_t)
+                print(f"dt_ctrl: {dt_ctrl}")
+                #dt_ctrl=0.001
                 self.de = (self.e - self.last_e) / dt_ctrl
             else:
                 dt_ctrl = 0.0
@@ -1198,17 +1204,22 @@ class OrientationControlNode(Node):
                 self.Ki = 0.0
 
             print(f"e: {self.e}, de: {self.de}, int_e: {self.int_e}")
+            print(f"Kp: {self.Kp}, Ki: {self.Ki}, Kd: {self.Kd}")
+            print(f'd: {d}')
             print(f"Kp*e: {self.Kp * self.e}, Ki*int_e: {self.Ki * self.int_e}, Kd*de: {self.Kd * self.de}")
             tau_A = (self.Kp * self.e + self.Ki * self.int_e + self.Kd * self.de)
             tau_sat = np.clip(tau_A, -tau_max, tau_max)
+            print(f"tau_A: {tau_A}, tau_sat: {tau_sat}, tau_max: {tau_max}")
 
             # Anti-windup
             if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
                 Tt = float(getattr(self, "aw_Tt", 0.05))
-                print(f"self.e + (tau_sat - tau_A): {self.e + (tau_sat - tau_A)}")
+                print(f"(tau_sat - tau_A): {(tau_sat - tau_A)}")
                 print(f"Ki * Tt: {self.Ki * Tt}")
                 i_dot = self.e + (tau_sat - tau_A) / (self.Ki * max(1e-6, Tt))
+                print(f"i_dot: {i_dot}")
                 self.int_e += i_dot * dt_ctrl
+                print(f"Updated int_e (with anti-windup): {self.int_e}")
             else:
                 if dt_ctrl > 0.0:
                     self.int_e += self.e * dt_ctrl
