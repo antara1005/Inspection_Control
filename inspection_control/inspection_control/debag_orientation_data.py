@@ -1,283 +1,496 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import cv2
+import open3d as o3d
 import os
+import shutil
 import csv
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 import pathlib
 from viewpoint_generation_interfaces.msg import OrientationControlData
-from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs_py import point_cloud2
 import matplotlib
-import yaml
 matplotlib.use('Agg')  # Use non-interactive backend
 
-# Set OpenCV to not use GUI
-os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
-def generate_orientation_plots(csv_filepath):
-    # Read CSV data
+def quat_to_rotation_matrix(q):
+    """Convert quaternion (x, y, z, w) to 3x3 rotation matrix."""
+    x, y, z, w = q.x, q.y, q.z, q.w
+    # Normalize
+    n = np.sqrt(x*x + y*y + z*z + w*w) + 1e-12
+    x, y, z, w = x/n, y/n, z/n, w/n
+
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+
+    return np.array([
+        [1 - 2*(yy + zz),     2*(xy - wz),       2*(xz + wy)],
+        [    2*(xy + wz), 1 - 2*(xx + zz),       2*(yz - wx)],
+        [    2*(xz - wy),     2*(yz + wx),   1 - 2*(xx + yy)]
+    ], dtype=np.float64)
+
+
+def transform_points(points, transform_msg):
+    """Transform points using a TransformStamped message."""
+    if len(points) == 0:
+        return points
+
+    R = quat_to_rotation_matrix(transform_msg.transform.rotation)
+    t = np.array([
+        transform_msg.transform.translation.x,
+        transform_msg.transform.translation.y,
+        transform_msg.transform.translation.z
+    ], dtype=np.float64)
+
+    # Transform: p' = R @ p + t
+    return (R @ points.T).T + t
+
+
+def transform_vector(vec, transform_msg):
+    """Transform a vector (rotation only, no translation) using a TransformStamped message."""
+    R = quat_to_rotation_matrix(transform_msg.transform.rotation)
+    return R @ vec
+
+
+def generate_theta_control_plots(csv_filepath):
+    """
+    Generate plots showing theta state and control:
+    - Top: theta error with filtered error on same plot
+    - Middle: derivative and integral
+    - Bottom: theta_torque command
+    """
     df = pd.read_csv(csv_filepath)
     csv_path = pathlib.Path(csv_filepath)
 
     # Convert timestamps to seconds relative to start
     timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 12))
-    # fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes[0].plot(timestamps_sec, df['error_x'], label='Error X')
-    axes[0].plot(timestamps_sec, df['error_y'], label='Error Y')
-    axes[0].plot(timestamps_sec, df['error_z'], label='Error Z')
-    axes[0].set_title('Rotational Error Over Time')
-    axes[0].set_xlabel('Time (s)')
-    axes[0].set_ylabel('Error (rad)')
-    axes[0].legend()
-    # Add torque commands
-    axes[1].plot(timestamps_sec, df['torque_x'], label='Torque X')
-    axes[1].plot(timestamps_sec, df['torque_y'], label='Torque Y')
-    axes[1].plot(timestamps_sec, df['torque_z'], label='Torque Z')
-    axes[1].set_title('Torque Commands Over Time')
-    axes[1].set_xlabel('Time (s)')
-    axes[1].set_ylabel('Torque (Nm)')
-    axes[1].legend()
-    # Add Cam Force and Torque plots
-    axes[2].plot(timestamps_sec, df['cam_force_x'], label='Cam Force X')
-    axes[2].plot(timestamps_sec, df['cam_force_y'], label='Cam Force Y')
-    axes[2].plot(timestamps_sec, df['cam_force_z'], label='Cam Force Z')
-    axes[2].set_title('Camera Force Commands Over Time')
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    # Top plot: theta error and filtered error
+    axes[0].plot(timestamps_sec, np.degrees(df['theta_error']),
+                 label='Theta Error', color='blue', alpha=0.7)
+    axes[0].plot(timestamps_sec, np.degrees(df['theta_error_filtered']),
+                 label='Filtered Error', color='red', linewidth=2)
+    axes[0].set_ylabel('Error (degrees)')
+    axes[0].set_ylim(-90, 90)
+    axes[0].set_title('Theta Error Over Time')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, alpha=0.3)
+
+    # Middle plot: derivative and integral
+    ax_deriv = axes[1]
+    ax_integ = ax_deriv.twinx()
+
+    line1, = ax_deriv.plot(timestamps_sec, np.degrees(df['dtheta_error']),
+                           label='Derivative (dθ/dt)', color='green')
+    line2, = ax_integ.plot(timestamps_sec, np.degrees(df['itheta_error']),
+                           label='Integral (∫θ dt)', color='orange')
+
+    ax_deriv.set_ylabel('Derivative (deg/s)', color='green')
+    ax_integ.set_ylabel('Integral (deg·s)', color='orange')
+    ax_deriv.tick_params(axis='y', labelcolor='green')
+    ax_integ.tick_params(axis='y', labelcolor='orange')
+    ax_deriv.set_title('Derivative and Integral of Theta Error')
+    ax_deriv.legend(handles=[line1, line2], loc='upper right')
+    ax_deriv.grid(True, alpha=0.3)
+
+    # Bottom plot: theta torque command
+    axes[2].plot(timestamps_sec, df['theta_torque_command'],
+                 label='Theta Torque', color='purple', linewidth=1.5)
     axes[2].set_xlabel('Time (s)')
-    axes[2].set_ylabel('Force (N)')
-    axes[2].legend()
-    axes[3].plot(timestamps_sec, df['cam_torque_x'], label='Cam Torque X')
-    axes[3].plot(timestamps_sec, df['cam_torque_y'], label='Cam Torque Y')
-    axes[3].plot(timestamps_sec, df['cam_torque_z'], label='Cam Torque Z')
-    axes[3].set_title('Camera Torque Commands Over Time')
-    axes[3].set_xlabel('Time (s)')
-    axes[3].set_ylabel('Torque (Nm)')
-    axes[3].legend()
-    # # --- Rotational error (rotvec_error) ---
-    # ax = axes[0, 0]
-    # ax.plot(timestamps_sec, df['error_x'], label='Error X')
-    # ax.plot(timestamps_sec, df['error_y'], label='Error Y')
-    # ax.plot(timestamps_sec, df['error_z'], label='Error Z')
-    # ax.set_title('Rotational Error Over Time')
-    # ax.set_xlabel('Time (s)')
-    # ax.set_ylabel('Error (rad)')
-    # ax.legend()
-    # ax.grid(True)
-
-    # # --- Torque commands ---
-    # ax = axes[0, 1]
-    # ax.plot(timestamps_sec, df['torque_x'], label='Torque X')
-    # ax.plot(timestamps_sec, df['torque_y'], label='Torque Y')
-    # ax.plot(timestamps_sec, df['torque_z'], label='Torque Z')
-    # ax.set_title('Torque Commands Over Time')
-    # ax.set_xlabel('Time (s)')
-    # ax.set_ylabel('Torque (Nm)')
-    # ax.legend()
-    # ax.grid(True)
-
-    # # --- Position error (pos_error) ---
-    # ax = axes[1, 0]
-    # ax.plot(timestamps_sec, df['pos_error_x'], label='pos_err X')
-    # ax.plot(timestamps_sec, df['pos_error_y'], label='pos_err Y')
-    # ax.plot(timestamps_sec, df['pos_error_z'], label='pos_err Z')
-    # ax.set_title('Position Error (p_des_cf) Over Time')
-    # ax.set_xlabel('Time (s)')
-    # ax.set_ylabel('Position Error (m)')
-    # ax.legend()
-    # ax.grid(True)
-
-    # # --- Force commands ---
-    # ax = axes[1, 1]
-    # ax.plot(timestamps_sec, df['force_x'], label='Force X')
-    # ax.plot(timestamps_sec, df['force_y'], label='Force Y')
-    # ax.plot(timestamps_sec, df['force_z'], label='Force Z')
-    # ax.set_title('Force Commands Over Time')
-    # ax.set_xlabel('Time (s)')
-    # ax.set_ylabel('Force (N)')
-    # ax.legend()
-    # ax.grid(True)
-
-
+    axes[2].set_ylabel('Torque (Nm)')
+    axes[2].set_title('Theta Torque Command')
+    axes[2].legend(loc='upper right')
+    axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
 
-    plot_filename = csv_path.parent / f'{csv_path.stem}_analysis.png'
+    plot_filename = csv_path.parent / f'{csv_path.stem}_theta_control.png'
     plt.savefig(plot_filename, dpi=150)
     plt.close()
-    print(f"Plot saved to {plot_filename}")
+    print(f"Theta control plot saved to {plot_filename}")
 
-def depth_to_colormap(depth_image, colormap=cv2.COLORMAP_TURBO, depth_min=None, depth_max=None):
+
+def generate_roll_control_plots(csv_filepath):
     """
-    Convert a single depth image (float) to a colormap image (BGR uint8).
-    
+    Generate plots showing roll state and control (similar structure to theta).
+    """
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
+
+    timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    # Top: roll error
+    axes[0].plot(timestamps_sec, np.degrees(df['roll_error']),
+                 label='Roll Error', color='blue', linewidth=1.5)
+    axes[0].set_ylabel('Error (degrees)')
+    axes[0].set_title('Roll Error Over Time')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, alpha=0.3)
+
+    # Middle: derivative and integral
+    ax_deriv = axes[1]
+    ax_integ = ax_deriv.twinx()
+
+    line1, = ax_deriv.plot(timestamps_sec, np.degrees(df['droll_error']),
+                           label='Derivative', color='green')
+    line2, = ax_integ.plot(timestamps_sec, np.degrees(df['iroll_error']),
+                           label='Integral', color='orange')
+
+    ax_deriv.set_ylabel('Derivative (deg/s)', color='green')
+    ax_integ.set_ylabel('Integral (deg·s)', color='orange')
+    ax_deriv.tick_params(axis='y', labelcolor='green')
+    ax_integ.tick_params(axis='y', labelcolor='orange')
+    ax_deriv.set_title('Derivative and Integral of Roll Error')
+    ax_deriv.legend(handles=[line1, line2], loc='upper right')
+    ax_deriv.grid(True, alpha=0.3)
+
+    # Bottom: roll torque command
+    axes[2].plot(timestamps_sec, df['roll_torque_command'],
+                 label='Roll Torque', color='purple', linewidth=1.5)
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_ylabel('Torque (Nm)')
+    axes[2].set_title('Roll Torque Command')
+    axes[2].legend(loc='upper right')
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    plot_filename = csv_path.parent / f'{csv_path.stem}_roll_control.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+    print(f"Roll control plot saved to {plot_filename}")
+
+
+def pointcloud2_to_array(cloud_msg):
+    """
+    Convert a ROS2 PointCloud2 message to numpy arrays of points and colors.
+    Returns (points, colors) where colors may be None if not present.
+    """
+    # Read points from the cloud
+    points_list = []
+    colors_list = []
+
+    # Get field names
+    field_names = [f.name for f in cloud_msg.fields]
+    has_rgb = 'rgb' in field_names or 'rgba' in field_names
+
+    for point in point_cloud2.read_points(cloud_msg, skip_nans=True):
+        points_list.append([point['x'], point['y'], point['z']])
+
+        if has_rgb:
+            # RGB is packed as a float, need to unpack
+            if 'rgb' in field_names:
+                rgb = point['rgb']
+            else:
+                rgb = point['rgba']
+
+            # Unpack RGB from float
+            if isinstance(rgb, float):
+                rgb_int = int(rgb)
+            else:
+                rgb_int = rgb
+            r = (rgb_int >> 16) & 0xFF
+            g = (rgb_int >> 8) & 0xFF
+            b = rgb_int & 0xFF
+            colors_list.append([r / 255.0, g / 255.0, b / 255.0])
+
+    points = np.array(points_list, dtype=np.float64)
+    colors = np.array(colors_list, dtype=np.float64) if colors_list else None
+
+    return points, colors
+
+
+def create_time_gradient_color(t_normalized, cmap_name='viridis'):
+    """
+    Create a color based on normalized time [0, 1] using a colormap.
+    """
+    cmap = plt.get_cmap(cmap_name)
+    return np.array(cmap(t_normalized)[:3])  # RGB, drop alpha
+
+
+def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps, output_path):
+    """
+    Create an Open3D visualization with all point clouds colored by time gradient.
+    Also shows normals at each centroid.
+
     Args:
-        depth_image: numpy array with float depth values
-        colormap: OpenCV colormap constant
-    
-    Returns:
-        BGR uint8 image suitable for video writing
+        point_clouds: List of numpy arrays (N, 3) for each timestep
+        normals: List of numpy arrays (3,) surface normals
+        centroids: List of numpy arrays (3,) surface centroids
+        timestamps: List of timestamps
+        output_path: Path to save the visualization
     """
-    # Handle invalid values (NaN, inf)
-    depth_clean = np.nan_to_num(depth_image, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Normalize to 0-255 range
-    if not depth_min: depth_min = np.min(depth_clean[depth_clean > 0])  # Ignore zeros/invalid
-    if not depth_max: depth_max = np.max(depth_clean)
-    
-    if depth_max > depth_min:
-        normalized = ((depth_clean - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
-    else:
-        normalized = np.zeros_like(depth_clean, dtype=np.uint8)
-    
-    # Where depth_image is zero, make colored image black
-    mask_filtered = (depth_image == np.nan)
+    if not point_clouds:
+        print("No point clouds to visualize")
+        return
 
-    # Apply colormap
-    colored = cv2.applyColorMap(normalized, colormap)
-    colored[mask_filtered] = [0, 0, 0]  # Black for invalid depth
-    
-    return colored
+    # Normalize timestamps to [0, 1]
+    t_min = min(timestamps)
+    t_max = max(timestamps)
+    t_range = t_max - t_min if t_max > t_min else 1.0
+
+    # Compute average centroid for camera positioning
+    valid_centroids = [c for c in centroids if c is not None]
+    if valid_centroids:
+        avg_centroid = np.mean(valid_centroids, axis=0)
+    else:
+        avg_centroid = np.zeros(3)
+
+    # Combined geometry for visualization
+    combined_pcd = o3d.geometry.PointCloud()
+    geometries = []
+
+    # Process each point cloud
+    for points, normal, centroid, t in zip(point_clouds, normals, centroids, timestamps):
+        if len(points) == 0:
+            continue
+
+        t_normalized = (t - t_min) / t_range
+        color = create_time_gradient_color(t_normalized)
+
+        # Create point cloud with time-based color
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(np.tile(color, (len(points), 1)))
+
+        # Add to combined
+        combined_pcd += pcd
+
+        # Create normal arrow at centroid (flip normal sign)
+        if centroid is not None and normal is not None:
+            flipped_normal = -normal  # Flip the normal vector
+            arrow_length = 0.05  # 5cm arrow
+            line_points = [centroid, centroid + flipped_normal * arrow_length]
+            line = o3d.geometry.LineSet()
+            line.points = o3d.utility.Vector3dVector(line_points)
+            line.lines = o3d.utility.Vector2iVector([[0, 1]])
+            line.colors = o3d.utility.Vector3dVector([color])
+            geometries.append(line)
+
+    # Clean up the combined point cloud
+    if combined_pcd.has_points():
+        print(f"Raw combined cloud: {len(combined_pcd.points)} points")
+
+        # Voxel downsample to create uniform point density
+        voxel_size = 0.002  # 2mm voxel size
+        combined_pcd = combined_pcd.voxel_down_sample(voxel_size)
+        print(f"After voxel downsampling ({voxel_size*1000:.1f}mm): {len(combined_pcd.points)} points")
+
+        # Remove statistical outliers
+        if len(combined_pcd.points) > 20:
+            combined_pcd, inlier_indices = combined_pcd.remove_statistical_outlier(
+                nb_neighbors=20,  # Number of neighbors to consider
+                std_ratio=2.0     # Standard deviation threshold
+            )
+            print(f"After statistical outlier removal: {len(combined_pcd.points)} points")
+
+    geometries.insert(0, combined_pcd)
+
+    # Add coordinate frame at origin
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+    geometries.append(coord_frame)
+
+    # Save to file
+    ply_path = output_path.parent / f'{output_path.stem}_pointclouds.ply'
+    o3d.io.write_point_cloud(str(ply_path), combined_pcd)
+    print(f"Combined point cloud saved to {ply_path}")
+
+    # Create visualization and save screenshot
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(visible=False, width=1920, height=1080)
+
+    for geom in geometries:
+        vis.add_geometry(geom)
+
+    # Set camera view: position at (-d/2, -d/2, -d/2) looking at average centroid
+    ctr = vis.get_view_control()
+
+    # Compute d as average distance from origin to centroids
+    if valid_centroids:
+        distances = [np.linalg.norm(c) for c in valid_centroids]
+        d = np.mean(distances)
+    else:
+        d = 1.0
+
+    # Camera position offset from average centroid
+    camera_offset = np.array([-d / 2, -d / 2, -d / 2])
+    camera_pos = avg_centroid + camera_offset
+
+    # Direction from camera to target (average centroid)
+    front = avg_centroid - camera_pos
+    front = front / (np.linalg.norm(front) + 1e-12)
+
+    # Set view parameters
+    ctr.set_lookat(avg_centroid)
+    ctr.set_front(-front)  # Open3D front is opposite of look direction
+    ctr.set_up([0, 0, -1])  # Z-up, but inverted for this view
+    ctr.set_zoom(0.5)
+
+    vis.poll_events()
+    vis.update_renderer()
+
+    # Save screenshot
+    screenshot_path = output_path.parent / f'{output_path.stem}_pointclouds.png'
+    vis.capture_screen_image(str(screenshot_path))
+    vis.destroy_window()
+    print(f"Point cloud visualization saved to {screenshot_path}")
+
+    return combined_pcd
 
 
 def debag(bag_file):
     bag_file = pathlib.Path(bag_file)
     output_dir = bag_file.with_suffix('')
     output_dir.mkdir(exist_ok=True)
-    os.rename(bag_file, output_dir / bag_file.name)
-    bag_file = output_dir / bag_file.name
+
+    # Output file base path (in output directory, same stem as bag)
+    output_base = output_dir / bag_file.stem
 
     reader = rosbag2_py.SequentialReader()
-    bridge = CvBridge()
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-
     reader.open(rosbag2_py.StorageOptions(uri=str(bag_file)),
                 rosbag2_py.ConverterOptions())
 
     if not reader.has_next():
         print(f"No messages in bag file {bag_file}")
         return
-     # Get first message to determine video properties
-    (topic, data, t) = reader.read_next()
-    first_msg = deserialize_message(data, OrientationControlData)
-    first_depth_image = bridge.imgmsg_to_cv2(
-        first_msg.depth_image, desired_encoding='passthrough')
-    first_depth_filtered_image = bridge.imgmsg_to_cv2(
-        first_msg.depth_filtered_image, desired_encoding='passthrough')
 
-    # Initialize video writer
-    depth_out = cv2.VideoWriter(str(output_dir) + f"/{bag_file.stem}_depth.avi",
-                          fourcc, 20.0, (first_depth_image.shape[1], first_depth_image.shape[0]))
-    depth_out.write(depth_to_colormap(first_depth_image))
-    depth_filtered_out = cv2.VideoWriter(str(output_dir) + f"/{bag_file.stem}_depth_filtered.avi",
-                          fourcc, 20.0, (first_depth_filtered_image.shape[1], first_depth_filtered_image.shape[0]))
-    depth_filtered_out.write(depth_to_colormap(first_depth_filtered_image))
+    # Storage for point cloud visualization
+    all_point_clouds = []
+    all_normals = []
+    all_centroids = []
+    all_timestamps = []
+
     # Initialize CSV writer
-    csv_file = open(bag_file.with_suffix('.csv'), 'w', newline='')
+    csv_filename = output_base.with_suffix('.csv')
+    csv_file = open(csv_filename, 'w', newline='')
     csv_writer = csv.writer(csv_file)
 
-    # CSV Header
+    # CSV Header matching new message structure
     csv_writer.writerow([
         'timestamp',
-        'main_camera_frame',
-        'target_frame',
+        'normal_method',
+        # Surface geometry
         'centroid_x',
         'centroid_y',
         'centroid_z',
         'normal_x',
         'normal_y',
         'normal_z',
-        'goal_position_x',
-        'goal_position_y',
-        'goal_position_z',
-        'goal_orientation_x',
-        'goal_orientation_y',
-        'goal_orientation_z',
-        'goal_orientation_w',
-        'error_x',
-        'error_y',
-        'error_z',
-        'torque_x',
-        'torque_y',
-        'torque_z',
-        'cam_force_x',
-        'cam_force_y',
-        'cam_force_z',
-        'cam_torque_x',
-        'cam_torque_y',
-        'cam_torque_z',
-        'k_p',
-        'k_d',
-        'k_i',
+        # Current pose
+        'current_pose_x',
+        'current_pose_y',
+        'current_pose_z',
+        'current_pose_qx',
+        'current_pose_qy',
+        'current_pose_qz',
+        'current_pose_qw',
+        # Current twist
+        'current_twist_linear_x',
+        'current_twist_linear_y',
+        'current_twist_linear_z',
+        'current_twist_angular_x',
+        'current_twist_angular_y',
+        'current_twist_angular_z',
+        # Goal pose
+        'goal_pose_x',
+        'goal_pose_y',
+        'goal_pose_z',
+        'goal_pose_qx',
+        'goal_pose_qy',
+        'goal_pose_qz',
+        'goal_pose_qw',
+        # Theta control
+        'theta_error',
+        'theta_error_filtered',
+        'dtheta_error',
+        'itheta_error',
+        'theta_axis_x',
+        'theta_axis_y',
+        'theta_axis_z',
+        'theta_torque_command',
+        # Roll control
+        'roll_error',
+        'droll_error',
+        'iroll_error',
+        'roll_torque_command',
+        # PID gains
+        'k_p_theta',
+        'k_d_theta',
+        'k_i_theta',
+        'k_p_roll',
+        'k_d_roll',
+        'k_i_roll',
     ])
 
-    csv_writer.writerow([
-        t,
-        first_msg.main_camera_frame,
-        first_msg.target_frame,
-        first_msg.centroid.x,
-        first_msg.centroid.y,
-        first_msg.centroid.z,
-        first_msg.normal.x,
-        first_msg.normal.y,
-        first_msg.normal.z,
-        first_msg.goal_pose.pose.position.x,
-        first_msg.goal_pose.pose.position.y,
-        first_msg.goal_pose.pose.position.z,
-        first_msg.goal_pose.pose.orientation.x,
-        first_msg.goal_pose.pose.orientation.y,
-        first_msg.goal_pose.pose.orientation.z,
-        first_msg.goal_pose.pose.orientation.w,
-        first_msg.rotvec_error.x,
-        first_msg.rotvec_error.y,
-        first_msg.rotvec_error.z,
-        first_msg.torque_cmd.x,
-        first_msg.torque_cmd.y,
-        first_msg.torque_cmd.z,
-        first_msg.cam_force_cmd.x,
-        first_msg.cam_force_cmd.y,
-        first_msg.cam_force_cmd.z,
-        first_msg.cam_torque_cmd.x,
-        first_msg.cam_torque_cmd.y,
-        first_msg.cam_torque_cmd.z,
-        first_msg.k_p,
-        first_msg.k_d,
-        first_msg.k_i,
-    ])
-
+    msg_count = 0
     while reader.has_next():
         (topic, data, t) = reader.read_next()
-
-        # Deserialize Message
         msg = deserialize_message(data, OrientationControlData)
+        msg_count += 1
 
+        # Extract point cloud for visualization (transform to object_frame)
         try:
-            cv_image = bridge.imgmsg_to_cv2(
-                msg.depth_image, desired_encoding='passthrough')
-            depth_out.write(depth_to_colormap(cv_image))
-        except CvBridgeError as e:
-            print(e)
+            points, _ = pointcloud2_to_array(msg.point_cloud)
+            if len(points) > 0:
+                # Transform point cloud from camera_frame to object_frame
+                points_obj = transform_points(points, msg.camera_transform)
+                all_point_clouds.append(points_obj)
 
-        try:
-            cv_filtered_image = bridge.imgmsg_to_cv2(
-                msg.depth_filtered_image, desired_encoding='passthrough')
-            depth_filtered_out.write(depth_to_colormap(cv_filtered_image, depth_min=msg.dmap_filter_min, depth_max=msg.dmap_filter_max))
-        except CvBridgeError as e:
-            print(e)
+                # Transform normal (rotation only)
+                normal_cam = np.array([
+                    msg.surface_normal.x,
+                    msg.surface_normal.y,
+                    msg.surface_normal.z
+                ])
+                normal_obj = transform_vector(normal_cam, msg.camera_transform)
+                all_normals.append(normal_obj)
+
+                # Transform centroid
+                centroid_cam = np.array([
+                    msg.surface_centroid.x,
+                    msg.surface_centroid.y,
+                    msg.surface_centroid.z
+                ])
+                centroid_obj = transform_points(centroid_cam.reshape(1, 3), msg.camera_transform).flatten()
+                all_centroids.append(centroid_obj)
+
+                all_timestamps.append(t)
+        except Exception as e:
+            print(f"Error extracting point cloud at msg {msg_count}: {e}")
 
         # Write data to CSV
         csv_writer.writerow([
             t,
-            msg.main_camera_frame,
-            msg.target_frame,
-            msg.centroid.x,
-            msg.centroid.y,
-            msg.centroid.z,
-            msg.normal.x,
-            msg.normal.y,
-            msg.normal.z,
+            msg.normal_method,
+            # Surface geometry
+            msg.surface_centroid.x,
+            msg.surface_centroid.y,
+            msg.surface_centroid.z,
+            msg.surface_normal.x,
+            msg.surface_normal.y,
+            msg.surface_normal.z,
+            # Current pose
+            msg.current_pose.pose.position.x,
+            msg.current_pose.pose.position.y,
+            msg.current_pose.pose.position.z,
+            msg.current_pose.pose.orientation.x,
+            msg.current_pose.pose.orientation.y,
+            msg.current_pose.pose.orientation.z,
+            msg.current_pose.pose.orientation.w,
+            # Current twist
+            msg.current_twist.twist.linear.x,
+            msg.current_twist.twist.linear.y,
+            msg.current_twist.twist.linear.z,
+            msg.current_twist.twist.angular.x,
+            msg.current_twist.twist.angular.y,
+            msg.current_twist.twist.angular.z,
+            # Goal pose
             msg.goal_pose.pose.position.x,
             msg.goal_pose.pose.position.y,
             msg.goal_pose.pose.position.z,
@@ -285,28 +498,47 @@ def debag(bag_file):
             msg.goal_pose.pose.orientation.y,
             msg.goal_pose.pose.orientation.z,
             msg.goal_pose.pose.orientation.w,
-            msg.rotvec_error.x,
-            msg.rotvec_error.y,
-            msg.rotvec_error.z,
-            msg.torque_cmd.x,
-            msg.torque_cmd.y,
-            msg.torque_cmd.z,
-            msg.cam_force_cmd.x,
-            msg.cam_force_cmd.y,
-            msg.cam_force_cmd.z,
-            msg.cam_torque_cmd.x,
-            msg.cam_torque_cmd.y,
-            msg.cam_torque_cmd.z,
-            msg.k_p,
-            msg.k_d,
-            msg.k_i,
+            # Theta control
+            msg.theta_error,
+            msg.theta_error_filtered,
+            msg.dtheta_error,
+            msg.itheta_error,
+            msg.theta_axis.x,
+            msg.theta_axis.y,
+            msg.theta_axis.z,
+            msg.theta_torque_command,
+            # Roll control
+            msg.roll_error,
+            msg.droll_error,
+            msg.iroll_error,
+            msg.roll_torque_command,
+            # PID gains
+            msg.k_p_theta,
+            msg.k_d_theta,
+            msg.k_i_theta,
+            msg.k_p_roll,
+            msg.k_d_roll,
+            msg.k_i_roll,
         ])
 
-    # Close CSV file and video
     csv_file.close()
-    # out.release()
-    csv_filename = bag_file.with_suffix('.csv')
+    print(f"CSV saved to {csv_filename} ({msg_count} messages)")
 
-    # Generate the detailed analysis plots
-    generate_orientation_plots(csv_filename)
+    # Generate the theta and roll control plots
+    generate_theta_control_plots(csv_filename)
+    generate_roll_control_plots(csv_filename)
 
+    # Generate Open3D point cloud visualization
+    print(f"Creating point cloud visualization from {len(all_point_clouds)} clouds...")
+    visualize_pointclouds_over_time(
+        all_point_clouds,
+        all_normals,
+        all_centroids,
+        all_timestamps,
+        output_base
+    )
+
+    # Delete the original bag file (directory) to save space
+    if bag_file.exists():
+        shutil.rmtree(bag_file)
+        print(f"Deleted bag file: {bag_file}")

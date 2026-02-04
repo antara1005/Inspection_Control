@@ -21,7 +21,7 @@ orientation_controller:
     standoff_m: 0.10 # standoff_value for fixed standoff mode
     standoff_mode: euclidean
     ema_enable: True
-    ema_tau: 0.5
+    ema_tau: 0.1
 
     normal_estimation_method: RANSAC #options: PCA, RANSAC
     visualize_normal_estimation: False
