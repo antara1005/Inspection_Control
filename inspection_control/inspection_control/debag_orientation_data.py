@@ -167,6 +167,138 @@ def generate_roll_control_plots(csv_filepath):
     print(f"Roll control plot saved to {plot_filename}")
 
 
+def estimate_kalman_noise_parameters(csv_filepath):
+    """
+    Estimate measurement noise (R) and process noise (Q) for Kalman filter tuning.
+
+    Measurement Noise (R): Variance of theta_error during near-stationary periods
+    Process Noise (Q): Variance of prediction errors (actual - predicted state change)
+
+    Returns dict with noise estimates and saves analysis plot.
+    """
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
+
+    # Convert timestamps to seconds
+    timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
+    dt = np.diff(timestamps_sec)
+
+    theta = df['theta_error'].values
+    dtheta = df['dtheta_error'].values
+
+    # === Measurement Noise (R) ===
+    # Detect if dataset is mostly stationary (controller off) vs has real motion
+    # Compare velocity std to a motion threshold
+    dtheta_std = np.std(dtheta)
+    motion_threshold = 0.1  # rad/s - below this, consider "no real motion"
+    is_stationary_dataset = dtheta_std < motion_threshold
+
+    if is_stationary_dataset:
+        # Dataset is stationary - use ALL samples for R estimation
+        # This is ideal for measurement noise estimation
+        stationary_mask = np.ones(len(theta), dtype=bool)
+        velocity_threshold = np.inf
+    else:
+        # Dataset has motion - find stationary periods
+        velocity_threshold = np.percentile(np.abs(dtheta), 25)
+        stationary_mask = np.abs(dtheta) < velocity_threshold
+
+    if np.sum(stationary_mask) > 10:
+        theta_stationary = theta[stationary_mask]
+        # Use high-pass filter to remove slow drift, keep only noise
+        theta_detrended = theta_stationary - pd.Series(theta_stationary).rolling(
+            window=min(10, len(theta_stationary)//2), center=True, min_periods=1).mean().values
+        R_theta = np.var(theta_detrended)
+    else:
+        # Fallback: use variance of consecutive differences
+        R_theta = np.var(np.diff(theta)) / 2  # Divide by 2 for difference variance
+
+    # === Process Noise (Q) ===
+    # Process model: theta(k+1) = theta(k) + dtheta(k) * dt
+    # Prediction error = actual_change - predicted_change
+    theta_predicted = theta[:-1] + dtheta[:-1] * dt
+    theta_actual = theta[1:]
+    prediction_errors = theta_actual - theta_predicted
+
+    Q_theta = np.var(prediction_errors)
+
+    # Also estimate derivative noise
+    # For dtheta, the process model might be: dtheta(k+1) = dtheta(k) (constant velocity)
+    dtheta_prediction_errors = np.diff(dtheta)
+    Q_dtheta = np.var(dtheta_prediction_errors)
+
+    # === Create analysis plot ===
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+
+    # Plot 1: Theta error with stationary periods highlighted
+    axes[0].plot(timestamps_sec, np.degrees(theta), 'b-', alpha=0.7, label='Theta Error')
+    stationary_times = timestamps_sec[stationary_mask]
+    stationary_theta = theta[stationary_mask]
+    axes[0].scatter(stationary_times, np.degrees(stationary_theta),
+                    c='green', s=10, alpha=0.5, label=f'Stationary (|dθ| < {np.degrees(velocity_threshold):.2f}°/s)')
+    axes[0].set_ylabel('Theta Error (deg)')
+    axes[0].set_title(f'Measurement Noise Estimation: R = {R_theta:.2e} rad² ({np.degrees(np.sqrt(R_theta)):.3f}° std)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot 2: Prediction errors
+    axes[1].plot(timestamps_sec[1:], np.degrees(prediction_errors), 'r-', alpha=0.7)
+    axes[1].axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    axes[1].axhline(y=np.degrees(np.sqrt(Q_theta)), color='g', linestyle='--', alpha=0.5, label=f'±1σ = {np.degrees(np.sqrt(Q_theta)):.3f}°')
+    axes[1].axhline(y=-np.degrees(np.sqrt(Q_theta)), color='g', linestyle='--', alpha=0.5)
+    axes[1].set_ylabel('Prediction Error (deg)')
+    axes[1].set_title(f'Process Noise Estimation: Q_theta = {Q_theta:.2e} rad² ({np.degrees(np.sqrt(Q_theta)):.3f}° std)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # Plot 3: Derivative prediction errors (for Q_dtheta)
+    axes[2].plot(timestamps_sec[1:], np.degrees(dtheta_prediction_errors), 'purple', alpha=0.7)
+    axes[2].axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_ylabel('dTheta Change (deg/s)')
+    axes[2].set_title(f'Derivative Process Noise: Q_dtheta = {Q_dtheta:.2e} (rad/s)² ({np.degrees(np.sqrt(Q_dtheta)):.3f}°/s std)')
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    plot_filename = csv_path.parent / f'{csv_path.stem}_kalman_noise.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+
+    # Write results to text file
+    txt_filename = csv_path.parent / f'{csv_path.stem}_kalman_noise.txt'
+    with open(txt_filename, 'w') as f:
+        f.write("="*60 + "\n")
+        f.write("KALMAN FILTER NOISE PARAMETER ESTIMATES\n")
+        f.write("="*60 + "\n")
+        if is_stationary_dataset:
+            f.write("Dataset type: STATIONARY (controller off)\n")
+            f.write("  -> R estimate is VALID (ideal conditions)\n")
+            f.write("  -> Q estimates are NOT VALID (no real dynamics)\n")
+        else:
+            f.write("Dataset type: MOTION (controller on)\n")
+            f.write("  -> Both R and Q estimates are valid\n")
+        f.write(f"\nMeasurement Noise (R):\n")
+        f.write(f"  R_theta = {R_theta:.6e} rad²  ({np.degrees(np.sqrt(R_theta)):.4f}° std)\n")
+        f.write(f"\nProcess Noise (Q):" + (" [MAY BE INVALID]\n" if is_stationary_dataset else "\n"))
+        f.write(f"  Q_theta  = {Q_theta:.6e} rad²  ({np.degrees(np.sqrt(Q_theta)):.4f}° std)\n")
+        f.write(f"  Q_dtheta = {Q_dtheta:.6e} (rad/s)²  ({np.degrees(np.sqrt(Q_dtheta)):.4f}°/s std)\n")
+        f.write(f"\nFor 2D state [theta, dtheta], suggested Q matrix:\n")
+        f.write(f"  Q = diag([{Q_theta:.6e}, {Q_dtheta:.6e}])\n")
+        f.write("="*60 + "\n")
+
+    print(f"Kalman noise parameters saved to {txt_filename}")
+
+    return {
+        'R_theta': R_theta,
+        'Q_theta': Q_theta,
+        'Q_dtheta': Q_dtheta,
+        'is_stationary_dataset': is_stationary_dataset,
+        'velocity_threshold': velocity_threshold,
+        'n_stationary_samples': np.sum(stationary_mask),
+    }
+
+
 def pointcloud2_to_array(cloud_msg):
     """
     Convert a ROS2 PointCloud2 message to numpy arrays of points and colors.
@@ -527,6 +659,9 @@ def debag(bag_file):
     # Generate the theta and roll control plots
     generate_theta_control_plots(csv_filename)
     generate_roll_control_plots(csv_filename)
+
+    # Estimate Kalman filter noise parameters
+    estimate_kalman_noise_parameters(csv_filename)
 
     # Generate Open3D point cloud visualization
     print(f"Creating point cloud visualization from {len(all_point_clouds)} clouds...")

@@ -1030,7 +1030,7 @@ class OrientationControlNode(Node):
         goal_pose_out = None
         if measurement_ok:
             goal_pose_out = goal_pose  # Already constructed above
-
+        
         # Store results thread-safely for controller timer
         # All ocd fields will be populated in process_controller to ensure consistency
         with self._measurement_lock:
@@ -1174,11 +1174,8 @@ class OrientationControlNode(Node):
         # Roll control about Z-axis
         tau_roll = roll_error * self.Kp
 
-        # If theta error is below pi/6, apply focal distance control
-        if abs(theta_err) < (3.141592653589793 / 6.0):
-            F_z = -self.Kp * (self.focal_distance - d)
-        else:
-            F_z = 0.0
+        # Apply focal distance control
+        F_z = -self.Kp * (self.focal_distance - d)
 
         # Conversion to body B dynamics
         force_drag_B = -self.linear_drag * self.lin_vel_cam
