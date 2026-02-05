@@ -20,7 +20,7 @@ orientation_controller:
     
     standoff_m: 0.10 # standoff_value for fixed standoff mode
     standoff_mode: euclidean
-    ema_enable: True
+    ema_enable: False
     ema_tau: 0.1
 
     normal_estimation_method: RANSAC #options: PCA, RANSAC
@@ -46,3 +46,8 @@ orientation_controller:
     Kp: 31.0
     Ki: 37.7
     Kd: 6.2
+
+    kalman_enabled: true
+    kalman_R_theta: 6.668939e-04      # Measurement noise variance (rad²)
+    kalman_Q_theta: 5.497500e-03     # Process noise for theta (rad²)
+    kalman_Q_dtheta: 5.483359e-01     # Process noise for dtheta ((rad/s)²)

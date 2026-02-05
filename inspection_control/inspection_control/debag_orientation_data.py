@@ -57,9 +57,10 @@ def transform_vector(vec, transform_msg):
 def generate_theta_control_plots(csv_filepath):
     """
     Generate plots showing theta state and control:
-    - Top: theta error with filtered error on same plot
-    - Middle: derivative and integral
-    - Bottom: theta_torque command
+    - Row 1: theta error with filtered error on same plot
+    - Row 2: derivative and integral
+    - Row 3: theta_torque command
+    - Row 4: theta_axis components (x, y, z)
     """
     df = pd.read_csv(csv_filepath)
     csv_path = pathlib.Path(csv_filepath)
@@ -67,44 +68,55 @@ def generate_theta_control_plots(csv_filepath):
     # Convert timestamps to seconds relative to start
     timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
-    # Top plot: theta error and filtered error
+    # Row 1: theta error and filtered error
     axes[0].plot(timestamps_sec, np.degrees(df['theta_error']),
                  label='Theta Error', color='blue', alpha=0.7)
     axes[0].plot(timestamps_sec, np.degrees(df['theta_error_filtered']),
                  label='Filtered Error', color='red', linewidth=2)
     axes[0].set_ylabel('Error (degrees)')
-    axes[0].set_ylim(-90, 90)
+    # axes[0].set_ylim(-90, 90)
     axes[0].set_title('Theta Error Over Time')
     axes[0].legend(loc='upper right')
     axes[0].grid(True, alpha=0.3)
 
-    # Middle plot: derivative and integral
+    # Row 2: derivative (raw and filtered) and integral
     ax_deriv = axes[1]
     ax_integ = ax_deriv.twinx()
 
     line1, = ax_deriv.plot(timestamps_sec, np.degrees(df['dtheta_error']),
-                           label='Derivative (dθ/dt)', color='green')
-    line2, = ax_integ.plot(timestamps_sec, np.degrees(df['itheta_error']),
-                           label='Integral (∫θ dt)', color='orange')
+                           label='dθ/dt (raw)', color='lightgreen', alpha=0.7)
+    line2, = ax_deriv.plot(timestamps_sec, np.degrees(df['dtheta_error_filtered']),
+                           label='dθ/dt (filtered)', color='green', linewidth=2)
+    line3, = ax_integ.plot(timestamps_sec, np.degrees(df['itheta_error']),
+                           label='∫θ dt', color='orange')
 
     ax_deriv.set_ylabel('Derivative (deg/s)', color='green')
     ax_integ.set_ylabel('Integral (deg·s)', color='orange')
     ax_deriv.tick_params(axis='y', labelcolor='green')
     ax_integ.tick_params(axis='y', labelcolor='orange')
     ax_deriv.set_title('Derivative and Integral of Theta Error')
-    ax_deriv.legend(handles=[line1, line2], loc='upper right')
+    ax_deriv.legend(handles=[line1, line2, line3], loc='upper right')
     ax_deriv.grid(True, alpha=0.3)
 
-    # Bottom plot: theta torque command
+    # Row 3: theta torque command
     axes[2].plot(timestamps_sec, df['theta_torque_command'],
                  label='Theta Torque', color='purple', linewidth=1.5)
-    axes[2].set_xlabel('Time (s)')
     axes[2].set_ylabel('Torque (Nm)')
     axes[2].set_title('Theta Torque Command')
     axes[2].legend(loc='upper right')
     axes[2].grid(True, alpha=0.3)
+
+    # Row 4: theta_axis components (Z is always 0, omitted)
+    axes[3].plot(timestamps_sec, df['theta_axis_x'], label='X', color='red', linewidth=1.5)
+    axes[3].plot(timestamps_sec, df['theta_axis_y'], label='Y', color='green', linewidth=1.5)
+    axes[3].set_xlabel('Time (s)')
+    axes[3].set_ylabel('Axis Component')
+    axes[3].set_title('Theta Axis Direction (Camera Frame)')
+    axes[3].legend(loc='upper right')
+    axes[3].grid(True, alpha=0.3)
+    axes[3].set_ylim(-1.1, 1.1)
 
     plt.tight_layout()
 
@@ -346,15 +358,16 @@ def create_time_gradient_color(t_normalized, cmap_name='viridis'):
     return np.array(cmap(t_normalized)[:3])  # RGB, drop alpha
 
 
-def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps, output_path):
+def visualize_pointclouds_over_time(point_clouds, normals, centroids, theta_axes, timestamps, output_path):
     """
     Create an Open3D visualization with all point clouds colored by time gradient.
-    Also shows normals at each centroid.
+    Also shows normals and theta_axes at each centroid.
 
     Args:
         point_clouds: List of numpy arrays (N, 3) for each timestep
         normals: List of numpy arrays (3,) surface normals
         centroids: List of numpy arrays (3,) surface centroids
+        theta_axes: List of numpy arrays (3,) theta rotation axes
         timestamps: List of timestamps
         output_path: Path to save the visualization
     """
@@ -377,9 +390,10 @@ def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps
     # Combined geometry for visualization
     combined_pcd = o3d.geometry.PointCloud()
     geometries = []
+    theta_axis_lines = []  # Separate list for theta axes
 
     # Process each point cloud
-    for points, normal, centroid, t in zip(point_clouds, normals, centroids, timestamps):
+    for points, normal, centroid, theta_axis, t in zip(point_clouds, normals, centroids, theta_axes, timestamps):
         if len(points) == 0:
             continue
 
@@ -394,7 +408,7 @@ def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps
         # Add to combined
         combined_pcd += pcd
 
-        # Create normal arrow at centroid (flip normal sign)
+        # Create normal arrow at centroid (flip normal sign) - colored by time
         if centroid is not None and normal is not None:
             flipped_normal = -normal  # Flip the normal vector
             arrow_length = 0.05  # 5cm arrow
@@ -404,6 +418,18 @@ def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps
             line.lines = o3d.utility.Vector2iVector([[0, 1]])
             line.colors = o3d.utility.Vector3dVector([color])
             geometries.append(line)
+
+        # Create theta_axis arrow at centroid - magenta color
+        if centroid is not None and theta_axis is not None:
+            axis_norm = np.linalg.norm(theta_axis)
+            if axis_norm > 1e-6:
+                arrow_length = 0.03  # 3cm arrow for theta axis
+                line_points = [centroid, centroid + theta_axis * arrow_length]
+                line = o3d.geometry.LineSet()
+                line.points = o3d.utility.Vector3dVector(line_points)
+                line.lines = o3d.utility.Vector2iVector([[0, 1]])
+                line.colors = o3d.utility.Vector3dVector([[1.0, 0.0, 1.0]])  # Magenta
+                theta_axis_lines.append(line)
 
     # Clean up the combined point cloud
     if combined_pcd.has_points():
@@ -423,6 +449,9 @@ def visualize_pointclouds_over_time(point_clouds, normals, centroids, timestamps
             print(f"After statistical outlier removal: {len(combined_pcd.points)} points")
 
     geometries.insert(0, combined_pcd)
+
+    # Add theta axis lines to geometries
+    geometries.extend(theta_axis_lines)
 
     # Add coordinate frame at origin
     coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
@@ -496,6 +525,7 @@ def debag(bag_file):
     all_point_clouds = []
     all_normals = []
     all_centroids = []
+    all_theta_axes = []
     all_timestamps = []
 
     # Initialize CSV writer
@@ -541,6 +571,7 @@ def debag(bag_file):
         'theta_error',
         'theta_error_filtered',
         'dtheta_error',
+        'dtheta_error_filtered',
         'itheta_error',
         'theta_axis_x',
         'theta_axis_y',
@@ -592,6 +623,15 @@ def debag(bag_file):
                 centroid_obj = transform_points(centroid_cam.reshape(1, 3), msg.camera_transform).flatten()
                 all_centroids.append(centroid_obj)
 
+                # Transform theta_axis (rotation only)
+                theta_axis_cam = np.array([
+                    msg.theta_axis.x,
+                    msg.theta_axis.y,
+                    msg.theta_axis.z
+                ])
+                theta_axis_obj = transform_vector(theta_axis_cam, msg.camera_transform)
+                all_theta_axes.append(theta_axis_obj)
+
                 all_timestamps.append(t)
         except Exception as e:
             print(f"Error extracting point cloud at msg {msg_count}: {e}")
@@ -634,6 +674,7 @@ def debag(bag_file):
             msg.theta_error,
             msg.theta_error_filtered,
             msg.dtheta_error,
+            msg.dtheta_error_filtered,
             msg.itheta_error,
             msg.theta_axis.x,
             msg.theta_axis.y,
@@ -669,6 +710,7 @@ def debag(bag_file):
         all_point_clouds,
         all_normals,
         all_centroids,
+        all_theta_axes,
         all_timestamps,
         output_base
     )

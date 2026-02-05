@@ -38,6 +38,127 @@ from geometry_msgs.msg import TransformStamped
 from inspection_control.debag_orientation_data import debag
 
 
+class ThetaKalmanFilter:
+    """
+    2D Kalman filter for theta error estimation.
+
+    State: [theta, dtheta]^T
+    Process model: theta(k+1) = theta(k) + dtheta(k) * dt
+                   dtheta(k+1) = dtheta(k)  (constant velocity model)
+    Measurement: z = theta (we only measure position, not velocity)
+    """
+
+    def __init__(self, R_theta: float, Q_theta: float, Q_dtheta: float):
+        """
+        Initialize Kalman filter with noise parameters.
+
+        Args:
+            R_theta: Measurement noise variance (rad²)
+            Q_theta: Process noise variance for theta (rad²)
+            Q_dtheta: Process noise variance for dtheta (rad²/s²)
+        """
+        # State estimate [theta, dtheta]
+        self.x = np.zeros(2, dtype=np.float64)
+
+        # State covariance matrix
+        self.P = np.eye(2, dtype=np.float64) * 1.0  # Initial uncertainty
+
+        # Measurement noise (scalar, we only measure theta)
+        self.R = R_theta
+
+        # Process noise covariance
+        self.Q = np.diag([Q_theta, Q_dtheta])
+
+        # Measurement matrix (we measure theta only)
+        self.H = np.array([[1.0, 0.0]], dtype=np.float64)
+
+        self._initialized = False
+
+    def reset(self, theta_init: float = 0.0):
+        """Reset filter state."""
+        self.x = np.array([theta_init, 0.0], dtype=np.float64)
+        self.P = np.eye(2, dtype=np.float64) * 1.0
+        self._initialized = True
+
+    def predict(self, dt: float):
+        """
+        Prediction step: propagate state forward by dt.
+
+        Args:
+            dt: Time step in seconds
+        """
+        if dt <= 0:
+            return
+
+        # State transition matrix
+        F = np.array([
+            [1.0, dt],
+            [0.0, 1.0]
+        ], dtype=np.float64)
+
+        # Predict state
+        self.x = F @ self.x
+
+        # Predict covariance
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, z_theta: float):
+        """
+        Update step: incorporate measurement.
+
+        Args:
+            z_theta: Measured theta error (rad)
+
+        Returns:
+            (theta_filtered, dtheta_filtered): Filtered state estimates
+        """
+        if not self._initialized:
+            self.reset(z_theta)
+            return self.x[0], self.x[1]
+
+        # Innovation (measurement residual)
+        y = z_theta - self.H @ self.x
+
+        # Innovation covariance
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # Kalman gain
+        K = self.P @ self.H.T / S
+
+        # Update state
+        self.x = self.x + K.flatten() * y
+
+        # Update covariance (Joseph form for numerical stability)
+        I_KH = np.eye(2) - K @ self.H
+        self.P = I_KH @ self.P @ I_KH.T + K @ np.array([[self.R]]) @ K.T
+
+        return self.x[0], self.x[1]
+
+    def predict_and_update(self, z_theta: float, dt: float):
+        """
+        Combined predict and update step.
+
+        Args:
+            z_theta: Measured theta error (rad)
+            dt: Time since last update (seconds)
+
+        Returns:
+            (theta_filtered, dtheta_filtered): Filtered state estimates
+        """
+        self.predict(dt)
+        return self.update(z_theta)
+
+    @property
+    def theta(self) -> float:
+        """Current filtered theta estimate."""
+        return self.x[0]
+
+    @property
+    def dtheta(self) -> float:
+        """Current filtered dtheta estimate."""
+        return self.x[1]
+
+
 def _quat_to_R_xyzw(x, y, z, w):
     """Return 3x3 rotation matrix from xyzw quaternion."""
     n = math.sqrt(x*x + y*y + z*z + w*w) + 1e-12
@@ -435,6 +556,12 @@ class OrientationControlNode(Node):
                 ('anti_windup_enabled', True),
                 ('integral_alpha', 5.0),
                 ('surface_target_frame', 'surface_target'),
+                # Kalman filter parameters
+                ('kalman_enabled', True),
+                ('kalman_R_theta', 3.123443e-04),      # Measurement noise variance (rad²)
+                ('kalman_Q_theta', 1.250619e-3),      # Process noise for theta (rad²)
+                ('kalman_Q_dtheta', 1.245061e-01),     # Process noise for dtheta ((rad/s)²)
+                ('theta_axis_stable_threshold', 5.0),  # degrees - threshold for axis stability
             ]
         )
 
@@ -463,6 +590,18 @@ class OrientationControlNode(Node):
         self._ema_normal   = None      # np.ndarray (3,)
         self._ema_centroid = None      # np.ndarray (3,)
         self._ema_last_t   = None      # float seconds
+
+        # Kalman filter for theta error
+        self.kalman_enabled = bool(self.get_parameter('kalman_enabled').value)
+        kalman_R = float(self.get_parameter('kalman_R_theta').value)
+        kalman_Q_theta = float(self.get_parameter('kalman_Q_theta').value)
+        kalman_Q_dtheta = float(self.get_parameter('kalman_Q_dtheta').value)
+        self.theta_kalman = ThetaKalmanFilter(kalman_R, kalman_Q_theta, kalman_Q_dtheta)
+        self._kalman_last_t = None
+
+        # Theta axis stability threshold (parameter in degrees, internal in radians)
+        self.theta_axis_stable_threshold = math.radians(float(self.get_parameter('theta_axis_stable_threshold').value))
+        self._stable_theta_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # Default to X-axis
 
         # ---- Initialize bbox fields so they're always present ----
         # Use infinities so "no box yet" behaves like "pass-through".
@@ -1001,6 +1140,17 @@ class OrientationControlNode(Node):
 
                     # Z-axis alignment error
                     theta_err, axis_err = _z_axis_rotvec_error(nrm_s.astype(np.float32))
+
+                    # Stabilize axis when theta is small to prevent noise-dominated direction
+                    if theta_err > self.theta_axis_stable_threshold:
+                        self._stable_theta_axis = axis_err.copy()
+                    else:
+                        # When theta is small, use stable axis but detect sign flips
+                        # If the computed axis has flipped relative to stable axis, flip stable axis
+                        if np.dot(axis_err, self._stable_theta_axis) < 0:
+                            self._stable_theta_axis = -self._stable_theta_axis
+                        axis_err = self._stable_theta_axis.copy()
+
                     rot_vec_error = axis_err * theta_err
 
                     # Roll error
@@ -1116,18 +1266,36 @@ class OrientationControlNode(Node):
         self.anti_windup_enabled = True
         self.aw_Tt = 0.05
         self.int_limit = 1e3
-        self.e = -theta_err
+
+        # Compute dt for Kalman filter and controller
         dt_ctrl = 0.0
-        if self._last_err_t is not None:
-            dt_ctrl = max(1e-6, now_s - self._last_err_t)
-            #dt_ctrl=0.001
-            self.de = (self.e - self.last_e) / dt_ctrl
+        if self._kalman_last_t is not None:
+            dt_ctrl = max(1e-6, now_s - self._kalman_last_t)
+        self._kalman_last_t = now_s
+
+        # Raw error (note: using -theta_err to match existing sign convention)
+        theta_err_raw = -theta_err
+
+        if self.kalman_enabled and dt_ctrl > 0:
+            # Use Kalman filter for state estimation
+            theta_filtered, dtheta_filtered = self.theta_kalman.predict_and_update(theta_err_raw, dt_ctrl)
+            self.e = theta_filtered
+            self.de = dtheta_filtered
+            # Store raw values for logging
+            self.e_raw = theta_err_raw
+            self.de_raw = (theta_err_raw - self.last_e) / dt_ctrl if self._last_err_t is not None else 0.0
         else:
-            dt_ctrl = 0.0
-            self.de = 0.0
+            # Fallback to finite difference (no filtering)
+            self.e = theta_err_raw
+            if self._last_err_t is not None and dt_ctrl > 0:
+                self.de = (self.e - self.last_e) / dt_ctrl
+            else:
+                self.de = 0.0
+            self.e_raw = self.e
+            self.de_raw = self.de
 
         self._last_err_t = now_s
-        self.last_e = float(self.e)
+        self.last_e = float(theta_err_raw)  # Store raw for next finite diff calculation
         self._last_rotvec_err = rot_vec_error.copy()
 
         inertia_A = self.inertia_B + self.mass_B * d**2
@@ -1159,7 +1327,16 @@ class OrientationControlNode(Node):
         # Anti-windup
         if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
             Tt = float(getattr(self, "aw_Tt", 0.05))
-            i_dot = self.e + (tau_sat - tau_theta) / (self.Ki * max(1e-6, Tt))
+            # i_dot = self.e + (tau_sat - tau_theta) / (self.Ki * max(1e-6, Tt))
+            # If saturated, only integrate error if it would reduce saturation
+            if abs(tau_sat - tau_theta) > 1e-3:
+                if (tau_theta > tau_max and self.e < 0.0) or (tau_theta < -tau_max and self.e > 0.0):
+                    i_dot = self.e
+                else:
+                    i_dot = 0.0
+            else:
+                i_dot = self.e
+            
             self.int_e += i_dot * dt_ctrl
         else:
             if dt_ctrl > 0.0:
@@ -1173,6 +1350,7 @@ class OrientationControlNode(Node):
 
         # Roll control about Z-axis
         tau_roll = roll_error * self.Kp
+        tau_roll = 0.0
 
         # Apply focal distance control
         F_z = -self.Kp * (self.focal_distance - d)
@@ -1260,9 +1438,11 @@ class OrientationControlNode(Node):
             self.ocd.goal_pose = PoseStamped()
             self.ocd.goal_pose.header = self.ocd.header
 
-        # Control errors
-        self.ocd.theta_error = float(getattr(self, 'e', 0.0))
-        self.ocd.dtheta_error = float(getattr(self, 'de', 0.0))
+        # Control errors (raw and filtered)
+        self.ocd.theta_error = float(getattr(self, 'e_raw', 0.0))           # Raw measurement
+        self.ocd.theta_error_filtered = float(getattr(self, 'e', 0.0))      # Kalman filtered (or raw if disabled)
+        self.ocd.dtheta_error = float(getattr(self, 'de_raw', 0.0))         # Raw finite difference
+        self.ocd.dtheta_error_filtered = float(getattr(self, 'de', 0.0))    # Kalman velocity (or raw if disabled)
         self.ocd.itheta_error = float(self.int_e)
         self.ocd.roll_error = float(roll_error)
 
@@ -1374,10 +1554,14 @@ class OrientationControlNode(Node):
     def enable_orientation_control(self):
         # Reset controller internal state so first dt_ctrl is not "time since last enable"
         self._last_err_t = None
+        self._kalman_last_t = None
         self.last_e = 0.0
         self.de = 0.0
-        #self._int_rotvec_err = np.zeros(3, dtype=np.float32)
         self.int_e = 0.0
+        # Reset Kalman filter
+        self.theta_kalman.reset()
+        # Reset stable theta axis to default
+        self._stable_theta_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         self.orientation_control_enabled = True
         self.get_logger().info('Orientation control ENABLED.')
 
@@ -1473,6 +1657,24 @@ class OrientationControlNode(Node):
                 else:
                     self.disable_normal_estimation_viz()
                 self.get_logger().info(f'Updated visualize_normal_estimation to {self.visualize_normal_estimation}')
+            # Kalman filter parameters
+            elif p.name == 'kalman_enabled':
+                self.kalman_enabled = bool(p.value)
+                if self.kalman_enabled:
+                    self.theta_kalman.reset()
+                self.get_logger().info(f'Updated kalman_enabled to {self.kalman_enabled}')
+            elif p.name == 'kalman_R_theta':
+                self.theta_kalman.R = float(p.value)
+                self.get_logger().info(f'Updated kalman_R_theta to {p.value:.2e}')
+            elif p.name == 'kalman_Q_theta':
+                self.theta_kalman.Q[0, 0] = float(p.value)
+                self.get_logger().info(f'Updated kalman_Q_theta to {p.value:.2e}')
+            elif p.name == 'kalman_Q_dtheta':
+                self.theta_kalman.Q[1, 1] = float(p.value)
+                self.get_logger().info(f'Updated kalman_Q_dtheta to {p.value:.2e}')
+            elif p.name == 'theta_axis_stable_threshold':
+                self.theta_axis_stable_threshold = math.radians(float(p.value))
+                self.get_logger().info(f'Updated theta_axis_stable_threshold to {p.value:.1f} deg')
 
         result = SetParametersResult()
         result.successful = True
