@@ -8,7 +8,7 @@ import copy
 import os
 import threading
 
-from sympy import zeta
+from scipy.linalg import expm
 
 import rclpy
 from rclpy.node import Node
@@ -38,125 +38,171 @@ from geometry_msgs.msg import TransformStamped
 from inspection_control.debag_orientation_data import debag
 
 
-class ThetaKalmanFilter:
+class AngleKalmanFilter:
     """
-    2D Kalman filter for theta error estimation.
+    2D Kalman filter with true linear plant dynamics:
 
-    State: [theta, dtheta]^T
-    Process model: theta(k+1) = theta(k) + dtheta(k) * dt
-                   dtheta(k+1) = dtheta(k)  (constant velocity model)
-    Measurement: z = theta (we only measure position, not velocity)
+      x = [angle, dangle]^T
+      x_{k+1} = Ad x_k + Bd u_k + w_k
+      z_k = H x_k + v_k,   H = [1 0]
+
+    Continuous-time model used to build (Ad, Bd):
+      angle_dot  = dangle
+      dangle_dot = -(b/I_A) dangle + (1/I_A) u
+    => A = [[0, 1],
+            [0, -b/I_A]]
+       B = [[0],
+            [1/I_A]]
     """
 
-    def __init__(self, R_theta: float, Q_theta: float, Q_dtheta: float):
+    def __init__(self, R: float, Q_angle: float, Q_dangle: float):
         """
         Initialize Kalman filter with noise parameters.
 
         Args:
-            R_theta: Measurement noise variance (rad²)
-            Q_theta: Process noise variance for theta (rad²)
-            Q_dtheta: Process noise variance for dtheta (rad²/s²)
+            R: Measurement noise variance (rad²)
+            Q_angle: Process noise variance for angle (rad²)
+            Q_dangle: Process noise variance for dangle (rad²/s²)
         """
-        # State estimate [theta, dtheta]
         self.x = np.zeros(2, dtype=np.float64)
+        self.P = np.diag([(0.5*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
 
-        # State covariance matrix
-        self.P = np.eye(2, dtype=np.float64) * 1.0  # Initial uncertainty
+        self.R = float(R)
+        self.Q = np.diag([float(Q_angle), float(Q_dangle)]).astype(np.float64)
 
-        # Measurement noise (scalar, we only measure theta)
-        self.R = R_theta
-
-        # Process noise covariance
-        self.Q = np.diag([Q_theta, Q_dtheta])
-
-        # Measurement matrix (we measure theta only)
         self.H = np.array([[1.0, 0.0]], dtype=np.float64)
 
         self._initialized = False
 
-    def reset(self, theta_init: float = 0.0):
-        """Reset filter state."""
-        self.x = np.array([theta_init, 0.0], dtype=np.float64)
-        self.P = np.eye(2, dtype=np.float64) * 1.0
-        self._initialized = True
+        # Cached discretization to avoid expm every time when dt & model unchanged
+        self._last_dt = None
+        self._last_I_A = None
+        self._last_b = None
+        self._Ad = np.eye(2, dtype=np.float64)
+        self._Bd = np.zeros((2, 1), dtype=np.float64)
 
-    def predict(self, dt: float):
+    def reset(self, angle_init: float = 0.0, dangle_init: float = 0.0):
+        """Reset filter state."""
+        self.x = np.array([angle_init, dangle_init], dtype=np.float64)
+        self.P = np.diag([(0.5*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
+        self._initialized = True
+        self._last_dt = None  # Force refresh discretization next predict
+
+    def set_noise(self, R: float = None, Q_angle: float = None, Q_dangle: float = None):
+        """Update noise parameters."""
+        if R is not None:
+            self.R = float(R)
+        if Q_angle is not None or Q_dangle is not None:
+            qa = self.Q[0, 0] if Q_angle is None else float(Q_angle)
+            qd = self.Q[1, 1] if Q_dangle is None else float(Q_dangle)
+            self.Q = np.diag([qa, qd]).astype(np.float64)
+
+    def _discretize(self, dt: float, I_A: float, b: float):
         """
-        Prediction step: propagate state forward by dt.
+        Exact discretization using augmented expm:
+            Md = expm([A B; 0 0]*dt)
+            Ad = Md(0:2,0:2), Bd = Md(0:2,2)
+        """
+        A = np.array([[0.0, 1.0],
+                      [0.0, -b / max(1e-12, I_A)]], dtype=np.float64)
+        B = np.array([[0.0],
+                      [1.0 / max(1e-12, I_A)]], dtype=np.float64)
+
+        M = np.zeros((3, 3), dtype=np.float64)
+        M[0:2, 0:2] = A
+        M[0:2, 2:3] = B
+
+        Md = expm(M * dt)
+        self._Ad = Md[0:2, 0:2]
+        self._Bd = Md[0:2, 2:3]
+
+        self._last_dt = dt
+        self._last_I_A = I_A
+        self._last_b = b
+
+    def predict(self, dt: float, u_prev: float, I_A: float, b: float):
+        """
+        Prediction step: propagate state forward using plant dynamics.
 
         Args:
             dt: Time step in seconds
+            u_prev: Previous control input (torque)
+            I_A: Effective inertia about point A
+            b: Damping coefficient
         """
         if dt <= 0:
             return
 
-        # State transition matrix
-        F = np.array([
-            [1.0, dt],
-            [0.0, 1.0]
-        ], dtype=np.float64)
+        if (self._last_dt != dt) or (self._last_I_A != I_A) or (self._last_b != b):
+            self._discretize(dt, I_A, b)
 
-        # Predict state
-        self.x = F @ self.x
+        u = float(u_prev)
 
-        # Predict covariance
-        self.P = F @ self.P @ F.T + self.Q
+        # Predict state and covariance
+        self.x = self._Ad @ self.x + (self._Bd.flatten() * u)
+        self.P = self._Ad @ self.P @ self._Ad.T + self.Q
 
-    def update(self, z_theta: float):
+    def update(self, z_angle: float):
         """
         Update step: incorporate measurement.
 
         Args:
-            z_theta: Measured theta error (rad)
+            z_angle: Measured angle error (rad)
 
         Returns:
-            (theta_filtered, dtheta_filtered): Filtered state estimates
+            (angle_filtered, dangle_filtered): Filtered state estimates
         """
         if not self._initialized:
-            self.reset(z_theta)
+            self.reset(angle_init=float(z_angle), dangle_init=0.0)
             return self.x[0], self.x[1]
 
-        # Innovation (measurement residual)
-        y = z_theta - self.H @ self.x
+        z = float(z_angle)
 
-        # Innovation covariance
-        S = self.H @ self.P @ self.H.T + self.R
+        # Innovation
+        y = z - (self.H @ self.x)[0]
 
-        # Kalman gain
-        K = self.P @ self.H.T / S
+        # Innovation covariance (scalar)
+        S = (self.H @ self.P @ self.H.T)[0, 0] + self.R
 
-        # Update state
-        self.x = self.x + K.flatten() * y
+        # Kalman gain (2x1)
+        K = (self.P @ self.H.T) / max(1e-12, S)
 
-        # Update covariance (Joseph form for numerical stability)
-        I_KH = np.eye(2) - K @ self.H
-        self.P = I_KH @ self.P @ I_KH.T + K @ np.array([[self.R]]) @ K.T
+        # State update
+        self.x = self.x + (K[:, 0] * y)
+
+        # Joseph covariance update
+        I = np.eye(2, dtype=np.float64)
+        I_KH = I - K @ self.H
+        self.P = I_KH @ self.P @ I_KH.T + K * self.R * K.T
 
         return self.x[0], self.x[1]
 
-    def predict_and_update(self, z_theta: float, dt: float):
+    def predict_and_update(self, z_angle: float, dt: float, u_prev: float, I_A: float, b: float):
         """
         Combined predict and update step.
 
         Args:
-            z_theta: Measured theta error (rad)
+            z_angle: Measured angle error (rad)
             dt: Time since last update (seconds)
+            u_prev: Previous control input (torque)
+            I_A: Effective inertia about point A
+            b: Damping coefficient
 
         Returns:
-            (theta_filtered, dtheta_filtered): Filtered state estimates
+            (angle_filtered, dangle_filtered): Filtered state estimates
         """
-        self.predict(dt)
-        return self.update(z_theta)
+        self.predict(dt, u_prev=u_prev, I_A=I_A, b=b)
+        return self.update(z_angle)
 
     @property
-    def theta(self) -> float:
-        """Current filtered theta estimate."""
-        return self.x[0]
+    def angle(self) -> float:
+        """Current filtered angle estimate."""
+        return float(self.x[0])
 
     @property
-    def dtheta(self) -> float:
-        """Current filtered dtheta estimate."""
-        return self.x[1]
+    def dangle(self) -> float:
+        """Current filtered dangle estimate."""
+        return float(self.x[1])
 
 
 def _quat_to_R_xyzw(x, y, z, w):
@@ -539,6 +585,7 @@ class OrientationControlNode(Node):
                 ('visualize_normal_estimation', False),
                 ('no_target_timeout_s', 0.25),
                 ('orientation_control_enabled', False),
+                ('autofocus_enabled', False),
                 ('save_data', False),
                 ('data_path', '/tmp'),
                 ('object', ''),
@@ -558,10 +605,9 @@ class OrientationControlNode(Node):
                 ('surface_target_frame', 'surface_target'),
                 # Kalman filter parameters
                 ('kalman_enabled', True),
-                ('kalman_R_theta', 3.123443e-04),      # Measurement noise variance (rad²)
-                ('kalman_Q_theta', 1.250619e-3),      # Process noise for theta (rad²)
-                ('kalman_Q_dtheta', 1.245061e-01),     # Process noise for dtheta ((rad/s)²)
-                ('theta_axis_stable_threshold', 5.0),  # degrees - threshold for axis stability
+                ('kalman_R', 3.123443e-04),      # Measurement noise variance (rad²)
+                ('kalman_Q_angle', 1.250619e-3),      # Process noise for angle (rad²)
+                ('kalman_Q_dangle', 1.245061e-01),     # Process noise for dangle ((rad/s)²)
             ]
         )
 
@@ -591,17 +637,14 @@ class OrientationControlNode(Node):
         self._ema_centroid = None      # np.ndarray (3,)
         self._ema_last_t   = None      # float seconds
 
-        # Kalman filter for theta error
+        # Kalman filters for pitch and yaw (same parameters for both axes)
         self.kalman_enabled = bool(self.get_parameter('kalman_enabled').value)
-        kalman_R = float(self.get_parameter('kalman_R_theta').value)
-        kalman_Q_theta = float(self.get_parameter('kalman_Q_theta').value)
-        kalman_Q_dtheta = float(self.get_parameter('kalman_Q_dtheta').value)
-        self.theta_kalman = ThetaKalmanFilter(kalman_R, kalman_Q_theta, kalman_Q_dtheta)
+        kalman_R = float(self.get_parameter('kalman_R').value)
+        kalman_Q_angle = float(self.get_parameter('kalman_Q_angle').value)
+        kalman_Q_dangle = float(self.get_parameter('kalman_Q_dangle').value)
+        self.pitch_kalman = AngleKalmanFilter(kalman_R, kalman_Q_angle, kalman_Q_dangle)
+        self.yaw_kalman = AngleKalmanFilter(kalman_R, kalman_Q_angle, kalman_Q_dangle)
         self._kalman_last_t = None
-
-        # Theta axis stability threshold (parameter in degrees, internal in radians)
-        self.theta_axis_stable_threshold = math.radians(float(self.get_parameter('theta_axis_stable_threshold').value))
-        self._stable_theta_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # Default to X-axis
 
         # ---- Initialize bbox fields so they're always present ----
         # Use infinities so "no box yet" behaves like "pass-through".
@@ -629,6 +672,7 @@ class OrientationControlNode(Node):
         self._had_target_last_cycle = False
         self._last_target_time_s = None  # float seconds of last valid crop/pose
         self.orientation_control_enabled = bool(self.get_parameter('orientation_control_enabled').value)
+        self.autofocus_enabled = bool(self.get_parameter('autofocus_enabled').value)
         
         # save data parameters
         self.save_data = bool(self.get_parameter('save_data').value)
@@ -726,12 +770,20 @@ class OrientationControlNode(Node):
         # keep a “last torque” handy so we can report it in the bundle
         self._last_tau = np.zeros(3, dtype=np.float32)
         self._last_force = np.zeros(3, dtype=np.float32)   # <<< NEW
-        # PD state: last rotation-vector error and timestamp                # <<< NEW
-        self._last_rotvec_err = None                                       # <<< NEW
-        self._last_err_t = None  
-        self._int_rotvec_err = np.zeros(3, dtype=np.float32)   
-        self.last_e = 0.0                                        # <<< NEW
-        self.int_e =0.0
+        # PD state: separate pitch/yaw control
+        self._last_err_t = None
+        # Pitch (rotation about X-axis) state
+        self.last_pitch = 0.0
+        self.int_pitch = 0.0
+        self.pitch_err = 0.0
+        self.dpitch = 0.0
+        self._prev_tau_pitch = 0.0  # Previous pitch torque for Kalman prediction
+        # Yaw (rotation about Y-axis) state
+        self.last_yaw = 0.0
+        self.int_yaw = 0.0
+        self.yaw_err = 0.0
+        self.dyaw = 0.0
+        self._prev_tau_yaw = 0.0  # Previous yaw torque for Kalman prediction
 
         # Focus distance PID state
         self.focal_distance = 0.28676
@@ -746,8 +798,8 @@ class OrientationControlNode(Node):
             'timestamp': 0.0,
             'stamp': None,          # ROS timestamp for header
             'rot_vec_error': np.zeros(3, dtype=np.float32),
-            'theta_err': 0.0,
-            'axis_err': np.zeros(3, dtype=np.float32),
+            'pitch_err': 0.0,       # Rotation about X-axis (rad)
+            'yaw_err': 0.0,         # Rotation about Y-axis (rad)
             'd': 0.0,               # Focal distance for controller
             'roll_error': 0.0,      # Roll error about Z-axis
             'r': np.zeros(3, dtype=np.float32),  # Vector from centroid to origin
@@ -849,6 +901,12 @@ class OrientationControlNode(Node):
                 self.enable_orientation_control()
             elif msg.buttons[self.enable_button] and self.orientation_control_enabled:
                 self.disable_orientation_control()
+        # Turn on autofocus control based on button 1 press
+        if not self.last_joy_msg.buttons[1]:
+            if msg.buttons[1] and not self.autofocus_enabled:
+                self.enable_autofocus()
+            elif msg.buttons[1] and self.autofocus_enabled:
+                self.disable_autofocus()
         # Turn on normal_estimation_visualization on button 9 press
         if not self.last_joy_msg.buttons[9]:
             if msg.buttons[9] and not self.visualize_normal_estimation:
@@ -973,8 +1031,8 @@ class OrientationControlNode(Node):
         points2 = np.zeros((0, 3), dtype=np.float32)
 
         # Local variables for measurement storage
-        theta_err = 0.0
-        axis_err = np.zeros(3, dtype=np.float32)
+        pitch_err = 0.0  # Rotation about X-axis
+        yaw_err = 0.0    # Rotation about Y-axis
         d = 0.0
         roll_error = 0.0
         r = np.zeros(3, dtype=np.float32)
@@ -1138,24 +1196,24 @@ class OrientationControlNode(Node):
                     goal_pose.pose.orientation = goal_orientation_cf
                     self.pub_eoat_pose_crop.publish(goal_pose)
 
-                    # Z-axis alignment error
-                    theta_err, axis_err = _z_axis_rotvec_error(nrm_s.astype(np.float32))
+                    # Decompose Z-axis alignment error into pitch and yaw
+                    # nrm_s = [nx, ny, nz] is the surface normal in camera frame
+                    # We want camera Z = [0, 0, 1] to align with nrm_s
+                    nx, ny, nz = nrm_s[0], nrm_s[1], nrm_s[2]
 
-                    # Stabilize axis when theta is small to prevent noise-dominated direction
-                    if theta_err > self.theta_axis_stable_threshold:
-                        self._stable_theta_axis = axis_err.copy()
-                    else:
-                        # When theta is small, use stable axis but detect sign flips
-                        # If the computed axis has flipped relative to stable axis, flip stable axis
-                        if np.dot(axis_err, self._stable_theta_axis) < 0:
-                            self._stable_theta_axis = -self._stable_theta_axis
-                        axis_err = self._stable_theta_axis.copy()
+                    # Pitch error: rotation about X-axis (positive pitches Z toward +Y)
+                    # If ny > 0, normal points toward +Y, need positive pitch
+                    pitch_err = math.atan2(float(ny), float(nz))
 
-                    rot_vec_error = axis_err * theta_err
+                    # Yaw error: rotation about Y-axis (positive yaws Z toward +X)
+                    # If nx > 0, normal points toward +X, need positive yaw
+                    yaw_err = math.atan2(float(nx), float(nz))
 
-                    # Roll error
+                    # Roll error about Z-axis
                     roll_error = _roll_error(x_cf)
-                    rot_vec_error[2] = roll_error
+
+                    # Build rotation vector error for publishing
+                    rot_vec_error = np.array([pitch_err, yaw_err, roll_error], dtype=np.float32)
 
                     centroid_out = cen_s.astype(np.float32)
                     normal_out = nrm_s.astype(np.float32)
@@ -1190,8 +1248,8 @@ class OrientationControlNode(Node):
             self._latest_measurement['timestamp'] = now_s
             self._latest_measurement['stamp'] = msg.header.stamp
             self._latest_measurement['rot_vec_error'] = rotvec_err_out.copy()
-            self._latest_measurement['theta_err'] = float(theta_err)
-            self._latest_measurement['axis_err'] = axis_err.copy()
+            self._latest_measurement['pitch_err'] = float(pitch_err)
+            self._latest_measurement['yaw_err'] = float(yaw_err)
             self._latest_measurement['surface_points'] = points2.copy() if points2 is not None else None
             self._latest_measurement['d'] = float(d)
             self._latest_measurement['roll_error'] = float(roll_error)
@@ -1221,11 +1279,15 @@ class OrientationControlNode(Node):
         time_since_target = 0.0 if self._last_target_time_s is None else (now_s - self._last_target_time_s)
 
         if time_since_target > self.no_target_timeout_s:
-            self._last_rotvec_err = None
             self._last_err_t = None
-            self._int_rotvec_err = np.zeros(3, dtype=np.float32)
-            self.int_e = 0.0
-            self.last_e = 0.0
+            # Reset pitch/yaw state
+            self.int_pitch = 0.0
+            self.int_yaw = 0.0
+            self.last_pitch = 0.0
+            self.last_yaw = 0.0
+            # Reset previous torques for Kalman prediction
+            self._prev_tau_pitch = 0.0
+            self._prev_tau_yaw = 0.0
 
         # Publish zero wrench
         w = WrenchStamped()
@@ -1244,8 +1306,8 @@ class OrientationControlNode(Node):
             cen_s = self._latest_measurement['centroid'].copy()
             nrm_s = self._latest_measurement['normal'].copy()
             rot_vec_error = self._latest_measurement['rot_vec_error'].copy()
-            theta_err = self._latest_measurement['theta_err']
-            axis_err = self._latest_measurement['axis_err'].copy()
+            pitch_err_meas = self._latest_measurement['pitch_err']
+            yaw_err_meas = self._latest_measurement['yaw_err']
             meas_stamp = self._latest_measurement['stamp']
             d = self._latest_measurement['d']
             roll_error = self._latest_measurement['roll_error']
@@ -1262,43 +1324,69 @@ class OrientationControlNode(Node):
 
         tau_out = np.zeros(3, dtype=np.float32)
 
-        # --- PID control ---
+        # --- PID control with separate pitch/yaw axes ---
         self.anti_windup_enabled = True
-        self.aw_Tt = 0.05
         self.int_limit = 1e3
 
-        # Compute dt for Kalman filter and controller
+        # Compute dt for controller
         dt_ctrl = 0.0
-        if self._kalman_last_t is not None:
-            dt_ctrl = max(1e-6, now_s - self._kalman_last_t)
-        self._kalman_last_t = now_s
+        if self._last_err_t is not None:
+            dt_ctrl = max(1e-6, now_s - self._last_err_t)
+        self._last_err_t = now_s
 
-        # Raw error (note: using -theta_err to match existing sign convention)
-        theta_err_raw = -theta_err
+        # Raw errors (sign convention: positive error = need positive rotation)
+        pitch_err_raw = -pitch_err_meas  # Negate to match existing sign convention
+        yaw_err_raw = yaw_err_meas
 
+        # Compute system dynamics parameters for Kalman filter
+        inertia_A = self.inertia_B + self.mass_B * d**2
+        b_damping = self.linear_drag * d * d  # Effective rotational damping
+
+        # Apply Kalman filtering if enabled
         if self.kalman_enabled and dt_ctrl > 0:
-            # Use Kalman filter for state estimation
-            theta_filtered, dtheta_filtered = self.theta_kalman.predict_and_update(theta_err_raw, dt_ctrl)
-            self.e = theta_filtered
-            self.de = dtheta_filtered
+            # Pitch Kalman filter with plant dynamics
+            pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
+                pitch_err_raw, dt_ctrl,
+                u_prev=self._prev_tau_pitch,
+                I_A=inertia_A,
+                b=b_damping
+            )
+            self.pitch_err = pitch_filtered
+            self.dpitch = dpitch_filtered
+
+            # Yaw Kalman filter with plant dynamics
+            yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
+                yaw_err_raw, dt_ctrl,
+                u_prev=self._prev_tau_yaw,
+                I_A=inertia_A,
+                b=b_damping
+            )
+            self.yaw_err = yaw_filtered
+            self.dyaw = dyaw_filtered
+
             # Store raw values for logging
-            self.e_raw = theta_err_raw
-            self.de_raw = (theta_err_raw - self.last_e) / dt_ctrl if self._last_err_t is not None else 0.0
+            self.pitch_err_raw = pitch_err_raw
+            self.yaw_err_raw = yaw_err_raw
+            self.dpitch_raw = (pitch_err_raw - self.last_pitch) / dt_ctrl if dt_ctrl > 0 else 0.0
+            self.dyaw_raw = (yaw_err_raw - self.last_yaw) / dt_ctrl if dt_ctrl > 0 else 0.0
         else:
             # Fallback to finite difference (no filtering)
-            self.e = theta_err_raw
-            if self._last_err_t is not None and dt_ctrl > 0:
-                self.de = (self.e - self.last_e) / dt_ctrl
+            self.pitch_err = pitch_err_raw
+            self.yaw_err = yaw_err_raw
+            if dt_ctrl > 0:
+                self.dpitch = (self.pitch_err - self.last_pitch) / dt_ctrl
+                self.dyaw = (self.yaw_err - self.last_yaw) / dt_ctrl
             else:
-                self.de = 0.0
-            self.e_raw = self.e
-            self.de_raw = self.de
+                self.dpitch = 0.0
+                self.dyaw = 0.0
+            # Raw equals filtered when no filtering
+            self.pitch_err_raw = self.pitch_err
+            self.yaw_err_raw = self.yaw_err
+            self.dpitch_raw = self.dpitch
+            self.dyaw_raw = self.dyaw
 
-        self._last_err_t = now_s
-        self.last_e = float(theta_err_raw)  # Store raw for next finite diff calculation
-        self._last_rotvec_err = rot_vec_error.copy()
-
-        inertia_A = self.inertia_B + self.mass_B * d**2
+        self.last_pitch = float(pitch_err_raw)  # Store raw for next iteration
+        self.last_yaw = float(yaw_err_raw)
         tau_max = self.linear_drag * d * self.v_max
         omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * 3.141592653589793 / 180.0))
         omega_n = omega_n_max
@@ -1321,36 +1409,54 @@ class OrientationControlNode(Node):
             self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
             self.Ki = 0.0
 
-        tau_theta = (self.Kp * self.e + self.Ki * self.int_e + self.Kd * self.de)
-        tau_sat = np.clip(tau_theta, -tau_max, tau_max)
+        # Compute unsaturated torques for pitch and yaw
+        tau_pitch_raw = self.Kp * self.pitch_err + self.Ki * self.int_pitch + self.Kd * self.dpitch
+        tau_yaw_raw = self.Kp * self.yaw_err + self.Ki * self.int_yaw + self.Kd * self.dyaw
 
-        # Anti-windup
-        if (getattr(self, "anti_windup_enabled", True) and (self.Ki > 1e-9) and (dt_ctrl > 0.0)):
-            Tt = float(getattr(self, "aw_Tt", 0.05))
-            # i_dot = self.e + (tau_sat - tau_theta) / (self.Ki * max(1e-6, Tt))
-            # If saturated, only integrate error if it would reduce saturation
-            if abs(tau_sat - tau_theta) > 1e-3:
-                if (tau_theta > tau_max and self.e < 0.0) or (tau_theta < -tau_max and self.e > 0.0):
-                    i_dot = self.e
-                else:
-                    i_dot = 0.0
-            else:
-                i_dot = self.e
-            
-            self.int_e += i_dot * dt_ctrl
+        # Apply proportional magnitude saturation
+        tau_magnitude = math.sqrt(tau_pitch_raw**2 + tau_yaw_raw**2)
+        if tau_magnitude > tau_max and tau_magnitude > 1e-9:
+            scale = tau_max / tau_magnitude
+            tau_pitch = tau_pitch_raw * scale
+            tau_yaw = tau_yaw_raw * scale
+            is_saturated = True
         else:
-            if dt_ctrl > 0.0:
-                self.int_e += self.e * dt_ctrl
+            tau_pitch = tau_pitch_raw
+            tau_yaw = tau_yaw_raw
+            is_saturated = False
 
-        int_lim = float(getattr(self, "int_limit", 1e3))
-        self.int_e = np.clip(self.int_e, -int_lim, int_lim)
-        tau_theta = tau_sat
-        tau_theta_vec = tau_theta * axis_err
+        # Anti-windup: conditional integration
+        if self.anti_windup_enabled and self.Ki > 1e-9 and dt_ctrl > 0.0:
+            if is_saturated:
+                # Only integrate if error would reduce saturation
+                # For pitch: integrate if error sign opposes torque sign
+                if (tau_pitch_raw > 0 and self.pitch_err < 0) or (tau_pitch_raw < 0 and self.pitch_err > 0):
+                    self.int_pitch += self.pitch_err * dt_ctrl
+                # For yaw: integrate if error sign opposes torque sign
+                if (tau_yaw_raw > 0 and self.yaw_err < 0) or (tau_yaw_raw < 0 and self.yaw_err > 0):
+                    self.int_yaw += self.yaw_err * dt_ctrl
+            else:
+                self.int_pitch += self.pitch_err * dt_ctrl
+                self.int_yaw += self.yaw_err * dt_ctrl
+        elif dt_ctrl > 0.0:
+            self.int_pitch += self.pitch_err * dt_ctrl
+            self.int_yaw += self.yaw_err * dt_ctrl
+
+        # Apply integral limits
+        int_lim = float(self.int_limit)
+        self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
+        self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
+
+        # Store torques for next Kalman prediction step
+        self._prev_tau_pitch = float(tau_pitch)
+        self._prev_tau_yaw = float(tau_yaw)
+
+        # Build torque vector: [tau_pitch (about X), tau_yaw (about Y), tau_roll (about Z)]
+        tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
         moment_tele_A = np.cross(r, self.force_teleop)
 
         # Roll control about Z-axis
         tau_roll = roll_error * self.Kp
-        tau_roll = 0.0
 
         # Apply focal distance control
         F_z = -self.Kp * (self.focal_distance - d)
@@ -1370,27 +1476,31 @@ class OrientationControlNode(Node):
 
         self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
 
+        w = WrenchStamped()
+        w.header.stamp = self.get_clock().now().to_msg()
+        w.header.frame_id = self.main_camera_frame
+
+        w.wrench.torque.z = float(tau_roll) # Roll control about Z-axis
+
         if self.orientation_control_enabled:
-            w = WrenchStamped()
-            w.header.stamp = self.get_clock().now().to_msg()
-            w.header.frame_id = self.main_camera_frame
             w.wrench.force.x = float(self.force_B[0])
             w.wrench.force.y = float(self.force_B[1])
             w.wrench.force.z = float(self.force_B[2])
             w.wrench.torque.x = float(self.tau_B[0])
             w.wrench.torque.y = float(self.tau_B[1])
-            w.wrench.torque.z = float(self.tau_B[2])
-            self.pub_wrench_cmd.publish(w)
         else:
             # Control disabled - publish zero wrench
-            tau_out = np.zeros(3, dtype=np.float32)
+            tau_out[0] = 0.0
+            tau_out[1] = 0.0
             self._last_tau = tau_out.copy()
-            self._last_force = np.zeros(3, dtype=np.float32)
+            self._last_force[0] = 0.0
+            self._last_force[1] = 0.0
 
-            w = WrenchStamped()
-            w.header.stamp = self.get_clock().now().to_msg()
-            w.header.frame_id = self.main_camera_frame
-            self.pub_wrench_cmd.publish(w)
+        if self.autofocus_enabled:
+            w.wrench.force.z = float(F_z)
+            print(f"Applying autofocus force F_z: {F_z:.3f} N based on focal distance error {self.focal_distance - d:.3f} m")
+
+        self.pub_wrench_cmd.publish(w)
 
         # ========== Populate ALL OrientationControlData fields ==========
         # This ensures all fields in the bagged message correspond to the same measurement
@@ -1438,30 +1548,37 @@ class OrientationControlNode(Node):
             self.ocd.goal_pose = PoseStamped()
             self.ocd.goal_pose.header = self.ocd.header
 
-        # Control errors (raw and filtered)
-        self.ocd.theta_error = float(getattr(self, 'e_raw', 0.0))           # Raw measurement
-        self.ocd.theta_error_filtered = float(getattr(self, 'e', 0.0))      # Kalman filtered (or raw if disabled)
-        self.ocd.dtheta_error = float(getattr(self, 'de_raw', 0.0))         # Raw finite difference
-        self.ocd.dtheta_error_filtered = float(getattr(self, 'de', 0.0))    # Kalman velocity (or raw if disabled)
-        self.ocd.itheta_error = float(self.int_e)
+        # Control errors - separate pitch/yaw/roll
+        # Pitch (rotation about X-axis) - filtered values
+        self.ocd.pitch_error = float(self.pitch_err)
+        self.ocd.dpitch_error = float(self.dpitch)
+        self.ocd.ipitch_error = float(self.int_pitch)
+        # Pitch - raw (unfiltered) values
+        self.ocd.pitch_error_raw = float(self.pitch_err_raw)
+        self.ocd.dpitch_error_raw = float(self.dpitch_raw)
+
+        # Yaw (rotation about Y-axis) - filtered values
+        self.ocd.yaw_error = float(self.yaw_err)
+        self.ocd.dyaw_error = float(self.dyaw)
+        self.ocd.iyaw_error = float(self.int_yaw)
+        # Yaw - raw (unfiltered) values
+        self.ocd.yaw_error_raw = float(self.yaw_err_raw)
+        self.ocd.dyaw_error_raw = float(self.dyaw_raw)
+
+        # Roll (rotation about Z-axis)
         self.ocd.roll_error = float(roll_error)
+        self.ocd.droll_error = 0.0  # Not computed yet
+        self.ocd.iroll_error = 0.0  # Not computed yet
 
-        # Torque command
-        self.ocd.theta_torque_command = tau_theta
-        self.ocd.theta_axis = Vector3(
-            x=float(axis_err[0]),
-            y=float(axis_err[1]),
-            z=float(axis_err[2])
-        )
-        self.ocd.roll_torque_command = tau_roll
+        # Torque commands
+        self.ocd.pitch_torque_command = float(tau_pitch)
+        self.ocd.yaw_torque_command = float(tau_yaw)
+        self.ocd.roll_torque_command = float(tau_roll)
 
-        # Gains
-        self.ocd.k_p_theta = float(self.Kp)
-        self.ocd.k_d_theta = float(self.Kd)
-        self.ocd.k_i_theta = float(self.Ki)
-        self.ocd.k_p_roll = float(self.Kp)
-        self.ocd.k_d_roll = float(self.Kd)
-        self.ocd.k_i_roll = float(self.Ki)
+        # Gains (same for all axes)
+        self.ocd.k_p = float(self.Kp)
+        self.ocd.k_d = float(self.Kd)
+        self.ocd.k_i = float(self.Ki)
 
         # Current pose from TF
         try:
@@ -1527,7 +1644,12 @@ class OrientationControlNode(Node):
         # Close the bag file
         self.writer.close()
         self.get_logger().info(f'Closed bag file.')
-        debag(self.storage_options.uri)
+        debag(
+            self.storage_options.uri,
+            sphere_mass=self.mass_B,
+            sphere_radius=self.sphere_radius,
+            fluid_viscosity=self.fluid_viscosity
+        )
     
     def enable_normal_estimation_viz(self):
         if not self.visualize_normal_estimation:
@@ -1555,19 +1677,33 @@ class OrientationControlNode(Node):
         # Reset controller internal state so first dt_ctrl is not "time since last enable"
         self._last_err_t = None
         self._kalman_last_t = None
-        self.last_e = 0.0
-        self.de = 0.0
-        self.int_e = 0.0
-        # Reset Kalman filter
-        self.theta_kalman.reset()
-        # Reset stable theta axis to default
-        self._stable_theta_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        # Reset pitch/yaw state
+        self.last_pitch = 0.0
+        self.last_yaw = 0.0
+        self.dpitch = 0.0
+        self.dyaw = 0.0
+        self.int_pitch = 0.0
+        self.int_yaw = 0.0
+        # Reset previous torques for Kalman prediction
+        self._prev_tau_pitch = 0.0
+        self._prev_tau_yaw = 0.0
+        # Reset Kalman filters
+        self.pitch_kalman.reset()
+        self.yaw_kalman.reset()
         self.orientation_control_enabled = True
         self.get_logger().info('Orientation control ENABLED.')
 
     def disable_orientation_control(self):
         self.orientation_control_enabled = False
         self.get_logger().info('Orientation control DISABLED.')
+
+    def enable_autofocus(self):
+        self.autofocus_enabled = True
+        self.get_logger().info('Autofocus ENABLED.')
+
+    def disable_autofocus(self):
+        self.autofocus_enabled = False
+        self.get_logger().info('Autofocus DISABLED.')
 
     # Param updates
     def _on_param_update(self, params):
@@ -1620,6 +1756,11 @@ class OrientationControlNode(Node):
                     self.enable_orientation_control()
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
+            elif p.name == 'autofocus_enabled':
+                if not self.autofocus_enabled and p.value:
+                    self.enable_autofocus()
+                elif self.autofocus_enabled and not p.value:
+                    self.disable_autofocus()
             elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
                 self.mass_B = float(p.value)
                 self.get_logger().info(f'Updated sphere_mass to {self.mass_B:.3f} kg')
@@ -1657,24 +1798,25 @@ class OrientationControlNode(Node):
                 else:
                     self.disable_normal_estimation_viz()
                 self.get_logger().info(f'Updated visualize_normal_estimation to {self.visualize_normal_estimation}')
-            # Kalman filter parameters
+            # Kalman filter parameters (applied to both pitch and yaw filters)
             elif p.name == 'kalman_enabled':
                 self.kalman_enabled = bool(p.value)
                 if self.kalman_enabled:
-                    self.theta_kalman.reset()
+                    self.pitch_kalman.reset()
+                    self.yaw_kalman.reset()
                 self.get_logger().info(f'Updated kalman_enabled to {self.kalman_enabled}')
             elif p.name == 'kalman_R_theta':
-                self.theta_kalman.R = float(p.value)
-                self.get_logger().info(f'Updated kalman_R_theta to {p.value:.2e}')
+                self.pitch_kalman.R = float(p.value)
+                self.yaw_kalman.R = float(p.value)
+                self.get_logger().info(f'Updated kalman_R to {p.value:.2e}')
             elif p.name == 'kalman_Q_theta':
-                self.theta_kalman.Q[0, 0] = float(p.value)
-                self.get_logger().info(f'Updated kalman_Q_theta to {p.value:.2e}')
+                self.pitch_kalman.Q[0, 0] = float(p.value)
+                self.yaw_kalman.Q[0, 0] = float(p.value)
+                self.get_logger().info(f'Updated kalman_Q_angle to {p.value:.2e}')
             elif p.name == 'kalman_Q_dtheta':
-                self.theta_kalman.Q[1, 1] = float(p.value)
-                self.get_logger().info(f'Updated kalman_Q_dtheta to {p.value:.2e}')
-            elif p.name == 'theta_axis_stable_threshold':
-                self.theta_axis_stable_threshold = math.radians(float(p.value))
-                self.get_logger().info(f'Updated theta_axis_stable_threshold to {p.value:.1f} deg')
+                self.pitch_kalman.Q[1, 1] = float(p.value)
+                self.yaw_kalman.Q[1, 1] = float(p.value)
+                self.get_logger().info(f'Updated kalman_Q_dangle to {p.value:.2e}')
 
         result = SetParametersResult()
         result.successful = True
