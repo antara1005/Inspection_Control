@@ -786,7 +786,7 @@ class OrientationControlNode(Node):
         self._prev_tau_yaw = 0.0  # Previous yaw torque for Kalman prediction
 
         # Focus distance PID state
-        self.focal_distance = 0.28676
+        self.focal_distance = 0.1810768097639084
 
         # Thread-safe state for depth→timer communication
         self._measurement_lock = threading.Lock()
@@ -1459,7 +1459,7 @@ class OrientationControlNode(Node):
         tau_roll = roll_error * self.Kp
 
         # Apply focal distance control
-        F_z = -self.Kp * (self.focal_distance - d)
+        F_z = -10 * self.Kp * (self.focal_distance - d)
 
         # Conversion to body B dynamics
         force_drag_B = -self.linear_drag * self.lin_vel_cam
@@ -1805,15 +1805,15 @@ class OrientationControlNode(Node):
                     self.pitch_kalman.reset()
                     self.yaw_kalman.reset()
                 self.get_logger().info(f'Updated kalman_enabled to {self.kalman_enabled}')
-            elif p.name == 'kalman_R_theta':
+            elif p.name == 'kalman_R':
                 self.pitch_kalman.R = float(p.value)
                 self.yaw_kalman.R = float(p.value)
                 self.get_logger().info(f'Updated kalman_R to {p.value:.2e}')
-            elif p.name == 'kalman_Q_theta':
+            elif p.name == 'kalman_Q_angle':
                 self.pitch_kalman.Q[0, 0] = float(p.value)
                 self.yaw_kalman.Q[0, 0] = float(p.value)
                 self.get_logger().info(f'Updated kalman_Q_angle to {p.value:.2e}')
-            elif p.name == 'kalman_Q_dtheta':
+            elif p.name == 'kalman_Q_dangle':
                 self.pitch_kalman.Q[1, 1] = float(p.value)
                 self.yaw_kalman.Q[1, 1] = float(p.value)
                 self.get_logger().info(f'Updated kalman_Q_dangle to {p.value:.2e}')
