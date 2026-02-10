@@ -48,6 +48,6 @@ orientation_controller:
     Kd: 6.2
 
     kalman_enabled: true
-    kalman_R_theta: 6.668939e-04      # Measurement noise variance (rad²)
-    kalman_Q_theta: 5.497500e-03     # Process noise for theta (rad²)
-    kalman_Q_dtheta: 5.483359e-01     # Process noise for dtheta ((rad/s)²)
+    kalman_R: 1e-01     # Measurement noise variance (rad²)
+    kalman_Q_angle: 4e-03     # Process noise for angle (rad²)
+    kalman_Q_dangle: 1.245061e-01     # Process noise for dangle ((rad/s)²)
