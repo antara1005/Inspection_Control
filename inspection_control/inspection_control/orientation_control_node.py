@@ -192,7 +192,8 @@ class AngleKalmanFilter:
             (angle_filtered, dangle_filtered): Filtered state estimates
         """
         self.predict(dt, u_prev=u_prev, I_A=I_A, b=b)
-        return self.update(z_angle)
+        x0, x1 = self.update(z_angle)
+        return x0, x1
 
     @property
     def angle(self) -> float:
@@ -605,8 +606,8 @@ class OrientationControlNode(Node):
                 ('surface_target_frame', 'surface_target'),
                 # Kalman filter parameters
                 ('kalman_enabled', True),
-                ('kalman_R', 3.123443e-04),      # Measurement noise variance (rad²)
-                ('kalman_Q_angle', 1.250619e-3),      # Process noise for angle (rad²)
+                ('kalman_R', 5e-03),      # Measurement noise variance (rad²)
+                ('kalman_Q_angle', 4e-03),      # Process noise for angle (rad²)
                 ('kalman_Q_dangle', 1.245061e-01),     # Process noise for dangle ((rad/s)²)
             ]
         )
@@ -1448,8 +1449,12 @@ class OrientationControlNode(Node):
         self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
 
         # Store torques for next Kalman prediction step
-        self._prev_tau_pitch = float(tau_pitch)
-        self._prev_tau_yaw = float(tau_yaw)
+        if self.orientation_control_enabled:
+            self._prev_tau_pitch = float(tau_pitch)
+            self._prev_tau_yaw = float(tau_yaw)
+        else:
+            self._prev_tau_pitch = 0.0
+            self._prev_tau_yaw = 0.0
 
         # Build torque vector: [tau_pitch (about X), tau_yaw (about Y), tau_roll (about Z)]
         tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
