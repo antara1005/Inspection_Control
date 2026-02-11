@@ -31,6 +31,11 @@ def generate_launch_description():
         default_value='admittance_control.yaml',
         description='Name of controller configuration file'
     )
+    turntable_config_file = DeclareLaunchArgument(
+        'turntable_config_file',
+        default_value='turntable_joy.yaml',
+        description='Name of turntable joy configuration file'
+    )
 
     orientation_config = PathJoinSubstitution([
         FindPackageShare('inspection_control'),
@@ -56,6 +61,11 @@ def generate_launch_description():
         FindPackageShare('inspection_control'),
         'config',
         LaunchConfiguration('admittance_config_file')
+    ])
+    turntable_config = PathJoinSubstitution([
+        FindPackageShare('inspection_control'),
+        'config',
+        LaunchConfiguration('turntable_config_file')
     ])
     
     orientation_control_node = Node(
@@ -106,6 +116,14 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
+    turntable_joy_node = Node(
+        package='inspection_control',
+        executable='turntable_joy_node',
+        name='turntable_joy_node',
+        parameters=[turntable_config],
+        output='screen',
+        emulate_tty=True
+    )
     return LaunchDescription([
         orientation_config_file,
         orientation_control_node,
@@ -114,7 +132,9 @@ def generate_launch_description():
         joy_node,
         teleop_config_file,
         admittance_config_file,
+        turntable_config_file,
         teleop_node,
        # admittance_control_node,
         admittance_control_combine_node,
+        turntable_joy_node,
     ])
