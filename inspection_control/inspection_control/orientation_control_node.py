@@ -65,7 +65,7 @@ class AngleKalmanFilter:
             Q_dangle: Process noise variance for dangle (rad²/s²)
         """
         self.x = np.zeros(2, dtype=np.float64)
-        self.P = np.diag([(0.5*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
+        self.P = np.diag([(30*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
 
         self.R = float(R)
         self.Q = np.diag([float(Q_angle), float(Q_dangle)]).astype(np.float64)
@@ -84,7 +84,7 @@ class AngleKalmanFilter:
     def reset(self, angle_init: float = 0.0, dangle_init: float = 0.0):
         """Reset filter state."""
         self.x = np.array([angle_init, dangle_init], dtype=np.float64)
-        self.P = np.diag([(0.5*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
+        self.P = np.diag([(30*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
         self._initialized = True
         self._last_dt = None  # Force refresh discretization next predict
 
@@ -609,6 +609,8 @@ class OrientationControlNode(Node):
                 ('kalman_R', 5e-03),      # Measurement noise variance (rad²)
                 ('kalman_Q_angle', 4e-03),      # Process noise for angle (rad²)
                 ('kalman_Q_dangle', 1.245061e-01),     # Process noise for dangle ((rad/s)²)
+                ('zeta', 1.0),
+                ('ie_clamp', 8.0),
             ]
         )
 
@@ -668,6 +670,8 @@ class OrientationControlNode(Node):
         self.no_target_timeout_s = float(self.get_parameter('no_target_timeout_s').value)
         self.controller_type = str(self.get_parameter('controller_type').value).upper()
         self.integral_alpha = float(self.get_parameter('integral_alpha').value)
+        self.zeta = float(self.get_parameter('zeta').value)
+        self.ie_clamp = float(self.get_parameter('ie_clamp').value)
         
         # Loss tracking
         self._had_target_last_cycle = False
@@ -787,7 +791,7 @@ class OrientationControlNode(Node):
         self._prev_tau_yaw = 0.0  # Previous yaw torque for Kalman prediction
 
         # Focus distance PID state
-        self.focal_distance = 0.1810768097639084
+        self.focal_distance = 0.2810768097639084
 
         # Thread-safe state for depth→timer communication
         self._measurement_lock = threading.Lock()
@@ -1327,7 +1331,6 @@ class OrientationControlNode(Node):
 
         # --- PID control with separate pitch/yaw axes ---
         self.anti_windup_enabled = True
-        self.int_limit = 1e3
 
         # Compute dt for controller
         dt_ctrl = 0.0
@@ -1348,7 +1351,7 @@ class OrientationControlNode(Node):
             # Pitch Kalman filter with plant dynamics
             pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
                 pitch_err_raw, dt_ctrl,
-                u_prev=self._prev_tau_pitch,
+                u_prev=-self._prev_tau_pitch,
                 I_A=inertia_A,
                 b=b_damping
             )
@@ -1358,7 +1361,7 @@ class OrientationControlNode(Node):
             # Yaw Kalman filter with plant dynamics
             yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
                 yaw_err_raw, dt_ctrl,
-                u_prev=self._prev_tau_yaw,
+                u_prev=-self._prev_tau_yaw,
                 I_A=inertia_A,
                 b=b_damping
             )
@@ -1392,9 +1395,9 @@ class OrientationControlNode(Node):
         omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * 3.141592653589793 / 180.0))
         omega_n = omega_n_max
 
-        p_1 = -omega_n
-        p_2 = -omega_n
-        p_3 = -self.integral_alpha * omega_n
+        p_1 = -self.zeta*omega_n + omega_n*math.sqrt(self.zeta**2 - 1)
+        p_2 = -self.zeta*omega_n - omega_n*math.sqrt(self.zeta**2 - 1)
+        p_3 = 5 * p_2 # p_2 is larger pole
 
         if self.controller_type == 'PD':
             self.Kp = inertia_A * (p_1 * p_2)
@@ -1402,7 +1405,7 @@ class OrientationControlNode(Node):
             self.Ki = 0.0
         elif self.controller_type == 'PID':
             self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
-            self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+            self.Ki = self.integral_alpha * -inertia_A * (p_1 * p_2 * p_3)
             self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
         else:
             self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
@@ -1444,18 +1447,18 @@ class OrientationControlNode(Node):
             self.int_yaw += self.yaw_err * dt_ctrl
 
         # Apply integral limits
-        int_lim = float(self.int_limit)
+        int_lim = float(self.ie_clamp)*(math.pi/180)
         self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
         self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
 
         # Store torques for next Kalman prediction step
-        if self.orientation_control_enabled:
-            self._prev_tau_pitch = float(tau_pitch)
-            self._prev_tau_yaw = float(tau_yaw)
-        else:
-            self._prev_tau_pitch = 0.0
-            self._prev_tau_yaw = 0.0
+        if not self.orientation_control_enabled:
+            tau_pitch = 0.0
+            tau_yaw = 0.0
 
+        self._prev_tau_pitch = float(tau_pitch)
+        self._prev_tau_yaw = float(tau_yaw)
+        
         # Build torque vector: [tau_pitch (about X), tau_yaw (about Y), tau_roll (about Z)]
         tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
         moment_tele_A = np.cross(r, self.force_teleop)
@@ -1464,7 +1467,7 @@ class OrientationControlNode(Node):
         tau_roll = roll_error * self.Kp
 
         # Apply focal distance control
-        F_z = -10 * self.Kp * (self.focal_distance - d)
+        F_z = -1 * self.Kp * (self.focal_distance - d)
 
         # Conversion to body B dynamics
         force_drag_B = -self.linear_drag * self.lin_vel_cam
@@ -1681,20 +1684,20 @@ class OrientationControlNode(Node):
     def enable_orientation_control(self):
         # Reset controller internal state so first dt_ctrl is not "time since last enable"
         self._last_err_t = None
-        self._kalman_last_t = None
+        # self._kalman_last_t = None
         # Reset pitch/yaw state
-        self.last_pitch = 0.0
-        self.last_yaw = 0.0
-        self.dpitch = 0.0
-        self.dyaw = 0.0
+        # self.last_pitch = 0.0
+        # self.last_yaw = 0.0
+        # self.dpitch = 0.0
+        # self.dyaw = 0.0
         self.int_pitch = 0.0
         self.int_yaw = 0.0
         # Reset previous torques for Kalman prediction
-        self._prev_tau_pitch = 0.0
-        self._prev_tau_yaw = 0.0
+        # self._prev_tau_pitch = 0.0
+        # self._prev_tau_yaw = 0.0
         # Reset Kalman filters
-        self.pitch_kalman.reset()
-        self.yaw_kalman.reset()
+        # self.pitch_kalman.reset()
+        # self.yaw_kalman.reset()
         self.orientation_control_enabled = True
         self.get_logger().info('Orientation control ENABLED.')
 
@@ -1822,6 +1825,10 @@ class OrientationControlNode(Node):
                 self.pitch_kalman.Q[1, 1] = float(p.value)
                 self.yaw_kalman.Q[1, 1] = float(p.value)
                 self.get_logger().info(f'Updated kalman_Q_dangle to {p.value:.2e}')
+            elif p.name == 'zeta':
+                self.zeta = float(p.value)
+            elif p.name == 'ie_clamp':
+                self.ie_clamp = float(p.value)
 
         result = SetParametersResult()
         result.successful = True
