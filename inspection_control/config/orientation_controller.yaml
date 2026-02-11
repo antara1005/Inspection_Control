@@ -47,7 +47,12 @@ orientation_controller:
     Ki: 37.7
     Kd: 6.2
 
+    ie_clamp: 5.0
+
     kalman_enabled: true
     kalman_R: 1e-01     # Measurement noise variance (rad²)
     kalman_Q_angle: 4e-03     # Process noise for angle (rad²)
     kalman_Q_dangle: 1.245061e-01     # Process noise for dangle ((rad/s)²)
+
+    zeta: 1.0
+    integral_alpha: 1.0
