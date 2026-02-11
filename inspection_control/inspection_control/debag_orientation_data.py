@@ -215,11 +215,11 @@ def generate_pitch_yaw_control_plots(csv_filepath):
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
 
-    axes[0].plot(timestamps_sec, np.degrees(df['pitch_error']), label='Pitch Filtered', linewidth=1.5)
+    axes[0].plot(timestamps_sec, np.degrees(df['pitch_error']), label='Pitch Filtered', linewidth=1.5, c='b')
     #if has_raw:
     axes[0].plot(timestamps_sec, np.degrees(df['pitch_error_raw']), label='Pitch Raw', linewidth=1.0, linestyle='--', alpha=0.5)
 
-    axes[0].plot(timestamps_sec, np.degrees(df['yaw_error']), label='Yaw Filtered', linewidth=1.5)
+    axes[0].plot(timestamps_sec, np.degrees(df['yaw_error']), label='Yaw Filtered', linewidth=1.5, c='g')
     #if has_raw:
     axes[0].plot(timestamps_sec, np.degrees(df['yaw_error_raw']), label='Yaw Raw', linewidth=1.0, linestyle='--', alpha=0.5)
 
@@ -231,10 +231,10 @@ def generate_pitch_yaw_control_plots(csv_filepath):
 
     ax_deriv = axes[1]
     ax_integ = ax_deriv.twinx()
-    line1, = ax_deriv.plot(timestamps_sec, np.degrees(df['dpitch_error']), label='d(pitch)/dt Filtered', linewidth=1.5)
+    line1, = ax_deriv.plot(timestamps_sec, np.degrees(df['dpitch_error']), label='d(pitch)/dt Filtered', linewidth=1.5, c='b')
     #if has_raw:
     line1_raw, = ax_deriv.plot(timestamps_sec, np.degrees(df['dpitch_error_raw']), label='d(pitch)/dt Raw', linewidth=1.0, linestyle='--', alpha=0.5)
-    line2, = ax_integ.plot(timestamps_sec, np.degrees(df['ipitch_error']), label='∫pitch dt', linewidth=1.5)
+    line2, = ax_integ.plot(timestamps_sec, np.degrees(df['ipitch_error']), label='∫pitch dt', linewidth=1.5, c='m')
 
     ax_deriv.set_ylabel('Derivative (deg/s)')
     ax_integ.set_ylabel('Integral (deg·s)')
@@ -244,10 +244,10 @@ def generate_pitch_yaw_control_plots(csv_filepath):
 
     ax_deriv2 = axes[2]
     ax_integ2 = ax_deriv2.twinx()
-    line3, = ax_deriv2.plot(timestamps_sec, np.degrees(df['dyaw_error']), label='d(yaw)/dt Filtered', linewidth=1.5)
+    line3, = ax_deriv2.plot(timestamps_sec, np.degrees(df['dyaw_error']), label='d(yaw)/dt Filtered', linewidth=1.5, c='g')
     #if has_raw:
     line3_raw, = ax_deriv2.plot(timestamps_sec, np.degrees(df['dyaw_error_raw']), label='d(yaw)/dt Raw', linewidth=1.0, linestyle='--', alpha=0.5)
-    line4, = ax_integ2.plot(timestamps_sec, np.degrees(df['iyaw_error']), label='∫yaw dt', linewidth=1.5)
+    line4, = ax_integ2.plot(timestamps_sec, np.degrees(df['iyaw_error']), label='∫yaw dt', linewidth=1.5, c='y')
 
     ax_deriv2.set_ylabel('Derivative (deg/s)')
     ax_integ2.set_ylabel('Integral (deg·s)')
