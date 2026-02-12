@@ -64,8 +64,9 @@ class AngleKalmanFilter:
             Q_angle: Process noise variance for angle (rad²)
             Q_dangle: Process noise variance for dangle (rad²/s²)
         """
+        
         self.x = np.zeros(2, dtype=np.float64)
-        self.P = np.diag([(30*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
+        self.P = np.diag([(50*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
 
         self.R = float(R)
         self.Q = np.diag([float(Q_angle), float(Q_dangle)]).astype(np.float64)
@@ -84,7 +85,7 @@ class AngleKalmanFilter:
     def reset(self, angle_init: float = 0.0, dangle_init: float = 0.0):
         """Reset filter state."""
         self.x = np.array([angle_init, dangle_init], dtype=np.float64)
-        self.P = np.diag([(30*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
+        self.P = np.diag([(50*math.pi/180)**2, (50.0*math.pi/180)**2]).astype(np.float64)  # Initial covariance
         self._initialized = True
         self._last_dt = None  # Force refresh discretization next predict
 
@@ -555,7 +556,7 @@ def _roll_error(x_current_world) -> float:
 class OrientationControlNode(Node):
     # Node that gives desired EOAT pose based on depth image, bounding box, and cropping
     def __init__(self):
-        super().__init__('pd_controller')
+        super().__init__('orientation_controller')
 
         sub_cb_group = ReentrantCallbackGroup()
         timer_cb_group = MutuallyExclusiveCallbackGroup()
@@ -606,11 +607,12 @@ class OrientationControlNode(Node):
                 ('surface_target_frame', 'surface_target'),
                 # Kalman filter parameters
                 ('kalman_enabled', True),
-                ('kalman_R', 5e-03),      # Measurement noise variance (rad²)
+                ('kalman_R', 1e-01),      # Measurement noise variance (rad²)
                 ('kalman_Q_angle', 4e-03),      # Process noise for angle (rad²)
                 ('kalman_Q_dangle', 1.245061e-01),     # Process noise for dangle ((rad/s)²)
                 ('zeta', 1.0),
                 ('ie_clamp', 8.0),
+                
             ]
         )
 
@@ -1829,7 +1831,6 @@ class OrientationControlNode(Node):
                 self.zeta = float(p.value)
             elif p.name == 'ie_clamp':
                 self.ie_clamp = float(p.value)
-
         result = SetParametersResult()
         result.successful = True
 
