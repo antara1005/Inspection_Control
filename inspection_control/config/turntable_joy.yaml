@@ -15,8 +15,9 @@ turntable_joy_node:
 
     # Controller manager
     switch_controller_service: "/controller_manager/switch_controller"
+    list_controllers_service: "/controller_manager/list_controllers"
     position_controller: "turntable_forward_position_controller"
     trajectory_controller: "turntable_trajectory_controller"
 
-    # Joint
-    joint_name: "disc_joint"
+    # Joint (prefixed name in inspection cell context)
+    joint_name: "turntable_disc_joint"
