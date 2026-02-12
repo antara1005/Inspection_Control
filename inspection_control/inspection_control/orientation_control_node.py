@@ -524,7 +524,7 @@ class OrientationControlNode(Node):
                 # =========================
                 ('adaptive_q_enabled', True),
                 ('adaptive_q_tau_thresh', 0.5),      # N·m
-                ('adaptive_q_w_thresh', 0.15),       # rad/s
+                ('adaptive_q_w_thresh', 1.57),       # rad/s
                 ('adaptive_q_scale_moving', 50.0),   # 10–100x typical
             ]
         )
