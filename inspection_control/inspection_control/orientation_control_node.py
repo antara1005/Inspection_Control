@@ -520,12 +520,11 @@ class OrientationControlNode(Node):
                 ('ie_clamp', 8.0),
 
                 # =========================
-                # Simple adaptive Q (NEW)
+                # Adaptive Q: torque jump only (NEW)
                 # =========================
                 ('adaptive_q_enabled', True),
-                ('adaptive_q_tau_thresh', 0.5),      # N·m
-                ('adaptive_q_w_thresh', 1.57),       # rad/s
-                ('adaptive_q_scale_moving', 50.0),   # 10–100x typical
+                ('adaptive_q_tau_thresh', 0.5),      # N·m  (interpreted as |Δtau| threshold)
+                ('adaptive_q_scale_moving', 50.0),   # scale factor when jump detected
             ]
         )
 
@@ -564,11 +563,10 @@ class OrientationControlNode(Node):
         self._kalman_last_t = None
 
         # =========================
-        # Adaptive Q params + baseline storage (NEW)
+        # Adaptive Q params + baseline storage
         # =========================
         self.adaptive_q_enabled = bool(self.get_parameter('adaptive_q_enabled').value)
         self.adaptive_q_tau_thresh = float(self.get_parameter('adaptive_q_tau_thresh').value)
-        self.adaptive_q_w_thresh = float(self.get_parameter('adaptive_q_w_thresh').value)
         self.adaptive_q_scale_moving = float(self.get_parameter('adaptive_q_scale_moving').value)
 
         self._kalman_Q_angle_base = kalman_Q_angle
@@ -684,6 +682,7 @@ class OrientationControlNode(Node):
         self.pitch_err = 0.0
         self.dpitch = 0.0
         self._prev_tau_pitch = 0.0
+        self._prev2_tau_pitch = 0.0  # NEW: torque history k-2
 
         # Yaw state
         self.last_yaw = 0.0
@@ -691,6 +690,7 @@ class OrientationControlNode(Node):
         self.yaw_err = 0.0
         self.dyaw = 0.0
         self._prev_tau_yaw = 0.0
+        self._prev2_tau_yaw = 0.0    # NEW: torque history k-2
 
         # Focus distance PID state
         self.focal_distance = 0.2810768097639084
@@ -850,6 +850,9 @@ class OrientationControlNode(Node):
         self.depth_msg = msg
         self.process_depth(msg)
 
+    # ===========================
+    # process_depth (UNCHANGED)
+    # ===========================
     def process_depth(self, msg: CompressedImage):
         if self.K is None:
             self.get_logger().warn('No camera intrinsics yet, cannot process depth image')
@@ -1121,12 +1124,17 @@ class OrientationControlNode(Node):
             self.last_yaw = 0.0
             self._prev_tau_pitch = 0.0
             self._prev_tau_yaw = 0.0
+            self._prev2_tau_pitch = 0.0  # NEW
+            self._prev2_tau_yaw = 0.0    # NEW
 
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
         w.header.frame_id = self.main_camera_frame
         self.pub_wrench_cmd.publish(w)
 
+    # ===========================
+    # process_controller (CHANGED)
+    # ===========================
     def process_controller(self):
         with self._measurement_lock:
             if not self._latest_measurement['valid']:
@@ -1160,26 +1168,20 @@ class OrientationControlNode(Node):
         pitch_err_raw = -pitch_err_meas
         yaw_err_raw = yaw_err_meas
 
-        # ===== NEW: measured raw rates BEFORE KF (for adaptive-Q gating) =====
-        dpitch_meas = 0.0
-        dyaw_meas = 0.0
-        if dt_ctrl > 0.0:
-            dpitch_meas = (pitch_err_raw - float(self.last_pitch)) / dt_ctrl
-            dyaw_meas = (yaw_err_raw - float(self.last_yaw)) / dt_ctrl
-
         inertia_A = self.inertia_B + self.mass_B * d ** 2
         b_damping = self.linear_drag * d * d
 
-        # ===== NEW: Simple adaptive Q (screenshot logic) =====
-        if self.kalman_enabled and self.adaptive_q_enabled and dt_ctrl > 0.0:
-            pitch_moving = (abs(self._prev_tau_pitch) > self.adaptive_q_tau_thresh)
-            pitch_moving = pitch_moving or (abs(dpitch_meas) > self.adaptive_q_w_thresh)
+        # ===== Adaptive Q based ONLY on sudden torque jump =====
+        # If |tau[k-1] - tau[k-2]| is big => Q *= 50, else Q *= 1
+        if self.kalman_enabled and self.adaptive_q_enabled:
+            d_tau_pitch = abs(float(self._prev_tau_pitch) - float(self._prev2_tau_pitch))
+            d_tau_yaw   = abs(float(self._prev_tau_yaw)   - float(self._prev2_tau_yaw))
 
-            yaw_moving = (abs(self._prev_tau_yaw) > self.adaptive_q_tau_thresh)
-            yaw_moving = yaw_moving or (abs(dyaw_meas) > self.adaptive_q_w_thresh)
+            pitch_jump = (d_tau_pitch > self.adaptive_q_tau_thresh)
+            yaw_jump   = (d_tau_yaw   > self.adaptive_q_tau_thresh)
 
-            pitch_scale = self.adaptive_q_scale_moving if pitch_moving else 1.0
-            yaw_scale = self.adaptive_q_scale_moving if yaw_moving else 1.0
+            pitch_scale = self.adaptive_q_scale_moving if pitch_jump else 1.0
+            yaw_scale   = self.adaptive_q_scale_moving if yaw_jump else 1.0
 
             self.pitch_kalman.set_noise(
                 Q_angle=self._kalman_Q_angle_base * pitch_scale,
@@ -1287,6 +1289,10 @@ class OrientationControlNode(Node):
         if not self.orientation_control_enabled:
             tau_pitch = 0.0
             tau_yaw = 0.0
+
+        # ===== Shift history for torque-jump detection =====
+        self._prev2_tau_pitch = float(self._prev_tau_pitch)
+        self._prev2_tau_yaw   = float(self._prev_tau_yaw)
 
         self._prev_tau_pitch = float(tau_pitch)
         self._prev_tau_yaw = float(tau_yaw)
@@ -1471,6 +1477,13 @@ class OrientationControlNode(Node):
         self.int_pitch = 0.0
         self.int_yaw = 0.0
         self.orientation_control_enabled = True
+
+        # NEW: reset torque history so jump detector doesn't false-trigger
+        self._prev_tau_pitch = 0.0
+        self._prev_tau_yaw = 0.0
+        self._prev2_tau_pitch = 0.0
+        self._prev2_tau_yaw = 0.0
+
         self.get_logger().info('Orientation control ENABLED.')
 
     def disable_orientation_control(self):
@@ -1606,16 +1619,13 @@ class OrientationControlNode(Node):
             elif p.name == 'ie_clamp':
                 self.ie_clamp = float(p.value)
 
-            # ===== NEW: adaptive-Q params =====
+            # ===== adaptive-Q params (UPDATED) =====
             elif p.name == 'adaptive_q_enabled':
                 self.adaptive_q_enabled = bool(p.value)
                 self.get_logger().info(f'Updated adaptive_q_enabled to {self.adaptive_q_enabled}')
             elif p.name == 'adaptive_q_tau_thresh':
                 self.adaptive_q_tau_thresh = float(p.value)
-                self.get_logger().info(f'Updated adaptive_q_tau_thresh to {self.adaptive_q_tau_thresh:.3f}')
-            elif p.name == 'adaptive_q_w_thresh':
-                self.adaptive_q_w_thresh = float(p.value)
-                self.get_logger().info(f'Updated adaptive_q_w_thresh to {self.adaptive_q_w_thresh:.3f}')
+                self.get_logger().info(f'Updated adaptive_q_tau_thresh(|Δtau|) to {self.adaptive_q_tau_thresh:.3f}')
             elif p.name == 'adaptive_q_scale_moving':
                 self.adaptive_q_scale_moving = float(p.value)
                 self.get_logger().info(f'Updated adaptive_q_scale_moving to {self.adaptive_q_scale_moving:.1f}')
