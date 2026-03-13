@@ -17,7 +17,9 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rcl_interfaces.srv import GetParameters
 
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+import struct
+
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TransformStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Header
@@ -143,12 +145,21 @@ class ParticleFilterNode(Node):
         # -- Publishers -----------------------------------------------------
         synth_topic = self.get_parameter("synthetic_depth_topic").value
         pose_topic  = self.get_parameter("pose_topic").value
-        self.depth_pub     = self.create_publisher(Image,       synth_topic,                        10)
+        self.depth_pub          = self.create_publisher(Image,           synth_topic,                               10)
+        self.depth_compressed_pub = self.create_publisher(CompressedImage, synth_topic + "/compressedDepth",         10)
         self.pose_pub      = self.create_publisher(PoseStamped, pose_topic,                         10)
-        self.particles_pub = self.create_publisher(PoseArray,   "particle_filter/particles",        10)
-        self.markers_pub   = self.create_publisher(MarkerArray, "particle_filter/particle_markers", 10)
+        self.particles_pub  = self.create_publisher(PoseArray,    "particle_filter/particles",        10)
+        self.markers_pub    = self.create_publisher(MarkerArray,  "particle_filter/particle_markers", 10)
+        self.obs_cloud_pub  = self.create_publisher(PointCloud2,  "particle_filter/observed_cloud",   10)
 
         # -- Subscribers (start before model is loaded so we buffer info) ---
+        # The depth callback can block for seconds (particle update step).
+        # Give it a ReentrantCallbackGroup so it does not starve the polling
+        # timer and service-response callbacks that live in the default
+        # MutuallyExclusiveCallbackGroup.  The self.processing lock already
+        # prevents overlapping depth-frame processing.
+        self._depth_cb_group = ReentrantCallbackGroup()
+
         self.create_subscription(
             CameraInfo,
             "/camera/d405_camera/depth/camera_info",
@@ -156,24 +167,37 @@ class ParticleFilterNode(Node):
 
         self.create_subscription(
             CompressedImage,
-            "/camera/d405_camera/depth/image_rect_raw/compressed",
-            self._depth_cb, 5)
+            "/camera/d405_camera/depth/image_rect_raw/compressedDepth",
+            self._depth_cb, 5,
+            callback_group=self._depth_cb_group)
 
         # -- Fetch model paths from viewpoint_generation node ---------------
         self._param_client = self.create_client(
             GetParameters,
             f"/{self.vg_node_name}/get_parameters")
 
-        self.get_logger().info("Waiting for viewpoint_generation parameter service …")
-        self._param_client.wait_for_service(timeout_sec=30.0)
-        self._fetch_model_params()
+        # Track last known paths and units so we can detect changes and restart
+        self._current_mesh_file  = None
+        self._current_mesh_units = None
+        self._current_pc_file    = None
+        self._current_pc_units   = None
+
+        self.get_logger().info(
+            "Polling viewpoint_generation for model parameters every 5 s …")
+        self.create_timer(5.0, self._poll_model_params)
 
     # -----------------------------------------------------------------------
     # Initialization helpers
     # -----------------------------------------------------------------------
 
-    def _fetch_model_params(self):
-        """Call viewpoint_generation node to retrieve model file paths and units."""
+    def _poll_model_params(self):
+        """Timer callback (every 5 s): fetch model paths from viewpoint_generation."""
+        if not self._param_client.service_is_ready():
+            self.get_logger().info(
+                "viewpoint_generation parameter service not ready yet, retrying …",
+                throttle_duration_sec=10.0)
+            return
+
         request = GetParameters.Request()
         request.names = [
             "model.mesh.file", "model.mesh.units",
@@ -195,13 +219,40 @@ class ParticleFilterNode(Node):
         pc_file    = values[2].string_value
         pc_units   = values[3].string_value
 
+        # Wait until both paths are populated
+        if not mesh_file or not pc_file:
+            self.get_logger().info(
+                "Model file paths not yet set in viewpoint_generation, waiting …",
+                throttle_duration_sec=10.0)
+            return
+
+        # Check whether paths or units have changed since the last load
+        params_changed = (mesh_file  != self._current_mesh_file  or
+                          mesh_units != self._current_mesh_units  or
+                          pc_file    != self._current_pc_file     or
+                          pc_units   != self._current_pc_units)
+        if not params_changed:
+            return
+
+        if self._current_mesh_file is not None:
+            self.get_logger().info(
+                "Model parameters changed – restarting particle filter …")
+
         self.get_logger().info(f"Mesh : {mesh_file} ({mesh_units})")
         self.get_logger().info(f"Cloud: {pc_file} ({pc_units})")
 
-        self._load_models(mesh_file, mesh_units, pc_file, pc_units)
-        self._init_particles()
-        self.model_ready = True
-        self.get_logger().info("Model loaded and particles initialised.")
+        try:
+            self.model_ready = False
+            self._load_models(mesh_file, mesh_units, pc_file, pc_units)
+            self._init_particles()
+            self._current_mesh_file  = mesh_file
+            self._current_mesh_units = mesh_units
+            self._current_pc_file    = pc_file
+            self._current_pc_units   = pc_units
+            self.model_ready = True
+            self.get_logger().info("Model loaded and particles initialised.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load models: {e}")
 
     def _load_models(self, mesh_path, mesh_units, pc_path, pc_units):
         """Load STL mesh and PLY cloud, scale both to metres."""
@@ -253,11 +304,19 @@ class ParticleFilterNode(Node):
         self.camera_frame = msg.header.frame_id
 
     def _depth_cb(self, msg: CompressedImage):
-        if not self.model_ready or self.intrinsics is None:
+        if not self.model_ready:
+            self.get_logger().info("depth_cb: model not ready yet, skipping",
+                                   throttle_duration_sec=5.0)
+            return
+        if self.intrinsics is None:
+            self.get_logger().info("depth_cb: no camera intrinsics yet, skipping",
+                                   throttle_duration_sec=5.0)
             return
         # Prevent overlapping processing
         with self.lock:
             if self.processing:
+                self.get_logger().info("depth_cb: previous frame still processing, skipping",
+                                       throttle_duration_sec=5.0)
                 return
             self.processing = True
         try:
@@ -274,12 +333,14 @@ class ParticleFilterNode(Node):
 
     def _process_frame(self, msg: CompressedImage):
         stamp = msg.header.stamp
+        self.get_logger().info("process_frame: start", throttle_duration_sec=2.0)
 
         # 1. Decode compressed depth image
         result = self._decode_compressed_depth(msg)
         if result is None:
             return
         depth_m, depth_scale = result
+        self.get_logger().info("process_frame: depth decoded", throttle_duration_sec=2.0)
 
         # 2. Look up transform: camera_frame -> object_frame
         try:
@@ -292,33 +353,54 @@ class ParticleFilterNode(Node):
             self.get_logger().warn(f"TF lookup failed: {e}", throttle_duration_sec=2.0)
             return
         T_cam_to_obj = msg_to_matrix(tf_cam_to_obj)
+        self.get_logger().info("process_frame: TF lookup OK", throttle_duration_sec=2.0)
 
         # 3. Deproject depth to 3-D points in camera frame, then to object_frame
         obs_points = self._deproject_and_transform(depth_m, T_cam_to_obj)
         if obs_points is None or len(obs_points) < 50:
-            self.get_logger().warn("Too few observed points after filtering.",
-                                   throttle_duration_sec=2.0)
+            self.get_logger().warn(
+                f"Too few observed points after filtering: "
+                f"{len(obs_points) if obs_points is not None else 0}",
+                throttle_duration_sec=2.0)
             return
+        self.get_logger().info(
+            f"process_frame: deprojected {len(obs_points)} pts", throttle_duration_sec=2.0)
 
         # 4. Crop to region of interest around origin (position_bound + margin)
         roi = self.pos_bound + self.roi_margin
-        mask = (np.abs(obs_points[:, 0]) < roi) & (np.abs(obs_points[:, 1]) < roi)
+        mask =  (np.abs(obs_points[:, 0]) < roi) &  \
+                (np.abs(obs_points[:, 1]) < roi) & \
+                (obs_points[:, 2] > 0.01)  # keep only points above the object_frame
         obs_points = obs_points[mask]
         if len(obs_points) < 50:
+            self.get_logger().warn(
+                f"Too few points after ROI crop: {len(obs_points)}", throttle_duration_sec=2.0)
             return
+        self.get_logger().info(
+            f"process_frame: {len(obs_points)} pts after ROI crop", throttle_duration_sec=2.0)
 
         # 5. Voxel downsample observed cloud
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(obs_points)
         pcd = pcd.voxel_down_sample(self.obs_voxel)
         obs_points = np.asarray(pcd.points)
+        self.get_logger().info(
+            f"process_frame: {len(obs_points)} pts after voxel downsample", throttle_duration_sec=2.0)
+        self._publish_obs_cloud(obs_points, stamp)
 
         # 6. Build KD-tree on observed cloud (queried once per particle)
         obs_tree = o3d.geometry.KDTreeFlann(pcd)
+        self.get_logger().info("process_frame: KD-tree built", throttle_duration_sec=2.0)
 
         # 7. Particle filter ---
+        self.get_logger().info("process_frame: starting predict", throttle_duration_sec=2.0)
         self._predict()
+        self.get_logger().info(
+            f"process_frame: starting update ({self.N} particles, "
+            f"{len(self.ref_cloud)} ref pts, {len(obs_points)} obs pts)",
+            throttle_duration_sec=2.0)
         self._update(obs_points, obs_tree)
+        self.get_logger().info("process_frame: update done, estimating", throttle_duration_sec=2.0)
         best_tx, best_ty, best_theta = self._estimate()
         self._resample()
 
@@ -327,27 +409,46 @@ class ParticleFilterNode(Node):
         self._publish_particles(stamp)
 
         # 9. Render and publish synthetic depth
+        self.get_logger().info("process_frame: starting render", throttle_duration_sec=2.0)
         T_obj_to_cam = np.linalg.inv(T_cam_to_obj)
         T_model_in_obj = pose_matrix(best_tx, best_ty, best_theta)
         self._render_and_publish(T_obj_to_cam, T_model_in_obj, stamp, depth_scale)
+        self.get_logger().info(
+            f"process_frame: complete  tx={best_tx:.4f} ty={best_ty:.4f} "
+            f"theta={np.degrees(best_theta):.1f}°",
+            throttle_duration_sec=2.0)
 
     # -----------------------------------------------------------------------
     # Depth decoding
     # -----------------------------------------------------------------------
 
     def _decode_compressed_depth(self, msg: CompressedImage) -> tuple[np.ndarray, float] | None:
-        """Decode a compressedDepth image (12-byte header + PNG).
+        """Decode a compressed or compressedDepth image.
+
+        compressedDepth images have a 12-byte ConfigHeader prepended before
+        the PNG payload; regular compressed images (format "png"/"jpeg") do not.
 
         Returns (depth_metres, depth_scale) or None on failure.
         depth_scale is the raw→metres factor used so the renderer can
         convert back to the same encoding.
         """
         np_arr = np.frombuffer(msg.data, np.uint8)
-        if np_arr.size <= 12:
-            self.get_logger().warn("Empty or invalid compressedDepth data, skipping frame",
+        if np_arr.size == 0:
+            self.get_logger().warn("Empty compressedDepth data, skipping frame",
                                    throttle_duration_sec=2.0)
             return None
-        png_data = np_arr[12:]
+
+        # compressedDepth transport prepends a 12-byte ConfigHeader before the PNG.
+        # Regular compressed transport (png/jpeg) has no such header.
+        if "compressedDepth" in msg.format:
+            if np_arr.size <= 12:
+                self.get_logger().warn("compressedDepth payload too short, skipping frame",
+                                       throttle_duration_sec=2.0)
+                return None
+            png_data = np_arr[12:]
+        else:
+            png_data = np_arr
+
         depth = cv2.imdecode(png_data, cv2.IMREAD_UNCHANGED)
         if depth is None:
             self.get_logger().warn("Failed to decode depth image, skipping frame",
@@ -461,6 +562,25 @@ class ParticleFilterNode(Node):
     # Publishing
     # -----------------------------------------------------------------------
 
+    def _publish_obs_cloud(self, points: np.ndarray, stamp):
+        """Publish observed points (in object_frame) as a PointCloud2 message."""
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "object_frame"
+        msg.height = 1
+        msg.width = len(points)
+        msg.fields = [
+            PointField(name="x", offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12          # 3 × float32
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.data = points.astype(np.float32).tobytes()
+        self.obs_cloud_pub.publish(msg)
+
     def _publish_particles(self, stamp):
         """Publish all particles as PoseArray and a weight-coloured MarkerArray."""
         pa = PoseArray()
@@ -559,7 +679,7 @@ class ParticleFilterNode(Node):
         z_depth[~np.isfinite(z_depth)] = 0.0
         depth_uint16 = (z_depth / depth_scale).astype(np.uint16)
 
-        # Build and publish Image message
+        # Build and publish raw Image message
         img_msg = Image()
         img_msg.header.stamp = stamp
         img_msg.header.frame_id = self.camera_frame
@@ -570,6 +690,17 @@ class ParticleFilterNode(Node):
         img_msg.step = w * 2
         img_msg.data = depth_uint16.tobytes()
         self.depth_pub.publish(img_msg)
+
+        # Build and publish compressedDepth message (12-byte ConfigHeader + PNG)
+        ok, png_buf = cv2.imencode(".png", depth_uint16)
+        if ok:
+            # ConfigHeader: int32 format=0, float32 depthParam[2]={0,0}
+            config_header = struct.pack("<iff", 0, 0.0, 0.0)
+            comp_msg = CompressedImage()
+            comp_msg.header = img_msg.header
+            comp_msg.format = "16UC1; compressedDepth png"
+            comp_msg.data = config_header + png_buf.tobytes()
+            self.depth_compressed_pub.publish(comp_msg)
 
 
 # ---------------------------------------------------------------------------

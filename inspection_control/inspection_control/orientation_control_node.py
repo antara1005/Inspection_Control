@@ -735,7 +735,7 @@ class OrientationControlNode(Node):
                 ('Kd', 5.0),
                 ('anti_windup_enabled', True),
                 ('integral_alpha', 5.0),
-                ('surface_target_frame', 'surface_target'),
+                ('surface_normal_frame', 'surface_normal'),
                 # Kalman filter parameters
                 ('kalman_enabled', True),
                 ('kalman_r', 1e-01),
@@ -945,7 +945,7 @@ class OrientationControlNode(Node):
             PoseStamped, f'/{self.get_name()}/eoat_desired_pose_in_{self.main_camera_frame}', 10
         )
 
-        self.surface_target_frame = self.get_parameter('surface_target_frame').get_parameter_value().string_value
+        self.surface_normal_frame = self.get_parameter('surface_normal_frame').get_parameter_value().string_value
         self.tf_broadcaster = TransformBroadcaster(self)
         self.pub_z_rotvec_err = self.create_publisher(
             Vector3Stamped, f'/{self.get_name()}/z_axis_rotvec_error_in_{self.main_camera_frame}', 10
@@ -1327,12 +1327,6 @@ class OrientationControlNode(Node):
         v_tip = -R_tip_base @ v_base
         w_tip = R_tip_base @ w_base
 
-        print("\n===== EOAT Velocity =====")
-        print(f"Linear in base frame (m/s):   {v_base}")
-        print(f"Angular in base frame (rad/s): {w_base}")
-        print(f"Linear in tip frame (m/s):    {v_tip}")
-        print(f"Angular in tip frame (rad/s):  {w_tip}")
-
         with self._joint_twist_lock:
             self.jacobian_lin_vel_cam[:] = v_tip
             self.jacobian_rot_vel_cam[:] = w_tip
@@ -1612,22 +1606,22 @@ class OrientationControlNode(Node):
                     surface_position_of = (R_tf @ cen_s) + t_vec
                     surface_normal_of = R_tf @ nrm_s
 
-                    surface_target_pose = PoseStamped()
-                    surface_target_pose.header = msg.header
-                    surface_target_pose.header.frame_id = 'object_frame'
-                    surface_target_pose.pose.position.x = float(surface_position_of[0])
-                    surface_target_pose.pose.position.y = float(surface_position_of[1])
-                    surface_target_pose.pose.position.z = float(surface_position_of[2])
-                    surface_target_pose.pose.orientation = _quaternion_from_z(surface_normal_of)
-                    self.normal_estimate_pub.publish(surface_target_pose)
+                    surface_normal_pose = PoseStamped()
+                    surface_normal_pose.header = msg.header
+                    surface_normal_pose.header.frame_id = 'object_frame'
+                    surface_normal_pose.pose.position.x = float(surface_position_of[0])
+                    surface_normal_pose.pose.position.y = float(surface_position_of[1])
+                    surface_normal_pose.pose.position.z = float(surface_position_of[2])
+                    surface_normal_pose.pose.orientation = _quaternion_from_z(surface_normal_of)
+                    self.normal_estimate_pub.publish(surface_normal_pose)
 
                     tf_msg = TransformStamped()
-                    tf_msg.header = surface_target_pose.header
-                    tf_msg.child_frame_id = self.surface_target_frame
-                    tf_msg.transform.translation.x = surface_target_pose.pose.position.x
-                    tf_msg.transform.translation.y = surface_target_pose.pose.position.y
-                    tf_msg.transform.translation.z = surface_target_pose.pose.position.z
-                    tf_msg.transform.rotation = surface_target_pose.pose.orientation
+                    tf_msg.header = surface_normal_pose.header
+                    tf_msg.child_frame_id = self.surface_normal_frame
+                    tf_msg.transform.translation.x = surface_normal_pose.pose.position.x
+                    tf_msg.transform.translation.y = surface_normal_pose.pose.position.y
+                    tf_msg.transform.translation.z = surface_normal_pose.pose.position.z
+                    tf_msg.transform.rotation = surface_normal_pose.pose.orientation
                     self.tf_broadcaster.sendTransform(tf_msg)
 
                     if self.standoff_mode == 'euclidean':
@@ -1985,8 +1979,7 @@ class OrientationControlNode(Node):
         tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
         moment_tele_A = np.cross(r, self.force_teleop)
 
-        tau_roll = roll_error * self.Kp
-        tau_roll= 0.0
+        tau_roll = roll_error 
         F_z = -1 * self.Kp * (self.focal_distance - d)
         
 

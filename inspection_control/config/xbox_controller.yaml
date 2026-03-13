@@ -5,8 +5,8 @@ teleop:
     publish_rate: 10.0
     
     # Scaling factors
-    force_scale: 5.0      # Max linear velocity (m/s)
-    torque_scale: 5.0     # Max angular velocity (rad/s)
+    force_scale: 0.5      # Max linear velocity (m/s)
+    torque_scale: 0.5     # Max angular velocity (rad/s)
     
     x_axis: 0         # Camera pan left/right (Stick X)
     y_axis: 1         # Camera pan up/down (Stick Z)

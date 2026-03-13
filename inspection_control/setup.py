@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'teleop = inspection_control.teleop_node:main',
+            'particle_filter_node = inspection_control.particle_filter_node:main',
             'admittance_control = inspection_control.admittance_control_node:main',
             'focus_monitor = inspection_control.focus_monitor_node:main',
             'multi_speed_autofocus = inspection_control.multi_speed_autofocus_node:main',
