@@ -11,6 +11,11 @@ def generate_launch_description():
     """Generate launch description for teleop_twist_stamped_joy node."""
 
     # Launch arguments
+    particle_filter_config_file = DeclareLaunchArgument(
+        'particle_filter_config_file',
+        default_value='particle_filter.yaml',
+        description='Name of particle filter configuration file'
+    )
     orientation_config_file = DeclareLaunchArgument(
         'orientation_config_file',
         default_value='orientation_controller.yaml',
@@ -37,6 +42,11 @@ def generate_launch_description():
         description='Name of turntable joy configuration file'
     )
 
+    particle_filter_config = PathJoinSubstitution([
+        FindPackageShare('inspection_control'),
+        'config',
+        LaunchConfiguration('particle_filter_config_file')
+    ])
     orientation_config = PathJoinSubstitution([
         FindPackageShare('inspection_control'),
         'config',
@@ -68,6 +78,14 @@ def generate_launch_description():
         LaunchConfiguration('turntable_config_file')
     ])
     
+    particle_filter_node = Node(
+        package='inspection_control',
+        executable='particle_filter_node',
+        name='particle_filter',
+        parameters=[particle_filter_config],
+        output='screen',
+        emulate_tty=True
+    )
     orientation_control_node = Node(
         package='inspection_control',
         executable='orientation_control_node',
@@ -125,6 +143,8 @@ def generate_launch_description():
         emulate_tty=True
     )
     return LaunchDescription([
+        particle_filter_config_file,
+        particle_filter_node,
         orientation_config_file,
         orientation_control_node,
         autofocus_config_file,

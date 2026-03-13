@@ -1,0 +1,29 @@
+particle_filter:
+  ros__parameters:
+    # -- Particle filter core --
+    num_particles: 500
+    sigma_translation: 0.005        # m – prediction noise (std dev)
+    sigma_rotation: 0.087           # rad – prediction noise (~5°)
+    sigma_observation: 0.005        # m – Gaussian likelihood std dev
+    inlier_threshold: 0.005         # m – distance for inlier counting
+    use_inlier_scoring: true        # true = inlier ratio, false = Gaussian
+    resample_threshold_ratio: 0.5   # resample when N_eff < ratio * N
+
+    # -- Point cloud processing --
+    reference_voxel_size: 0.002     # m – downsample reference cloud for scoring
+    observation_voxel_size: 0.003   # m – downsample observed cloud per frame
+
+    # -- Depth sensor --
+    depth_min: 0.07                 # m – D405 min usable range
+    depth_max: 0.50                 # m – D405 max usable range
+
+    # -- Workspace --
+    position_bound: 0.17            # m – radius of uniform init region
+    roi_margin: 0.05                # m – extra margin when cropping observed cloud
+
+    # -- Topics --
+    synthetic_depth_topic: "particle_filter/depth/synthetic"
+    pose_topic: "particle_filter/pose"
+
+    # -- External node --
+    viewpoint_generation_node: "viewpoint_generation"
