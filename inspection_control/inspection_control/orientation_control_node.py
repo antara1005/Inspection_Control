@@ -17,6 +17,12 @@ from rclpy.duration import Duration
 from geometry_msgs.msg import Vector3Stamped
 from geometry_msgs.msg import WrenchStamped, TwistStamped
 
+from sensor_msgs import msg
+from sensor_msgs.msg import JointState
+from moveit.core.robot_state import RobotState
+#from moveit.core.robot_model_loader import RobotModelLoader
+from moveit.planning import MoveItPy
+
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2, PointField
@@ -25,11 +31,12 @@ from cv_bridge import CvBridge
 from builtin_interfaces.msg import Time
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import AccelStamped
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from viewpoint_generation_interfaces.msg import OrientationControlData
 from geometry_msgs.msg import PointStamped, Point, Vector3
-
+from sensor_msgs.msg import Imu
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
 from rclpy.serialization import serialize_message
 
@@ -37,7 +44,118 @@ from tf2_ros import Buffer, TransformListener, TransformException, TransformBroa
 from geometry_msgs.msg import TransformStamped
 from inspection_control.debag_orientation_data import debag
 
+class AngleKalmanFilterKKF:
+    """
+    2-state Kinematic Kalman Filter (KKF) with acceleration input.
 
+      x = [angle, dangle]^T
+      x_{k+1} = F(dt) x_k + B(dt) * a_k + w_k
+      z_k     = H x_k + v_k,   H = [1 0]
+
+    where a_k is measured angular acceleration (from admittance node),
+    treated as a known input, but with uncertainty (Wa) injected via B*Wa*B^T.
+    """
+
+    def __init__(self, R: float, Wa: float, Q_angle: float = 0.0, Q_dangle: float = 0.0):
+        # state and covariance
+        self.x = np.zeros(2, dtype=np.float64)
+
+        self.P = np.diag([
+            (50.0 * math.pi / 180.0) ** 2,
+            (50.0 * math.pi / 180.0) ** 2
+        ]).astype(np.float64)
+
+        # measurement noise variance (angle)
+        self.R = float(R)
+
+        # accel-input noise variance (angular accel): rad^2/s^4
+        self.Wa = float(Wa)
+
+        # optional extra process noise directly on states
+        self.Qx = np.diag([float(Q_angle), float(Q_dangle)]).astype(np.float64)
+
+        self.H = np.array([[1.0, 0.0]], dtype=np.float64)
+
+        self._initialized = False
+        self._last_dt = None
+        self._F = np.eye(2, dtype=np.float64)
+        self._B = np.zeros((2, 1), dtype=np.float64)
+
+    def reset(self, angle_init: float = 0.0, dangle_init: float = 0.0):
+        self.x = np.array([angle_init, dangle_init], dtype=np.float64)
+        self.P = np.diag([
+            (0.5 * math.pi / 180.0) ** 2,
+            (50.0 * math.pi / 180.0) ** 2
+        ]).astype(np.float64)
+        self._initialized = True
+        self._last_dt = None
+
+    def set_noise(self, R: float = None, Wa: float = None, Q_angle: float = None, Q_dangle: float = None):
+        if R is not None:
+            self.R = float(R)
+        if Wa is not None:
+            self.Wa = float(Wa)
+        if Q_angle is not None or Q_dangle is not None:
+            qa = self.Qx[0, 0] if Q_angle is None else float(Q_angle)
+            qd = self.Qx[1, 1] if Q_dangle is None else float(Q_dangle)
+            self.Qx = np.diag([qa, qd]).astype(np.float64)
+
+    def _update_mats(self, dt: float):
+        dt2 = dt * dt
+        # x_{k+1} = [1 dt; 0 1] x_k + [0.5 dt^2; dt] a_k
+        self._F = np.array([[1.0, dt],
+                            [0.0, 1.0]], dtype=np.float64)
+        self._B = np.array([[0.5 * dt2],
+                            [dt]], dtype=np.float64)
+        self._last_dt = dt
+
+    def predict(self, dt: float, a_k: float):
+        if dt <= 0.0:
+            return
+
+        if self._last_dt != dt:
+            self._update_mats(dt)
+
+        a = float(a_k)
+
+        # state prediction
+        self.x = self._F @ self.x + (self._B[:, 0] * a)
+
+        # covariance prediction:
+        # P = F P F^T + B Wa B^T + Qx
+        self.P = self._F @ self.P @ self._F.T + (self._B * self.Wa) @ self._B.T + self.Qx
+
+    def update(self, z_angle: float):
+        if not self._initialized:
+            self.reset(angle_init=float(z_angle), dangle_init=0.0)
+            return float(self.x[0]), float(self.x[1])
+
+        z = float(z_angle)
+
+        y = z - (self.H @ self.x)[0]
+        S = (self.H @ self.P @ self.H.T)[0, 0] + self.R
+        K = (self.P @ self.H.T) / max(1e-12, S)  # (2x1)
+
+        self.x = self.x + (K[:, 0] * y)
+
+        # Joseph form
+        I = np.eye(2, dtype=np.float64)
+        I_KH = I - K @ self.H
+        self.P = I_KH @ self.P @ I_KH.T + K * self.R * K.T
+
+        return float(self.x[0]), float(self.x[1])
+
+    def predict_and_update(self, z_angle: float, dt: float, a_k: float):
+        self.predict(dt, a_k=a_k)
+        return self.update(z_angle)
+
+    @property
+    def angle(self) -> float:
+        return float(self.x[0])
+
+    @property
+    def dangle(self) -> float:
+        return float(self.x[1])
 class AngleKalmanFilter:
     """
     2D Kalman filter with true linear plant dynamics:
@@ -169,6 +287,113 @@ class AngleKalmanFilter:
     @property
     def dangle(self) -> float:
         return float(self.x[1])
+class AngleKalmanFilterCA:
+    """
+    3D Constant-Acceleration (CA) Kalman filter (kinematic model):
+
+      x = [angle, dangle, ddangle]^T
+
+      x_{k+1} = F(dt) x_k + w_k
+      z_k     = H x_k + v_k,     H = [1 0 0]
+
+    where acceleration is NOT measured; it's a state with ddangle_dot = 0.
+    """
+
+    def __init__(self, R: float, Q_angle: float, Q_dangle: float, Q_ddangle: float):
+        self.x = np.zeros(3, dtype=np.float64)
+
+        # Initial covariance (tune as needed)
+        self.P = np.diag([
+            (50 * math.pi / 180) ** 2,   # angle uncertainty
+            (50 * math.pi / 180) ** 2,   # rate uncertainty
+            (200 * math.pi / 180) ** 2   # accel uncertainty (often larger)
+        ]).astype(np.float64)
+
+        self.R = float(R)
+        self.Q = np.diag([float(Q_angle), float(Q_dangle), float(Q_ddangle)]).astype(np.float64)
+
+        self.H = np.array([[1.0, 0.0, 0.0]], dtype=np.float64)
+
+        self._initialized = False
+
+        # Cache F(dt)
+        self._last_dt = None
+        self._F = np.array([ [1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0],
+                             [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    def reset(self, angle_init: float = 0.0, dangle_init: float = 0.0, ddangle_init: float = -200.0):
+        self.x = np.array([angle_init, dangle_init, ddangle_init], dtype=np.float64)
+        self.P = np.diag([
+            (0.5 * math.pi / 180) ** 2,
+            (50.0 * math.pi / 180) ** 2,
+            (200.0 * math.pi / 180) ** 2
+        ]).astype(np.float64)
+        self._initialized = True
+        self._last_dt = None
+
+    def set_noise(self, R: float = None, Q_angle: float = None, Q_dangle: float = None, Q_ddangle: float = None):
+        if R is not None:
+            self.R = float(R)
+
+        qa = self.Q[0, 0] if Q_angle is None else float(Q_angle)
+        qd = self.Q[1, 1] if Q_dangle is None else float(Q_dangle)
+        qdd = self.Q[2, 2] if Q_ddangle is None else float(Q_ddangle)
+        self.Q = np.diag([qa, qd, qdd]).astype(np.float64)
+
+    def _update_F(self, dt: float):
+        dt2 = dt * dt
+        self._F = np.array([
+            [1.0, dt, 0.5 * dt2],
+            [0.0, 1.0, dt],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+        self._last_dt = dt
+
+    def predict(self, dt: float):
+        if dt <= 0:
+            return
+        if self._last_dt != dt:
+            self._update_F(dt)
+
+        self.x = self._F @ self.x
+        self.P = self._F @ self.P @ self._F.T + self.Q
+
+    def update(self, z_angle: float):
+        if not self._initialized:
+            self.reset(angle_init=float(z_angle), dangle_init=0.0, ddangle_init=-200.0)
+            return float(self.x[0]), float(self.x[1]), float(self.x[2])
+
+        z = float(z_angle)
+
+        y = z - (self.H @ self.x)[0]
+        S = (self.H @ self.P @ self.H.T)[0, 0] + self.R
+        K = (self.P @ self.H.T) / max(1e-12, S)   # (3x1)
+
+        self.x = self.x + (K[:, 0] * y)
+
+        # Joseph form
+        I = np.eye(3, dtype=np.float64)
+        I_KH = I - K @ self.H
+        self.P = I_KH @ self.P @ I_KH.T + K * self.R * K.T
+
+        return float(self.x[0]), float(self.x[1]), float(self.x[2])
+
+    def predict_and_update(self, z_angle: float, dt: float):
+        self.predict(dt)
+        return self.update(z_angle)
+
+    @property
+    def angle(self) -> float:
+        return float(self.x[0])
+
+    @property
+    def dangle(self) -> float:
+        return float(self.x[1])
+
+    @property
+    def ddangle(self) -> float:
+        return float(self.x[2])
 
 
 def _quat_to_R_xyzw(x, y, z, w):
@@ -502,7 +727,7 @@ class OrientationControlNode(Node):
                 ('fluid_viscosity', 0.0010016),
                 ('d_min', 0.15),
                 ('d_max', 0.30),
-                ('v_max', 0.40),
+                ('v_max', 0.10),
                 ('theta_max_deg', 30.0),
                 ('controller_type', 'PD'),
                 ('Kp', 200.0),
@@ -513,18 +738,31 @@ class OrientationControlNode(Node):
                 ('surface_target_frame', 'surface_target'),
                 # Kalman filter parameters
                 ('kalman_enabled', True),
-                ('kalman_R', 1e-01),
-                ('kalman_Q_angle', 4e-03),
-                ('kalman_Q_dangle', 1.245061e-01),
+                ('kalman_r', 1e-01),
+                ('kalman_q_angle', 4e-03),
+                ('kalman_q_dangle', 1.245061e-01),
                 ('zeta', 1.0),
                 ('ie_clamp', 8.0),
 
                 # =========================
-                # Adaptive Q: torque jump only (NEW)
+                # Simple adaptive Q (NEW)   
                 # =========================
                 ('adaptive_q_enabled', True),
                 ('adaptive_q_tau_thresh', 0.5),      # N·m  (interpreted as |Δtau| threshold)
+                ('adaptive_q_w_thresh', 1.57),       # rad/s
                 ('adaptive_q_scale_moving', 50.0),   # scale factor when jump detected
+                ('kalman_model', 'PLANT'),         # 'PLANT' or 'CA'
+                ('kalman_q_ddangle', 1.0),         # CA-only process noise for acceleration state
+                ('simulate_imu', True),
+                ('imu_topic', '/simulated/imu'),
+                ('imu_frame_id', 'eoat_camera_link'),  # or your IMU frame
+                ('imu_rate_hz', 100.0),
+
+                # Noise std devs (1-sigma)
+                ('imu_accel_noise_std', 0.05),     # m/s^2
+                ('imu_gyro_noise_std', 0.005),     # rad/s
+                ('imu_gyro_bias_rw_std', 0.0),  # rad/s per sqrt(s) (optional)
+                ('imu_accel_bias_rw_std', 0.0),  # m/s^2 per sqrt(s) (optional)
             ]
         )
 
@@ -554,24 +792,40 @@ class OrientationControlNode(Node):
 
         # Kalman filters
         self.kalman_enabled = bool(self.get_parameter('kalman_enabled').value)
-        kalman_R = float(self.get_parameter('kalman_R').value)
-        kalman_Q_angle = float(self.get_parameter('kalman_Q_angle').value)
-        kalman_Q_dangle = float(self.get_parameter('kalman_Q_dangle').value)
+        kalman_r = float(self.get_parameter('kalman_r').value)
+        kalman_q_angle = float(self.get_parameter('kalman_q_angle').value)
+        kalman_q_dangle = float(self.get_parameter('kalman_q_dangle').value)
+        self.kalman_model = str(self.get_parameter('kalman_model').value).upper()
+        kalman_q_ddangle = float(self.get_parameter('kalman_q_ddangle').value)
 
-        self.pitch_kalman = AngleKalmanFilter(kalman_R, kalman_Q_angle, kalman_Q_dangle)
-        self.yaw_kalman = AngleKalmanFilter(kalman_R, kalman_Q_angle, kalman_Q_dangle)
+        self.pitch_kalman = AngleKalmanFilter(kalman_r, kalman_q_angle, kalman_q_dangle)
+        self.yaw_kalman = AngleKalmanFilter(kalman_r, kalman_q_angle, kalman_q_dangle)
+        
+        self.pitch_kalman_ca = AngleKalmanFilterCA(kalman_r, kalman_q_angle, kalman_q_dangle, kalman_q_ddangle)
+        self.yaw_kalman_ca = AngleKalmanFilterCA(kalman_r, kalman_q_angle, kalman_q_dangle, kalman_q_ddangle)
+
+                # --- KKF (kinematic KF) parameters ---
+        # Reuse kalman_r for angle measurement noise (rad^2)
+        # Use kalman_q_ddangle as Wa (angular-accel variance), or add a dedicated param if you prefer
+        kkf_R  = kalman_r
+        kkf_Wa = kalman_q_ddangle  # interpret as accel-input noise variance
+
+        self.pitch_kalman_kkf = AngleKalmanFilterKKF(R=kkf_R, Wa=kkf_Wa, Q_angle=0.0, Q_dangle=0.0)
+        self.yaw_kalman_kkf   = AngleKalmanFilterKKF(R=kkf_R, Wa=kkf_Wa, Q_angle=0.0, Q_dangle=0.0)
+        
         self._kalman_last_t = None
 
         # =========================
-        # Adaptive Q params + baseline storage
+        # Adaptive Q params + baseline storage (NEW)
         # =========================
         self.adaptive_q_enabled = bool(self.get_parameter('adaptive_q_enabled').value)
         self.adaptive_q_tau_thresh = float(self.get_parameter('adaptive_q_tau_thresh').value)
+        self.adaptive_q_w_thresh = float(self.get_parameter('adaptive_q_w_thresh').value)
         self.adaptive_q_scale_moving = float(self.get_parameter('adaptive_q_scale_moving').value)
 
-        self._kalman_Q_angle_base = kalman_Q_angle
-        self._kalman_Q_dangle_base = kalman_Q_dangle
-
+        self._kalman_q_angle_base = kalman_q_angle
+        self._kalman_q_dangle_base = kalman_q_dangle
+        self._kalman_q_ddangle_base = kalman_q_ddangle
         # ---- Initialize bbox fields ----
         self.bbox_min = np.array([-float('inf'), -float('inf'), -float('inf')], dtype=float)
         self.bbox_max = np.array([float('inf'), float('inf'), float('inf')], dtype=float)
@@ -632,7 +886,40 @@ class OrientationControlNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self._tf_ready = False
 
+        # =============================
+        # MoveIt Jacobian Setup
+        # =============================
+      #  self.model_loader = RobotModelLoader(self, "robot_description")
+        moveit = MoveItPy(node_name="moveit_py")
+        robot_model = moveit.get_robot_model()
+        self.robot_model = robot_model
+
+        self.robot_state = RobotState(self.robot_model)
+        self.robot_state.set_to_default_values()
+
+        self.jmg = self.robot_model.get_joint_model_group("ur5e")
+       # self.ee_link_model = self.robot_model.get_link_model("tool0")
+        self.ee_link_model= "eoat_camera_link"
+        self.joint_positions = None
+        self.joint_velocities = None
+
+       # Subscribe to joint states
+        self.create_subscription(
+        JointState,
+        "/joint_states",
+        self.on_joint_states,
+        10
+      )
+ 
         self.ocd = OrientationControlData()
+        # Defaults for new KF logging fields
+        self.ocd.kalman_model = "PLANT"
+        self.ocd.kalman_r = float(self.get_parameter('kalman_r').value)
+        self.ocd.kalman_q_angle = float(self.get_parameter('kalman_q_angle').value)
+        self.ocd.kalman_q_dangle = float(self.get_parameter('kalman_q_dangle').value)
+        self.ocd.kalman_q_ddangle = float(self.get_parameter('kalman_q_ddangle').value)  # ok even if unused
+        self.ocd.ddpitch_error = 0.0
+        self.ocd.ddyaw_error = 0.0
 
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_info, qos)
         self.sub_depth = self.create_subscription(CompressedImage, self.depth_topic, self.on_depth, 1,
@@ -640,7 +927,8 @@ class OrientationControlNode(Node):
         self.bbox = self.create_subscription(Marker, self.bounding_box_topic, self.on_bbox, qos)
         self.create_subscription(TwistStamped, f'/servo_node/delta_twist_cmds', self.on_delta_twist, qos)
         self.create_subscription(WrenchStamped, f'/teleop/wrench_cmds', self.on_wrench_cmd, qos)
-
+        self.create_subscription(AccelStamped, f'/admittance/accel_cmds', self.on_accel_cmd, qos)
+    
         self.last_joy_msg = None
         self.joy_sub = self.create_subscription(Joy, joy_topic, self.joy_callback, qos)
         self.depth_msg = None
@@ -664,10 +952,43 @@ class OrientationControlNode(Node):
         )
         self.pub_wrench_cmd = self.create_publisher(WrenchStamped, f'/{self.get_name()}/wrench_cmds', 10)
         self.distance_pub = self.create_publisher(Float64, f'/{self.get_name()}/focal_distance_m', 10)
+        # Raw yaw error publisher (rad)
+        self.pub_yaw_err_raw = self.create_publisher(Float64, f'/{self.get_name()}/yaw_error_raw', 10
+)
+        self.simulate_imu = bool(self.get_parameter('simulate_imu').value)
+        self.imu_topic = str(self.get_parameter('imu_topic').value)
+        self.imu_frame_id = str(self.get_parameter('imu_frame_id').value)
+        self.imu_rate_hz = float(self.get_parameter('imu_rate_hz').value)
 
+        self.imu_accel_noise_std = float(self.get_parameter('imu_accel_noise_std').value)
+        self.imu_gyro_noise_std  = float(self.get_parameter('imu_gyro_noise_std').value)
+
+        # optional slowly-varying bias random walk
+        self.imu_gyro_bias_rw_std  = float(self.get_parameter('imu_gyro_bias_rw_std').value)
+        self.imu_accel_bias_rw_std = float(self.get_parameter('imu_accel_bias_rw_std').value)
+
+        self._imu_bias_g = np.zeros(3, dtype=np.float64)  # rad/s
+        self._imu_bias_a = np.zeros(3, dtype=np.float64)  # m/s^2
+
+        self.imu_pub = self.create_publisher(Imu, self.imu_topic, 10)
+
+        # Store last noisy IMU sample for logging into OCD
+        self._imu_lock = threading.Lock()
+        self._last_noisy_imu = Imu()
+        self._last_noisy_imu_valid = False
+
+        self._imu_prev_t = None
+        if self.simulate_imu and self.imu_rate_hz > 0:
+          self._imu_timer = self.create_timer(1.0/self.imu_rate_hz, self._publish_sim_imu)
         self.force_B = np.zeros(3, dtype=np.float32)
         self.lin_vel_cam = np.zeros(3, dtype=np.float32)
         self.rot_vel_cam = np.zeros(3, dtype=np.float32)
+        self.lin_acc_cam = np.zeros(3, dtype=np.float32)
+        self.rot_acc_cam = np.zeros(3, dtype=np.float32)
+        self._joint_twist_lock = threading.Lock()
+        self.jacobian_lin_vel_cam = np.zeros(3, dtype=np.float64)
+        self.jacobian_rot_vel_cam = np.zeros(3, dtype=np.float64)
+        self.jacobian_twist_valid = False
         self.tau_B = np.zeros(3, dtype=np.float32)
         self.force_teleop = np.zeros(3, dtype=np.float32)
         self.torque_teleop = np.zeros(3, dtype=np.float32)
@@ -682,7 +1003,7 @@ class OrientationControlNode(Node):
         self.pitch_err = 0.0
         self.dpitch = 0.0
         self._prev_tau_pitch = 0.0
-        self._prev2_tau_pitch = 0.0  # NEW: torque history k-2
+       # self._prev2_tau_pitch = 0.0  # NEW: torque history k-2
 
         # Yaw state
         self.last_yaw = 0.0
@@ -690,7 +1011,7 @@ class OrientationControlNode(Node):
         self.yaw_err = 0.0
         self.dyaw = 0.0
         self._prev_tau_yaw = 0.0
-        self._prev2_tau_yaw = 0.0    # NEW: torque history k-2
+        #self._prev2_tau_yaw = 0.0    # NEW: torque history k-2
 
         # Focus distance PID state
         self.focal_distance = 0.2810768097639084
@@ -802,6 +1123,220 @@ class OrientationControlNode(Node):
 
         self.last_joy_msg = msg
 
+
+    # def on_joint_states(self, msg: JointState):
+
+    #     if len(msg.velocity) == 0:
+    #         return
+
+    #     #ap by name (safe ordering)
+    #     idx = {name: i for i, name in enumerate(msg.name)}
+
+    #     #var_names = self.jmg.get_variable_names()
+        
+    #     if hasattr(self.jmg, "get_active_joint_model_names"):
+    #         var_names = list(self.jmg.get_active_joint_model_names())
+    #         print(var_names)
+    #     elif hasattr(self.jmg, "get_joint_model_names"):
+    #         var_names = list(self.jmg.get_joint_model_names())
+    #     else:
+    #         print("JointModelGroup has no supported joint-name getter in this build")
+    #     N = len(var_names)
+
+    #     q = np.zeros(N)
+    #     qdot = np.zeros(N)
+
+    #     for k, joint_name in enumerate(var_names):
+    #         if joint_name not in idx:
+    #             return
+    #         i = idx[joint_name]
+    #         q[k] = msg.position[i]
+    #         qdot[k] = msg.velocity[i]
+
+    #     #Update state
+    #     self.robot_state.set_joint_group_positions(self.jmg, q)
+    #     self.robot_state.update_link_transforms()
+
+    #     #Compute Jacobian (6xN)
+    #     J = self.robot_state.get_jacobian(
+    #         self.jmg,
+    #         self.ee_link_model,
+    #         [0.0, 0.0, 0.0]
+    #     )
+
+    #     J = np.array(J)
+
+    #     twist = J @ qdot
+
+    #     v = twist[0:3]
+    #     w = twist[3:6]
+
+    # def on_joint_states(self, msg):
+    #     # need positions at least
+    #     if len(msg.position) == 0 or len(msg.name) == 0:
+    #         return
+
+    #     # if velocities missing, set to zeros (or return if you require them)
+    #     has_vel = (len(msg.velocity) == len(msg.name))
+
+    #     # 1) Update RobotState by joint names (no need for var_names from group)
+    #     name_to_pos = {n: msg.position[i] for i, n in enumerate(msg.name)}
+    #     self.robot_state.set_variable_positions(name_to_pos)
+    #     self.robot_state.update_link_transforms()
+
+    #     # 2) Compute Jacobian for the group and your tip link
+    #     tip = "eoat_camera_link"  # or "tool0" if that’s what you want
+    #     J = np.array(self.robot_state.get_jacobian(self.jmg, tip, [0.0, 0.0, 0.0]))
+
+    # # 3) Build qdot vector that matches the Jacobian columns (group DOFs)
+    # # Since your build can’t give group variable names, simplest is:
+    # # - require velocities for all joints contributing to the group
+    # # - OR compute twist only when you know the ordering.
+    # #
+    # # Practical workaround: restrict to UR5e only and manually define order:
+    #     ur_order = [
+    #         "shoulder_pan_joint",
+    #         "shoulder_lift_joint",
+    #         "elbow_joint",
+    #         "wrist_1_joint",
+    #         "wrist_2_joint",
+    #         "wrist_3_joint",
+    #     ]
+
+    #     if not has_vel:
+    #         return
+
+    #     idx = {n: i for i, n in enumerate(msg.name)}
+    #     qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
+
+    #     twist = J @ qdot
+    #     v, w = twist[:3], twist[3:]
+    #     print("v:", v, "w:", w)
+
+    #     print("\n===== EOAT Velocity (from joint states) =====")
+    #     print(f"Linear velocity  (m/s): {v}")
+    #     print(f"Angular velocity (rad/s): {w}")
+    # def on_joint_states(self, msg):
+    #     # require velocities if you want twist (otherwise you can set zeros)
+    #     if len(msg.name) == 0 or len(msg.position) == 0:
+    #         return
+    #     if len(msg.velocity) == 0:
+    #         return
+
+    #     idx = {n: i for i, n in enumerate(msg.name)}
+
+    #     # UR5e joint order (matches MoveIt group DOF order in essentially all UR configs)
+    #     ur_order = [
+    #         "shoulder_pan_joint",
+    #         "shoulder_lift_joint",
+    #         "elbow_joint",
+    #         "wrist_1_joint",
+    #         "wrist_2_joint",
+    #         "wrist_3_joint",
+    #     ]
+
+    #     # build q, qdot in that order
+    #     try:
+    #         q    = np.array([msg.position[idx[j]] for j in ur_order], dtype=float)
+    #         qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
+    #     except KeyError as e:
+    #         self.get_logger().warn(f"Missing joint in /joint_states: {e}")
+    #         return
+
+    #     # update robot state
+    #     self.robot_state.set_joint_group_positions("ur5e", q)
+    #     #self.robot_state.update_link_transforms()
+    #     if hasattr(self.robot_state, "update"):
+    #         self.robot_state.update()
+    #     ref = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
+
+    #     # Jacobian for the link you care about
+    #     tip_link = "eoat_camera_link"  # or "tool0" if that’s what you want
+    #     J = np.array(self.robot_state.get_jacobian("ur5e", tip_link, ref, False))
+
+    #     # sanity: J should be 6x6 for UR5e group
+    #     if J.shape[1] != qdot.shape[0]:
+    #         self.get_logger().error(f"Jacobian cols {J.shape[1]} != qdot len {qdot.shape[0]}")
+    #         return
+
+    #     twist = J @ qdot
+    #     v = twist[:3]
+    #     w = twist[3:]
+
+    #     print("\n===== EOAT Velocity (from joint states) =====")
+    #     print(f"Linear  (m/s):  {v}")
+    #     print(f"Angular (rad/s): {w}")
+    #     with self._joint_twist_lock:
+    #         self.jacobian_lin_vel_cam[:] = v
+    #         self.jacobian_rot_vel_cam[:] = w
+    #         self.jacobian_twist_valid = True
+    
+    def on_joint_states(self, msg):
+        if len(msg.name) == 0 or len(msg.position) == 0:
+            return
+        if len(msg.velocity) == 0:
+            return
+
+        idx = {n: i for i, n in enumerate(msg.name)}
+
+        ur_order = [
+            "shoulder_pan_joint",
+            "shoulder_lift_joint",
+            "elbow_joint",
+            "wrist_1_joint",
+            "wrist_2_joint",
+            "wrist_3_joint",
+        ]
+
+        try:
+            q    = np.array([msg.position[idx[j]] for j in ur_order], dtype=float)
+            qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
+        except KeyError as e:
+            self.get_logger().warn(f"Missing joint in /joint_states: {e}")
+            return
+
+        self.robot_state.set_joint_group_positions("ur5e", q)
+
+        if hasattr(self.robot_state, "update"):
+            self.robot_state.update()
+
+        tip_link = "eoat_camera_link"
+        ref = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
+
+        J = np.array(self.robot_state.get_jacobian("ur5e", tip_link, ref, False))
+
+        if J.shape[1] != qdot.shape[0]:
+            self.get_logger().error(f"Jacobian cols {J.shape[1]} != qdot len {qdot.shape[0]}")
+            return
+
+        twist_base = J @ qdot
+        v_base = twist_base[:3]
+        w_base = twist_base[3:]
+
+        # Get tip-link transform w.r.t. group/base/world model frame
+        T = self.robot_state.get_global_link_transform(tip_link)
+
+        # Convert rotation to numpy
+        # Depending on your MoveIt Python binding, T may already be a 4x4 numpy array,
+        # or an Eigen/Isometry-like object. The common case below assumes 4x4-like access.
+        T_np = np.array(T)
+        R_base_tip = T_np[:3, :3]
+
+        # Express base-frame twist in tip-link coordinates
+        R_tip_base = R_base_tip.T
+        v_tip = -R_tip_base @ v_base
+        w_tip = R_tip_base @ w_base
+
+        print("\n===== EOAT Velocity =====")
+        print(f"Linear in base frame (m/s):   {v_base}")
+        print(f"Angular in base frame (rad/s): {w_base}")
+        print(f"Linear in tip frame (m/s):    {v_tip}")
+        print(f"Angular in tip frame (rad/s):  {w_tip}")
+
+        with self._joint_twist_lock:
+            self.jacobian_lin_vel_cam[:] = v_tip
+            self.jacobian_rot_vel_cam[:] = w_tip
+            self.jacobian_twist_valid = True
     def on_delta_twist(self, msg: TwistStamped):
         self.lin_vel_cam[0] = msg.twist.linear.x
         self.lin_vel_cam[1] = msg.twist.linear.y
@@ -817,6 +1352,72 @@ class OrientationControlNode(Node):
         self.torque_teleop[1] = msg.wrench.torque.y
         self.torque_teleop[2] = msg.wrench.torque.z
 
+    def on_accel_cmd(self, msg: AccelStamped):
+        self.lin_acc_cam[0] = msg.accel.linear.x
+        self.lin_acc_cam[1] = msg.accel.linear.y
+        self.lin_acc_cam[2] = msg.accel.linear.z
+        self.rot_acc_cam[0] = msg.accel.angular.x
+        self.rot_acc_cam[1] = msg.accel.angular.y
+        self.rot_acc_cam[2] = msg.accel.angular.z
+    def _publish_sim_imu(self):
+   
+     now = self.get_clock().now()
+     now_s = now.nanoseconds * 1e-9
+
+    # dt for bias random walk
+     if self._imu_prev_t is None:
+        dt = 0.0
+     else:
+        dt = max(0.0, now_s - self._imu_prev_t)
+     self._imu_prev_t = now_s
+
+    # Ground truth signals (from your node state)
+    # These are already "commanded"/estimated in camera frame
+     gyro_true  = self.rot_vel_cam.astype(np.float64)         # rad/s (from Twist)
+     accel_true = self.lin_acc_cam.astype(np.float64)         # m/s^2 (from AccelStamped)
+
+    # Optional: if you want angular acceleration too, you'd compute it separately,
+    # but sensor_msgs/Imu does not carry angular acceleration.
+
+    # Bias random walk: b_{k+1} = b_k + sigma_rw * sqrt(dt) * N(0,1)
+     if dt > 0:
+        self._imu_bias_g += self.imu_gyro_bias_rw_std * math.sqrt(dt) * np.random.randn(3)
+        self._imu_bias_a += self.imu_accel_bias_rw_std * math.sqrt(dt) * np.random.randn(3)
+
+    # White Gaussian noise
+     gyro_meas  = gyro_true  + self._imu_bias_g + self.imu_gyro_noise_std  * np.random.randn(3)
+     accel_meas = accel_true + self._imu_bias_a + self.imu_accel_noise_std * np.random.randn(3)
+
+     imu = Imu()
+     imu.header.stamp = now.to_msg()
+     imu.header.frame_id = self.imu_frame_id
+
+     imu.angular_velocity.x = float(gyro_meas[0])
+     imu.angular_velocity.y = float(gyro_meas[1])
+     imu.angular_velocity.z = float(gyro_meas[2])
+
+     imu.linear_acceleration.x = float(accel_meas[0])
+     imu.linear_acceleration.y = float(accel_meas[1])
+     imu.linear_acceleration.z = float(accel_meas[2])
+
+    # No orientation provided (unless you want to fabricate one)
+     imu.orientation_covariance[0] = -1.0  # ROS convention: orientation not available
+
+    # (Optional) fill covariances with variances
+     var_g = self.imu_gyro_noise_std ** 2
+     var_a = self.imu_accel_noise_std ** 2
+     imu.angular_velocity_covariance = [var_g, 0.0, 0.0,
+                                       0.0, var_g, 0.0,
+                                       0.0, 0.0, var_g]
+     imu.linear_acceleration_covariance = [var_a, 0.0, 0.0,
+                                          0.0, var_a, 0.0,
+                                          0.0, 0.0, var_a]
+
+     self.imu_pub.publish(imu)
+     # store the exact noisy sample for logging into OCD
+     with self._imu_lock:
+       self._last_noisy_imu = imu
+       self._last_noisy_imu_valid = True
     def on_info(self, msg: CameraInfo):
         self.K = np.array(msg.k, dtype=np.float32).reshape(3, 3)
         self.depth_frame_id = msg.header.frame_id
@@ -1124,8 +1725,8 @@ class OrientationControlNode(Node):
             self.last_yaw = 0.0
             self._prev_tau_pitch = 0.0
             self._prev_tau_yaw = 0.0
-            self._prev2_tau_pitch = 0.0  # NEW
-            self._prev2_tau_yaw = 0.0    # NEW
+           # self._prev2_tau_pitch = 0.0  # NEW
+            #self._prev2_tau_yaw = 0.0    # NEW
 
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
@@ -1163,60 +1764,139 @@ class OrientationControlNode(Node):
         if self._last_err_t is not None:
             dt_ctrl = max(1e-6, now_s - self._last_err_t)
         self._last_err_t = now_s
-
+        model = str(self.kalman_model).upper()
+        self.ocd.kalman_model = model
         # Raw errors
         pitch_err_raw = -pitch_err_meas
         yaw_err_raw = yaw_err_meas
+        # Publish raw yaw error (rad)
+        self.pub_yaw_err_raw.publish(Float64(data=float(yaw_err_raw)))
+        # ===== NEW: measured raw rates BEFORE KF (for adaptive-Q gating) =====
+        dpitch_meas = 0.0
+        dyaw_meas = 0.0
+        if dt_ctrl > 0.0:
+            dpitch_meas = (pitch_err_raw - float(self.last_pitch)) / dt_ctrl
+            dyaw_meas = (yaw_err_raw - float(self.last_yaw)) / dt_ctrl
+
 
         inertia_A = self.inertia_B + self.mass_B * d ** 2
         b_damping = self.linear_drag * d * d
-
+        # ===== NEW: Simple adaptive Q (screenshot logic) =====
+        if self.kalman_enabled and self.adaptive_q_enabled and dt_ctrl > 0.0:
+            pitch_moving = (abs(self._prev_tau_pitch) > self.adaptive_q_tau_thresh)
+            pitch_moving = pitch_moving or (abs(dpitch_meas) > self.adaptive_q_w_thresh)
         # ===== Adaptive Q based ONLY on sudden torque jump =====
         # If |tau[k-1] - tau[k-2]| is big => Q *= 50, else Q *= 1
-        if self.kalman_enabled and self.adaptive_q_enabled:
-            d_tau_pitch = abs(float(self._prev_tau_pitch) - float(self._prev2_tau_pitch))
-            d_tau_yaw   = abs(float(self._prev_tau_yaw)   - float(self._prev2_tau_yaw))
-
-            pitch_jump = (d_tau_pitch > self.adaptive_q_tau_thresh)
-            yaw_jump   = (d_tau_yaw   > self.adaptive_q_tau_thresh)
-
-            pitch_scale = self.adaptive_q_scale_moving if pitch_jump else 1.0
-            yaw_scale   = self.adaptive_q_scale_moving if yaw_jump else 1.0
+        #if self.kalman_enabled and self.adaptive_q_enabled:
+           # d_tau_pitch = abs(float(self._prev_tau_pitch) - float(self._prev2_tau_pitch))
+           # d_tau_yaw   = abs(float(self._prev_tau_yaw)   - float(self._prev2_tau_yaw))
+            yaw_moving = (abs(self._prev_tau_yaw) > self.adaptive_q_tau_thresh)
+            yaw_moving = yaw_moving or (abs(dyaw_meas) > self.adaptive_q_w_thresh)
+           # pitch_jump = (d_tau_pitch > self.adaptive_q_tau_thresh)
+          #  yaw_jump   = (d_tau_yaw   > self.adaptive_q_tau_thresh)
+            pitch_scale = self.adaptive_q_scale_moving if pitch_moving else 1.0
+            yaw_scale = self.adaptive_q_scale_moving if yaw_moving else 1.0
+           # pitch_scale = self.adaptive_q_scale_moving if pitch_jump else 1.0
+           # yaw_scale   = self.adaptive_q_scale_moving if yaw_jump else 1.0
 
             self.pitch_kalman.set_noise(
-                Q_angle=self._kalman_Q_angle_base * pitch_scale,
-                Q_dangle=self._kalman_Q_dangle_base * pitch_scale
+                Q_angle=self._kalman_q_angle_base * pitch_scale,
+                Q_dangle=self._kalman_q_dangle_base * pitch_scale
             )
             self.yaw_kalman.set_noise(
-                Q_angle=self._kalman_Q_angle_base * yaw_scale,
-                Q_dangle=self._kalman_Q_dangle_base * yaw_scale
+                Q_angle=self._kalman_q_angle_base * yaw_scale,
+                Q_dangle=self._kalman_q_dangle_base * yaw_scale
             )
+        # --- Log KF noise actually used ---
+            if model == "PLANT":
+        # If adaptive-Q is enabled, you may have scaled Q inside self.pitch_kalman/self.yaw_kalman.
+        # We log the pitch filter's current values (you could also log max(pitch,yaw) if you prefer).
+              self.ocd.kalman_r = float(self.pitch_kalman.R)
+              self.ocd.kalman_q_angle = float(self.pitch_kalman.Q[0, 0])
+              self.ocd.kalman_q_dangle = float(self.pitch_kalman.Q[1, 1])
+              self.ocd.kalman_q_ddangle = 0.0  # not used in PLANT
+            else:
+        # CA mode: fixed Q (no adaptive-Q)
+              self.ocd.kalman_r = float(self.pitch_kalman_ca.R)
+              self.ocd.kalman_q_angle = float(self.pitch_kalman_ca.Q[0, 0])
+              self.ocd.kalman_q_dangle = float(self.pitch_kalman_ca.Q[1, 1])
+              self.ocd.kalman_q_ddangle = float(self.pitch_kalman_ca.Q[2, 2])
 
         # Apply Kalman filtering if enabled
         if self.kalman_enabled and dt_ctrl > 0:
-            pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
-                pitch_err_raw, dt_ctrl,
-                u_prev=-self._prev_tau_pitch,
-                I_A=inertia_A,
-                b=b_damping
-            )
-            self.pitch_err = pitch_filtered
-            self.dpitch = dpitch_filtered
 
-            yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
-                yaw_err_raw, dt_ctrl,
-                u_prev=-self._prev_tau_yaw,
-                I_A=inertia_A,
-                b=b_damping
-            )
+            if self.kalman_model == 'CA':
+              # CA model ignores torque/I_A/b (pure kinematics)
+              pitch_filtered, dpitch_filtered, ddpitch_filtered = self.pitch_kalman_ca.predict_and_update(
+               pitch_err_raw, dt_ctrl
+              )
+              yaw_filtered, dyaw_filtered, ddyaw_filtered = self.yaw_kalman_ca.predict_and_update(
+               yaw_err_raw, dt_ctrl
+              )
+
+              self.pitch_err = pitch_filtered
+              self.dpitch = dpitch_filtered
+              self.yaw_err = yaw_filtered
+              self.dyaw = dyaw_filtered
+              
+              # NEW: log CA accel states
+              self.ocd.ddpitch_error = float(ddpitch_filtered)
+              self.ocd.ddyaw_error = float(ddyaw_filtered)
+              # Optional: expose acceleration estimates if you want later
+              self.ddpitch = ddpitch_filtered
+              self.ddyaw = ddyaw_filtered
+            elif self.kalman_model == 'KKF':
+                # KKF uses measured angular acceleration from admittance node
+                # Map axes consistent with your tau_theta_vec = [tau_pitch, tau_yaw, 0]
+                a_pitch = float(self.rot_acc_cam[0])  # rad/s^2
+                a_yaw   = float(self.rot_acc_cam[1])  # rad/s^2
+
+                pitch_filtered, dpitch_filtered = self.pitch_kalman_kkf.predict_and_update(
+                    pitch_err_raw, dt_ctrl, a_pitch
+                )
+                yaw_filtered, dyaw_filtered = self.yaw_kalman_kkf.predict_and_update(
+                    yaw_err_raw, dt_ctrl, a_yaw
+                )
+
+                self.pitch_err = pitch_filtered
+                self.dpitch = dpitch_filtered
+                self.yaw_err = yaw_filtered
+                self.dyaw = dyaw_filtered
+
+                # No accel state in 2-state KKF (we *use* accel as input)
+                self.ocd.ddpitch_error = float(a_pitch)  # optional: log the input accel instead
+                self.ocd.ddyaw_error   = float(a_yaw)
+
+                # Log noise actually used
+                self.ocd.kalman_r = float(self.pitch_kalman_kkf.R)
+                self.ocd.kalman_q_angle = float(self.pitch_kalman_kkf.Qx[0, 0])
+                self.ocd.kalman_q_dangle = float(self.pitch_kalman_kkf.Qx[1, 1])
+                self.ocd.kalman_q_ddangle = float(self.pitch_kalman_kkf.Wa)  # treat as accel-input variance
+
+            else:
+            # Default: PLANT (your existing model-based KF)
+              pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
+               pitch_err_raw, dt_ctrl,
+               u_prev=-self._prev_tau_pitch,
+               I_A=inertia_A,
+               b=b_damping
+              )
+              self.pitch_err = pitch_filtered
+              self.dpitch = dpitch_filtered
+
+              yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
+               yaw_err_raw, dt_ctrl,
+               u_prev=-self._prev_tau_yaw,
+               I_A=inertia_A,
+               b=b_damping
+             )
             self.yaw_err = yaw_filtered
             self.dyaw = dyaw_filtered
-
-            self.pitch_err_raw = pitch_err_raw
-            self.yaw_err_raw = yaw_err_raw
-            self.dpitch_raw = (pitch_err_raw - self.last_pitch) / dt_ctrl if dt_ctrl > 0 else 0.0
-            self.dyaw_raw = (yaw_err_raw - self.last_yaw) / dt_ctrl if dt_ctrl > 0 else 0.0
+            # NEW: PLANT has no accel state
+            self.ocd.ddpitch_error = 0.0
+            self.ocd.ddyaw_error = 0.0
         else:
+              # No Kalman: raw derivatives
             self.pitch_err = pitch_err_raw
             self.yaw_err = yaw_err_raw
             if dt_ctrl > 0:
@@ -1225,10 +1905,14 @@ class OrientationControlNode(Node):
             else:
                 self.dpitch = 0.0
                 self.dyaw = 0.0
-            self.pitch_err_raw = self.pitch_err
-            self.yaw_err_raw = self.yaw_err
-            self.dpitch_raw = self.dpitch
-            self.dyaw_raw = self.dyaw
+            self.ocd.ddpitch_error = 0.0
+            self.ocd.ddyaw_error = 0.0    
+           
+        # keep your raw bookkeeping exactly as-is below...
+        self.pitch_err_raw = pitch_err_raw
+        self.yaw_err_raw = yaw_err_raw
+        self.dpitch_raw = (pitch_err_raw - self.last_pitch) / dt_ctrl if dt_ctrl > 0 else 0.0
+        self.dyaw_raw = (yaw_err_raw - self.last_yaw) / dt_ctrl if dt_ctrl > 0 else 0.0  
 
         self.last_pitch = float(pitch_err_raw)
         self.last_yaw = float(yaw_err_raw)
@@ -1239,7 +1923,7 @@ class OrientationControlNode(Node):
 
         p_1 = -self.zeta * omega_n + omega_n * math.sqrt(self.zeta ** 2 - 1)
         p_2 = -self.zeta * omega_n - omega_n * math.sqrt(self.zeta ** 2 - 1)
-        p_3 = 5 * p_2
+        p_3 = self.integral_alpha * p_2
 
         if self.controller_type == 'PD':
             self.Kp = inertia_A * (p_1 * p_2)
@@ -1247,7 +1931,8 @@ class OrientationControlNode(Node):
             self.Ki = 0.0
         elif self.controller_type == 'PID':
             self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
-            self.Ki = self.integral_alpha * -inertia_A * (p_1 * p_2 * p_3)
+            self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+           # self.Ki = 0.0  # TEMP: disable I for now to see if it helps with stability
             self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
         else:
             self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
@@ -1291,8 +1976,8 @@ class OrientationControlNode(Node):
             tau_yaw = 0.0
 
         # ===== Shift history for torque-jump detection =====
-        self._prev2_tau_pitch = float(self._prev_tau_pitch)
-        self._prev2_tau_yaw   = float(self._prev_tau_yaw)
+      #  self._prev2_tau_pitch = float(self._prev_tau_pitch)
+      #  self._prev2_tau_yaw   = float(self._prev_tau_yaw)
 
         self._prev_tau_pitch = float(tau_pitch)
         self._prev_tau_yaw = float(tau_yaw)
@@ -1301,7 +1986,9 @@ class OrientationControlNode(Node):
         moment_tele_A = np.cross(r, self.force_teleop)
 
         tau_roll = roll_error * self.Kp
+        tau_roll= 0.0
         F_z = -1 * self.Kp * (self.focal_distance - d)
+        
 
         force_drag_B = -self.linear_drag * self.lin_vel_cam
         moment_drag_B = -self.angular_drag * self.rot_vel_cam
@@ -1387,6 +2074,12 @@ class OrientationControlNode(Node):
         self.ocd.k_p = float(self.Kp)
         self.ocd.k_d = float(self.Kd)
         self.ocd.k_i = float(self.Ki)
+        self.ocd.kalman_model = self.kalman_model  
+       
+        with self._joint_twist_lock:
+            jacobian_twist_valid = self.jacobian_twist_valid
+            jac_v = self.jacobian_lin_vel_cam.copy()
+            jac_w = self.jacobian_rot_vel_cam.copy()
 
         try:
             tf_pose = self.tf_buffer.lookup_transform(
@@ -1413,6 +2106,45 @@ class OrientationControlNode(Node):
         self.ocd.current_twist.twist.angular.y = float(self.rot_vel_cam[1])
         self.ocd.current_twist.twist.angular.z = float(self.rot_vel_cam[2])
 
+        self.ocd.current_accel.header.stamp = self.ocd.header.stamp
+        self.ocd.current_accel.header.frame_id = self.main_camera_frame
+        self.ocd.current_accel.accel.linear.x = float(self.lin_acc_cam[0])
+        self.ocd.current_accel.accel.linear.y = float(self.lin_acc_cam[1])
+        self.ocd.current_accel.accel.linear.z = float(self.lin_acc_cam[2])
+        self.ocd.current_accel.accel.angular.x = float(self.rot_acc_cam[0])
+        self.ocd.current_accel.accel.angular.y = float(self.rot_acc_cam[1])
+        self.ocd.current_accel.accel.angular.z = float(self.rot_acc_cam[2])
+
+        self.ocd.jacobian_twist.header.stamp = self.ocd.header.stamp
+        self.ocd.jacobian_twist.header.frame_id = self.main_camera_frame
+
+        if jacobian_twist_valid:
+            self.ocd.jacobian_twist.twist.linear.x = float(jac_v[0])
+            self.ocd.jacobian_twist.twist.linear.y = float(-jac_v[1])
+            self.ocd.jacobian_twist.twist.linear.z = float(jac_v[2])
+            self.ocd.jacobian_twist.twist.angular.x = float(-jac_w[0])
+            self.ocd.jacobian_twist.twist.angular.y = float(jac_w[1])
+            self.ocd.jacobian_twist.twist.angular.z = float(jac_w[2])
+        else:
+            self.ocd.jacobian_twist.twist.linear.x = 0.0
+            self.ocd.jacobian_twist.twist.linear.y = 0.0
+            self.ocd.jacobian_twist.twist.linear.z = 0.0
+            self.ocd.jacobian_twist.twist.angular.x = 0.0
+            self.ocd.jacobian_twist.twist.angular.y = 0.0
+            self.ocd.jacobian_twist.twist.angular.z = 0.0
+        # If you already publish simulated IMU, you can either:
+# (1) store the last simulated IMU message in self._last_imu_msg, or
+# (2) reconstruct it here from the same signals.
+
+        with self._imu_lock:
+         if self._last_noisy_imu_valid:
+           self.ocd.imu = self._last_noisy_imu
+         else:
+        # fallback if IMU hasn't published yet
+           self.ocd.imu = Imu()
+           self.ocd.imu.header.stamp = self.ocd.header.stamp
+           self.ocd.imu.header.frame_id = self.imu_frame_id
+           self.ocd.imu.orientation_covariance[0] = -1.0
         if camera_transform is not None:
             self.ocd.camera_transform = camera_transform
         else:
@@ -1479,10 +2211,10 @@ class OrientationControlNode(Node):
         self.orientation_control_enabled = True
 
         # NEW: reset torque history so jump detector doesn't false-trigger
-        self._prev_tau_pitch = 0.0
-        self._prev_tau_yaw = 0.0
-        self._prev2_tau_pitch = 0.0
-        self._prev2_tau_yaw = 0.0
+        #self._prev_tau_pitch = 0.0
+        #self._prev_tau_yaw = 0.0
+       # self._prev2_tau_pitch = 0.0
+       # self._prev2_tau_yaw = 0.0
 
         self.get_logger().info('Orientation control ENABLED.')
 
@@ -1600,20 +2332,26 @@ class OrientationControlNode(Node):
                     self.pitch_kalman.reset()
                     self.yaw_kalman.reset()
                 self.get_logger().info(f'Updated kalman_enabled to {self.kalman_enabled}')
-            elif p.name == 'kalman_R':
+            elif p.name == 'kalman_r':
                 self.pitch_kalman.set_noise(R=float(p.value))
                 self.yaw_kalman.set_noise(R=float(p.value))
-                self.get_logger().info(f'Updated kalman_R to {float(p.value):.2e}')
-            elif p.name == 'kalman_Q_angle':
-                self._kalman_Q_angle_base = float(p.value)
-                self.pitch_kalman.set_noise(Q_angle=self._kalman_Q_angle_base)
-                self.yaw_kalman.set_noise(Q_angle=self._kalman_Q_angle_base)
-                self.get_logger().info(f'Updated kalman_Q_angle(base) to {self._kalman_Q_angle_base:.2e}')
-            elif p.name == 'kalman_Q_dangle':
-                self._kalman_Q_dangle_base = float(p.value)
-                self.pitch_kalman.set_noise(Q_dangle=self._kalman_Q_dangle_base)
-                self.yaw_kalman.set_noise(Q_dangle=self._kalman_Q_dangle_base)
-                self.get_logger().info(f'Updated kalman_Q_dangle(base) to {self._kalman_Q_dangle_base:.2e}')
+                self.pitch_kalman_ca.set_noise(R=float(p.value))
+                self.yaw_kalman_ca.set_noise(R=float(p.value))
+                self.get_logger().info(f'Updated kalman_r to {float(p.value):.2e}')
+            elif p.name == 'kalman_q_angle':
+                self._kalman_q_angle_base = float(p.value)
+                self.pitch_kalman.set_noise(Q_angle=self._kalman_q_angle_base)
+                self.yaw_kalman.set_noise(Q_angle=self._kalman_q_angle_base)
+                self.pitch_kalman_ca.set_noise(Q_angle=self._kalman_q_angle_base)
+                self.yaw_kalman_ca.set_noise(Q_angle=self._kalman_q_angle_base)
+                self.get_logger().info(f'Updated kalman_q_angle(base) to {self._kalman_q_angle_base:.2e}')
+            elif p.name == 'kalman_q_dangle':
+                self._kalman_q_dangle_base = float(p.value)
+                self.pitch_kalman.set_noise(Q_dangle=self._kalman_q_dangle_base)
+                self.yaw_kalman.set_noise(Q_dangle=self._kalman_q_dangle_base)
+                self.pitch_kalman_ca.set_noise(Q_dangle=self._kalman_q_dangle_base)
+                self.yaw_kalman_ca.set_noise(Q_dangle=self._kalman_q_dangle_base)
+                self.get_logger().info(f'Updated kalman_q_dangle(base) to {self._kalman_q_dangle_base:.2e}')
             elif p.name == 'zeta':
                 self.zeta = float(p.value)
             elif p.name == 'ie_clamp':
@@ -1625,10 +2363,44 @@ class OrientationControlNode(Node):
                 self.get_logger().info(f'Updated adaptive_q_enabled to {self.adaptive_q_enabled}')
             elif p.name == 'adaptive_q_tau_thresh':
                 self.adaptive_q_tau_thresh = float(p.value)
-                self.get_logger().info(f'Updated adaptive_q_tau_thresh(|Δtau|) to {self.adaptive_q_tau_thresh:.3f}')
+                self.get_logger().info(f'Updated adaptive_q_tau_thresh to {self.adaptive_q_tau_thresh:.3f}')
+            elif p.name == 'adaptive_q_w_thresh':
+                self.adaptive_q_w_thresh = float(p.value)
+                self.get_logger().info(f'Updated adaptive_q_w_thresh to {self.adaptive_q_w_thresh:.3f}')
+                #self.get_logger().info(f'Updated adaptive_q_tau_thresh(|Δtau|) to {self.adaptive_q_tau_thresh:.3f}')
             elif p.name == 'adaptive_q_scale_moving':
                 self.adaptive_q_scale_moving = float(p.value)
                 self.get_logger().info(f'Updated adaptive_q_scale_moving to {self.adaptive_q_scale_moving:.1f}')
+            elif p.name == 'kalman_model':
+                self.kalman_model = str(p.value).upper()
+                self.get_logger().info(f'Updated kalman_model to {self.kalman_model}')
+
+                # Reset both filters so switching doesn't cause transients
+                self.pitch_kalman.reset()
+                self.yaw_kalman.reset()
+                self.pitch_kalman_ca.reset()
+                self.yaw_kalman_ca.reset()
+            elif p.name == 'kalman_q_ddangle':
+                self._kalman_q_ddangle_base = float(p.value)
+                self.pitch_kalman_ca.set_noise(Q_ddangle=self._kalman_q_ddangle_base)
+                self.yaw_kalman_ca.set_noise(Q_ddangle=self._kalman_q_ddangle_base)
+                self.get_logger().info(f'Updated kalman_q_ddangle(base) to {self._kalman_q_ddangle_base:.2e}')
+            elif p.name == 'kalman_model':
+                self.kalman_model = str(p.value).upper()
+                self.get_logger().info(f'Updated kalman_model to {self.kalman_model}')
+
+                # Reset filters
+                self.pitch_kalman.reset()
+                self.yaw_kalman.reset()
+                self.pitch_kalman_ca.reset()
+                self.yaw_kalman_ca.reset()
+                self.pitch_kalman_kkf.reset()
+                self.yaw_kalman_kkf.reset()
+                # Restore baseline Q for PLANT KF (so no leftover scaling)
+                self.pitch_kalman.set_noise(Q_angle=self._kalman_q_angle_base,
+                                            Q_dangle=self._kalman_q_dangle_base)
+                self.yaw_kalman.set_noise(Q_angle=self._kalman_q_angle_base,
+                                          Q_dangle=self._kalman_q_dangle_base)
 
         result = SetParametersResult()
         result.successful = True

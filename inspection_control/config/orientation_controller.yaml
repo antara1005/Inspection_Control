@@ -38,7 +38,7 @@ orientation_controller:
 
     d_min: 0.15 # Minimum focal distance (meters)
     d_max: 0.30 # Maximum focal distance (meters)
-    v_max: 0.40 # Maximum linear velocity (meters/second)
+    v_max: 0.10 # Maximum linear velocity (meters/second)
     theta_max_deg: 90.0 # Maximum angular displacement (degrees)
 
     controller_type: PID # Options: PID, PD
@@ -55,4 +55,6 @@ orientation_controller:
     kalman_Q_dangle: 1.245061e-01     # Process noise for dangle ((rad/s)²)
 
     zeta: 1.0
-    integral_alpha: 1.0
+    integral_alpha: 50.0
+    kalman_model: PLANT # 'PLANT' or 'CA'
+    kalman_Q_ddangle: 1.0 # CA-only process noise for acceleration state

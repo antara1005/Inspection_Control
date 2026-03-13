@@ -271,6 +271,230 @@ def generate_pitch_yaw_control_plots(csv_filepath):
     print(f"Pitch/Yaw control plot saved to {plot_filename}")
 
 
+def generate_vel_acc_imu_plots(csv_filepath):
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import pathlib
+
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
+
+    # time in seconds relative to start
+    t = (df['timestamp'].astype(np.float64) - df['timestamp'].iloc[0]) / 1e9
+    t = np.asarray(t, dtype=np.float64)
+
+    # required columns
+    imu_g_cols = ['imu_ang_vel_x','imu_ang_vel_y','imu_ang_vel_z']
+    imu_a_cols = ['imu_lin_acc_x','imu_lin_acc_y','imu_lin_acc_z']
+    cur_g_cols = ['current_twist_angular_x','current_twist_angular_y','current_twist_angular_z']
+    cur_a_cols = ['current_accel_linear_x','current_accel_linear_y','current_accel_linear_z']
+
+    has_imu_g = all(c in df.columns for c in imu_g_cols)
+    has_imu_a = all(c in df.columns for c in imu_a_cols)
+    has_cur_g = all(c in df.columns for c in cur_g_cols)
+    has_cur_a = all(c in df.columns for c in cur_a_cols)
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
+
+    axes_names = ['x', 'y', 'z']
+
+    for i, ax_name in enumerate(axes_names):
+        # -------------------------
+        # Left: Angular velocity
+        # -------------------------
+        ax = axes[i, 0]
+        if i == 0:
+            ax.set_title("Angular velocity (rad/s): Current (solid) vs IMU (dashed)")
+        ax.set_ylabel(f"{ax_name}-axis")
+
+        plotted_any = False
+
+        if has_cur_g:
+            ax.plot(t, df[cur_g_cols[i]], label=f'current ω_{ax_name}', linewidth=1.5)
+            plotted_any = True
+        if has_imu_g:
+            ax.plot(t, df[imu_g_cols[i]], linestyle='--', alpha=0.9, label=f'imu ω_{ax_name}', linewidth=1.5)
+            plotted_any = True
+
+        if not plotted_any:
+            ax.text(0.5, 0.5, "missing gyro columns",
+                    transform=ax.transAxes, ha='center', va='center')
+
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+
+        # -------------------------
+        # Right: Linear acceleration
+        # -------------------------
+        ax = axes[i, 1]
+        if i == 0:
+            ax.set_title("Linear acceleration (m/s²): Current (solid) vs IMU (dashed)")
+
+        plotted_any = False
+
+        if has_cur_a:
+            ax.plot(t, df[cur_a_cols[i]], label=f'current a_{ax_name}', linewidth=1.5)
+            plotted_any = True
+        if has_imu_a:
+            ax.plot(t, df[imu_a_cols[i]], linestyle='--', alpha=0.9, label=f'imu a_{ax_name}', linewidth=1.5)
+            plotted_any = True
+
+        if not plotted_any:
+            ax.text(0.5, 0.5, "missing accel columns",
+                    transform=ax.transAxes, ha='center', va='center')
+
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+
+    axes[2, 0].set_xlabel("Time (s)")
+    axes[2, 1].set_xlabel("Time (s)")
+
+    plt.tight_layout()
+    plot_filename = csv_path.parent / f'{csv_path.stem}_imu_vs_current_overlay_6plots.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+    print(f"IMU vs current overlay plot saved to {plot_filename}")
+
+def generate_velocity_accel_plots_combine(csv_filepath):
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
+
+    timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
+
+    required = [
+        'current_twist_linear_x','current_twist_linear_y','current_twist_linear_z',
+        'current_twist_angular_x','current_twist_angular_y','current_twist_angular_z',
+        'jacobian_twist_linear_x','jacobian_twist_linear_y','jacobian_twist_linear_z',
+        'jacobian_twist_angular_x','jacobian_twist_angular_y','jacobian_twist_angular_z',
+        'current_accel_linear_x','current_accel_linear_y','current_accel_linear_z',
+        'current_accel_angular_x','current_accel_angular_y','current_accel_angular_z',
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing columns in CSV:\n" + "\n".join(missing)
+        )
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+
+    # 1) Linear velocity: commanded vs Jacobian
+    axes[0].plot(timestamps_sec, df['current_twist_linear_x'], label='cmd v_x')
+    axes[0].plot(timestamps_sec, df['current_twist_linear_y'], label='cmd v_y')
+    axes[0].plot(timestamps_sec, df['current_twist_linear_z'], label='cmd v_z')
+
+    axes[0].plot(timestamps_sec, df['jacobian_twist_linear_x'], '--', label='jac v_x')
+    axes[0].plot(timestamps_sec, df['jacobian_twist_linear_y'], '--', label='jac v_y')
+    axes[0].plot(timestamps_sec, df['jacobian_twist_linear_z'], '--', label='jac v_z')
+
+    axes[0].set_ylabel('Linear vel (m/s)')
+    axes[0].set_title('Linear Velocity: Commanded (solid) vs Jacobian (dashed)')
+    axes[0].legend(loc='upper right', ncol=2)
+    axes[0].grid(True, alpha=0.3)
+
+    # 2) Angular velocity: commanded vs Jacobian
+    axes[1].plot(timestamps_sec, df['current_twist_angular_x'], label='cmd ω_x')
+    axes[1].plot(timestamps_sec, df['current_twist_angular_y'], label='cmd ω_y')
+    axes[1].plot(timestamps_sec, df['current_twist_angular_z'], label='cmd ω_z')
+
+    axes[1].plot(timestamps_sec, df['jacobian_twist_angular_x'], '--', label='jac ω_x')
+    axes[1].plot(timestamps_sec, df['jacobian_twist_angular_y'], '--', label='jac ω_y')
+    axes[1].plot(timestamps_sec, df['jacobian_twist_angular_z'], '--', label='jac ω_z')
+
+    axes[1].set_ylabel('Angular vel (rad/s)')
+    axes[1].set_title('Angular Velocity: Commanded (solid) vs Jacobian (dashed)')
+    axes[1].legend(loc='upper right', ncol=2)
+    axes[1].grid(True, alpha=0.3)
+
+    # 3) Linear acceleration
+    axes[2].plot(timestamps_sec, df['current_accel_linear_x'], label='a_x')
+    axes[2].plot(timestamps_sec, df['current_accel_linear_y'], label='a_y')
+    axes[2].plot(timestamps_sec, df['current_accel_linear_z'], label='a_z')
+    axes[2].set_ylabel('Linear accel (m/s²)')
+    axes[2].set_title('End-effector Linear Acceleration (camera frame)')
+    axes[2].legend(loc='upper right', ncol=3)
+    axes[2].grid(True, alpha=0.3)
+
+    # 4) Angular acceleration
+    axes[3].plot(timestamps_sec, df['current_accel_angular_x'], label='α_x')
+    axes[3].plot(timestamps_sec, df['current_accel_angular_y'], label='α_y')
+    axes[3].plot(timestamps_sec, df['current_accel_angular_z'], label='α_z')
+    axes[3].set_xlabel('Time (s)')
+    axes[3].set_ylabel('Angular accel (rad/s²)')
+    axes[3].set_title('End-effector Angular Acceleration (camera frame)')
+    axes[3].legend(loc='upper right', ncol=3)
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_filename = csv_path.parent / f'{csv_path.stem}_vel_accel_with_jacobian.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+    print(f"Velocity/Acceleration/Jacobian plot saved to {plot_filename}")
+def generate_velocity_accel_plots(csv_filepath):
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
+
+    timestamps_sec = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
+
+    # Required columns (helps catch missing CSV fields early)
+    required = [
+        'current_twist_linear_x','current_twist_linear_y','current_twist_linear_z',
+        'current_twist_angular_x','current_twist_angular_y','current_twist_angular_z',
+        'current_accel_linear_x','current_accel_linear_y','current_accel_linear_z',
+        'current_accel_angular_x','current_accel_angular_y','current_accel_angular_z',
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing columns in CSV (did you add accel fields to debag CSV export?):\n" +
+            "\n".join(missing)
+        )
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+
+    # 1) Linear velocity
+    axes[0].plot(timestamps_sec, df['current_twist_linear_x'], label='v_x')
+    axes[0].plot(timestamps_sec, df['current_twist_linear_y'], label='v_y')
+    axes[0].plot(timestamps_sec, df['current_twist_linear_z'], label='v_z')
+    axes[0].set_ylabel('Linear vel (m/s)')
+    axes[0].set_title('End-effector Linear Velocity (camera frame)')
+    axes[0].legend(loc='upper right', ncol=3)
+    axes[0].grid(True, alpha=0.3)
+
+    # 2) Angular velocity
+    axes[1].plot(timestamps_sec, df['current_twist_angular_x'], label='ω_x')
+    axes[1].plot(timestamps_sec, df['current_twist_angular_y'], label='ω_y')
+    axes[1].plot(timestamps_sec, df['current_twist_angular_z'], label='ω_z')
+    axes[1].set_ylabel('Angular vel (rad/s)')
+    axes[1].set_title('End-effector Angular Velocity (camera frame)')
+    axes[1].legend(loc='upper right', ncol=3)
+    axes[1].grid(True, alpha=0.3)
+
+    # 3) Linear acceleration
+    axes[2].plot(timestamps_sec, df['current_accel_linear_x'], label='a_x')
+    axes[2].plot(timestamps_sec, df['current_accel_linear_y'], label='a_y')
+    axes[2].plot(timestamps_sec, df['current_accel_linear_z'], label='a_z')
+    axes[2].set_ylabel('Linear accel (m/s²)')
+    axes[2].set_title('End-effector Linear Acceleration (camera frame)')
+    axes[2].legend(loc='upper right', ncol=3)
+    axes[2].grid(True, alpha=0.3)
+
+    # 4) Angular acceleration
+    axes[3].plot(timestamps_sec, df['current_accel_angular_x'], label='α_x')
+    axes[3].plot(timestamps_sec, df['current_accel_angular_y'], label='α_y')
+    axes[3].plot(timestamps_sec, df['current_accel_angular_z'], label='α_z')
+    axes[3].set_xlabel('Time (s)')
+    axes[3].set_ylabel('Angular accel (rad/s²)')
+    axes[3].set_title('End-effector Angular Acceleration (camera frame)')
+    axes[3].legend(loc='upper right', ncol=3)
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_filename = csv_path.parent / f'{csv_path.stem}_vel_accel.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+    print(f"Velocity/Acceleration plot saved to {plot_filename}")
+
 def generate_roll_control_plots(csv_filepath):
     df = pd.read_csv(csv_filepath)
     csv_path = pathlib.Path(csv_filepath)
@@ -719,6 +943,21 @@ def debag(bag_file,
         'yaw_error_raw', 'dyaw_error_raw', 'yaw_torque_command',
         'roll_error', 'droll_error', 'iroll_error', 'roll_torque_command',
         'k_p', 'k_d', 'k_i',
+        'kalman_model',
+        'kalman_r', 'kalman_q_angle', 'kalman_q_dangle', 'kalman_q_ddangle',
+        'ddpitch_error', 'ddyaw_error',
+        'current_twist_linear_x', 'current_twist_linear_y', 'current_twist_linear_z',
+        'current_twist_angular_x', 'current_twist_angular_y', 'current_twist_angular_z',
+
+        # NEW: accel
+        'current_accel_linear_x', 'current_accel_linear_y', 'current_accel_linear_z',
+        'current_accel_angular_x', 'current_accel_angular_y', 'current_accel_angular_z',
+        'imu_ang_vel_x', 'imu_ang_vel_y', 'imu_ang_vel_z',
+        'imu_lin_acc_x', 'imu_lin_acc_y', 'imu_lin_acc_z',
+
+        'jacobian_twist_linear_x', 'jacobian_twist_linear_y', 'jacobian_twist_linear_z',
+        'jacobian_twist_angular_x', 'jacobian_twist_angular_y', 'jacobian_twist_angular_z',
+
     ])
 
     msg_count = 0
@@ -770,6 +1009,20 @@ def debag(bag_file,
             msg.yaw_error_raw, msg.dyaw_error_raw, msg.yaw_torque_command,
             msg.roll_error, msg.droll_error, msg.iroll_error, msg.roll_torque_command,
             msg.k_p, msg.k_d, msg.k_i,
+            msg.kalman_model,
+            msg.kalman_r, msg.kalman_q_angle, msg.kalman_q_dangle, msg.kalman_q_ddangle,
+            msg.ddpitch_error, msg.ddyaw_error,
+            msg.current_twist.twist.linear.x, msg.current_twist.twist.linear.y, msg.current_twist.twist.linear.z,
+            msg.current_twist.twist.angular.x, msg.current_twist.twist.angular.y, msg.current_twist.twist.angular.z,
+
+            # NEW: accel
+            msg.current_accel.accel.linear.x, msg.current_accel.accel.linear.y, msg.current_accel.accel.linear.z,
+            msg.current_accel.accel.angular.x, msg.current_accel.accel.angular.y, msg.current_accel.accel.angular.z,
+            msg.imu.angular_velocity.x, msg.imu.angular_velocity.y, msg.imu.angular_velocity.z,
+            msg.imu.linear_acceleration.x, msg.imu.linear_acceleration.y, msg.imu.linear_acceleration.z,
+
+            msg.jacobian_twist.twist.linear.x, msg.jacobian_twist.twist.linear.y, msg.jacobian_twist.twist.linear.z,
+            msg.jacobian_twist.twist.angular.x, msg.jacobian_twist.twist.angular.y, msg.jacobian_twist.twist.angular.z,
         ])
 
     csv_file.close()
@@ -777,6 +1030,9 @@ def debag(bag_file,
 
     generate_pitch_yaw_control_plots(csv_filename)
     generate_roll_control_plots(csv_filename)
+    generate_velocity_accel_plots(csv_filename)
+    generate_vel_acc_imu_plots(csv_filename)
+    generate_velocity_accel_plots_combine(csv_filename)
 
     # UPDATED call: Option B inside estimator
     estimate_kalman_noise_parameters(
@@ -789,14 +1045,14 @@ def debag(bag_file,
     )
 
     print(f"Creating point cloud visualization from {len(all_point_clouds)} clouds...")
-    visualize_pointclouds_over_time(
-        all_point_clouds,
-        all_normals,
-        all_centroids,
-        all_torque_vectors,
-        all_timestamps,
-        output_base
-    )
+    # visualize_pointclouds_over_time(
+    #     all_point_clouds,
+    #     all_normals,
+    #     all_centroids,
+    #     all_torque_vectors,
+    #     all_timestamps,
+    #     output_base
+    # )
 
     if bag_file.exists():
         shutil.rmtree(bag_file)

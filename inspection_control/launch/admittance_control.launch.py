@@ -6,6 +6,8 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+from moveit_configs_utils import MoveItConfigsBuilder
+
 
 def generate_launch_description():
     """Generate launch description for teleop_twist_stamped_joy node."""
@@ -40,6 +42,18 @@ def generate_launch_description():
         'turntable_config_file',
         default_value='turntable_joy.yaml',
         description='Name of turntable joy configuration file'
+    )
+
+    moveit_config = (
+        MoveItConfigsBuilder("inspection_cell")
+        .moveit_cpp(file_path="config/motion_planning.yaml")
+        .planning_scene_monitor(
+            publish_planning_scene=False,
+            publish_geometry_updates=False,
+            publish_state_updates=False,
+            publish_transforms_updates=False,
+        )
+        .to_moveit_configs()
     )
 
     particle_filter_config = PathJoinSubstitution([
@@ -90,7 +104,8 @@ def generate_launch_description():
         package='inspection_control',
         executable='orientation_control_node',
         name='orientation_controller',
-        parameters=[orientation_config],
+        parameters=[orientation_config,
+                    moveit_config.to_dict()],
         output='screen',
         emulate_tty=True
     )
