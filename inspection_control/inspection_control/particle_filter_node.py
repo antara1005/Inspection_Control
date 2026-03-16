@@ -137,6 +137,7 @@ class ParticleFilterNode(Node):
         self.processing = False
         self.lock = threading.Lock()
         self.model_ready = False
+        self._T_model_in_obj = None   # latest particle filter estimate (set by _process_frame)
 
         # -- TF -------------------------------------------------------------
         self.tf_buffer = tf2_ros.Buffer()
@@ -151,6 +152,7 @@ class ParticleFilterNode(Node):
         self.particles_pub  = self.create_publisher(PoseArray,    "particle_filter/particles",        10)
         self.markers_pub    = self.create_publisher(MarkerArray,  "particle_filter/particle_markers", 10)
         self.obs_cloud_pub  = self.create_publisher(PointCloud2,  "particle_filter/observed_cloud",   10)
+        self.camera_info_pub = self.create_publisher(CameraInfo,  "particle_filter/depth/camera_info", 10)
 
         # -- Subscribers (start before model is loaded so we buffer info) ---
         # The depth callback can block for seconds (particle update step).
@@ -302,6 +304,7 @@ class ParticleFilterNode(Node):
             "width": msg.width, "height": msg.height,
         }
         self.camera_frame = msg.header.frame_id
+        self.camera_info_pub.publish(msg)
 
     def _depth_cb(self, msg: CompressedImage):
         if not self.model_ready:
@@ -312,20 +315,40 @@ class ParticleFilterNode(Node):
             self.get_logger().info("depth_cb: no camera intrinsics yet, skipping",
                                    throttle_duration_sec=5.0)
             return
-        # Prevent overlapping processing
+
+        # Run particle filter update if not already processing
+        run_pf = False
         with self.lock:
-            if self.processing:
-                self.get_logger().info("depth_cb: previous frame still processing, skipping",
-                                       throttle_duration_sec=5.0)
-                return
-            self.processing = True
-        try:
-            self._process_frame(msg)
-        except Exception as e:
-            self.get_logger().error(f"Processing error: {e}", throttle_duration_sec=2.0)
-        finally:
-            with self.lock:
-                self.processing = False
+            if not self.processing:
+                self.processing = True
+                run_pf = True
+        if run_pf:
+            try:
+                self._process_frame(msg)
+            except Exception as e:
+                self.get_logger().error(f"Processing error: {e}", throttle_duration_sec=2.0)
+            finally:
+                with self.lock:
+                    self.processing = False
+
+        # Always render at full frame rate using the latest T_model_in_obj
+        if self._T_model_in_obj is not None:
+            try:
+                tf_cam_to_obj = self.tf_buffer.lookup_transform(
+                    "object_frame", self.camera_frame,
+                    rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.01))
+                T_obj_to_cam = np.linalg.inv(msg_to_matrix(tf_cam_to_obj))
+
+                result = self._decode_compressed_depth(msg)
+                if result is not None:
+                    _, depth_scale = result
+                    self._render_and_publish(T_obj_to_cam, self._T_model_in_obj,
+                                             msg.header.stamp, depth_scale)
+            except (tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException) as e:
+                self.get_logger().warn(f"Render TF lookup failed: {e}",
+                                       throttle_duration_sec=2.0)
 
     # -----------------------------------------------------------------------
     # Main processing pipeline
@@ -339,7 +362,7 @@ class ParticleFilterNode(Node):
         result = self._decode_compressed_depth(msg)
         if result is None:
             return
-        depth_m, depth_scale = result
+        depth_m, _ = result
         self.get_logger().info("process_frame: depth decoded", throttle_duration_sec=2.0)
 
         # 2. Look up transform: camera_frame -> object_frame
@@ -408,11 +431,8 @@ class ParticleFilterNode(Node):
         self._publish_pose(best_tx, best_ty, best_theta, stamp)
         self._publish_particles(stamp)
 
-        # 9. Render and publish synthetic depth
-        self.get_logger().info("process_frame: starting render", throttle_duration_sec=2.0)
-        T_obj_to_cam = np.linalg.inv(T_cam_to_obj)
-        T_model_in_obj = pose_matrix(best_tx, best_ty, best_theta)
-        self._render_and_publish(T_obj_to_cam, T_model_in_obj, stamp, depth_scale)
+        # 9. Save T_model_in_obj for rendering (done in _depth_cb at full frame rate)
+        self._T_model_in_obj = pose_matrix(best_tx, best_ty, best_theta)
         self.get_logger().info(
             f"process_frame: complete  tx={best_tx:.4f} ty={best_ty:.4f} "
             f"theta={np.degrees(best_theta):.1f}°",

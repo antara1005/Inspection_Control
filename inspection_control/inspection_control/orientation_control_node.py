@@ -1703,7 +1703,6 @@ class OrientationControlNode(Node):
 
     def _handle_no_measurement(self):
         now_s = self.get_clock().now().nanoseconds * 1e-9
-        print("No valid measurement available.")
 
         if self._had_target_last_cycle:
             self._last_target_time_s = now_s
@@ -1732,294 +1731,310 @@ class OrientationControlNode(Node):
     # ===========================
     def process_controller(self):
         with self._measurement_lock:
-            if not self._latest_measurement['valid']:
-                self._handle_no_measurement()
-                return
+            has_measurement = self._latest_measurement['valid']
+            if has_measurement:
+                cen_s = self._latest_measurement['centroid'].copy()
+                nrm_s = self._latest_measurement['normal'].copy()
+                rot_vec_error = self._latest_measurement['rot_vec_error'].copy()
+                pitch_err_meas = self._latest_measurement['pitch_err']
+                yaw_err_meas = self._latest_measurement['yaw_err']
+                meas_stamp = self._latest_measurement['stamp']
+                d = self._latest_measurement['d']
+                r = self._latest_measurement['r'].copy()
+                surface_points = self._latest_measurement['surface_points']
+                goal_pose = self._latest_measurement['goal_pose']
+                camera_transform = self._latest_measurement['camera_transform']
 
-            cen_s = self._latest_measurement['centroid'].copy()
-            nrm_s = self._latest_measurement['normal'].copy()
-            rot_vec_error = self._latest_measurement['rot_vec_error'].copy()
-            pitch_err_meas = self._latest_measurement['pitch_err']
-            yaw_err_meas = self._latest_measurement['yaw_err']
-            meas_stamp = self._latest_measurement['stamp']
-            d = self._latest_measurement['d']
-            roll_error = self._latest_measurement['roll_error']
-            r = self._latest_measurement['r'].copy()
-            surface_points = self._latest_measurement['surface_points']
-            goal_pose = self._latest_measurement['goal_pose']
-            camera_transform = self._latest_measurement['camera_transform']
+        # Always compute roll error from TF
+        roll_error = 0.0
+        try:
+            T = self.tf_buffer.lookup_transform(
+                'object_frame', self.main_camera_frame, Time(sec=0, nanosec=0), timeout=Duration(seconds=0.001))
+            q = T.transform.rotation
+            R_tf = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
+            x_cf = R_tf[:, 0]
+            roll_error = _roll_error(x_cf)
+        except TransformException:
+            pass
+        tau_roll = 2*roll_error
 
-        now_s = self.get_clock().now().nanoseconds * 1e-9
+        if has_measurement:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
 
-        tau_out = np.zeros(3, dtype=np.float32)
-        self.anti_windup_enabled = True
+            tau_out = np.zeros(3, dtype=np.float32)
+            self.anti_windup_enabled = True
 
-        dt_ctrl = 0.0
-        if self._last_err_t is not None:
-            dt_ctrl = max(1e-6, now_s - self._last_err_t)
-        self._last_err_t = now_s
-        model = str(self.kalman_model).upper()
-        self.ocd.kalman_model = model
-        # Raw errors
-        pitch_err_raw = -pitch_err_meas
-        yaw_err_raw = yaw_err_meas
-        # Publish raw yaw error (rad)
-        self.pub_yaw_err_raw.publish(Float64(data=float(yaw_err_raw)))
-        # ===== NEW: measured raw rates BEFORE KF (for adaptive-Q gating) =====
-        dpitch_meas = 0.0
-        dyaw_meas = 0.0
-        if dt_ctrl > 0.0:
-            dpitch_meas = (pitch_err_raw - float(self.last_pitch)) / dt_ctrl
-            dyaw_meas = (yaw_err_raw - float(self.last_yaw)) / dt_ctrl
+            dt_ctrl = 0.0
+            if self._last_err_t is not None:
+                dt_ctrl = max(1e-6, now_s - self._last_err_t)
+            self._last_err_t = now_s
+            model = str(self.kalman_model).upper()
+            self.ocd.kalman_model = model
+            # Raw errors
+            pitch_err_raw = -pitch_err_meas
+            yaw_err_raw = yaw_err_meas
+            # Publish raw yaw error (rad)
+            self.pub_yaw_err_raw.publish(Float64(data=float(yaw_err_raw)))
+            # ===== NEW: measured raw rates BEFORE KF (for adaptive-Q gating) =====
+            dpitch_meas = 0.0
+            dyaw_meas = 0.0
+            if dt_ctrl > 0.0:
+                dpitch_meas = (pitch_err_raw - float(self.last_pitch)) / dt_ctrl
+                dyaw_meas = (yaw_err_raw - float(self.last_yaw)) / dt_ctrl
 
 
-        inertia_A = self.inertia_B + self.mass_B * d ** 2
-        b_damping = self.linear_drag * d * d
-        # ===== NEW: Simple adaptive Q (screenshot logic) =====
-        if self.kalman_enabled and self.adaptive_q_enabled and dt_ctrl > 0.0:
-            pitch_moving = (abs(self._prev_tau_pitch) > self.adaptive_q_tau_thresh)
-            pitch_moving = pitch_moving or (abs(dpitch_meas) > self.adaptive_q_w_thresh)
-        # ===== Adaptive Q based ONLY on sudden torque jump =====
-        # If |tau[k-1] - tau[k-2]| is big => Q *= 50, else Q *= 1
-        #if self.kalman_enabled and self.adaptive_q_enabled:
-           # d_tau_pitch = abs(float(self._prev_tau_pitch) - float(self._prev2_tau_pitch))
-           # d_tau_yaw   = abs(float(self._prev_tau_yaw)   - float(self._prev2_tau_yaw))
-            yaw_moving = (abs(self._prev_tau_yaw) > self.adaptive_q_tau_thresh)
-            yaw_moving = yaw_moving or (abs(dyaw_meas) > self.adaptive_q_w_thresh)
-           # pitch_jump = (d_tau_pitch > self.adaptive_q_tau_thresh)
-          #  yaw_jump   = (d_tau_yaw   > self.adaptive_q_tau_thresh)
-            pitch_scale = self.adaptive_q_scale_moving if pitch_moving else 1.0
-            yaw_scale = self.adaptive_q_scale_moving if yaw_moving else 1.0
-           # pitch_scale = self.adaptive_q_scale_moving if pitch_jump else 1.0
-           # yaw_scale   = self.adaptive_q_scale_moving if yaw_jump else 1.0
+            inertia_A = self.inertia_B + self.mass_B * d ** 2
+            b_damping = self.linear_drag * d * d
+            # ===== NEW: Simple adaptive Q (screenshot logic) =====
+            if self.kalman_enabled and self.adaptive_q_enabled and dt_ctrl > 0.0:
+                pitch_moving = (abs(self._prev_tau_pitch) > self.adaptive_q_tau_thresh)
+                pitch_moving = pitch_moving or (abs(dpitch_meas) > self.adaptive_q_w_thresh)
+            # ===== Adaptive Q based ONLY on sudden torque jump =====
+            # If |tau[k-1] - tau[k-2]| is big => Q *= 50, else Q *= 1
+            #if self.kalman_enabled and self.adaptive_q_enabled:
+               # d_tau_pitch = abs(float(self._prev_tau_pitch) - float(self._prev2_tau_pitch))
+               # d_tau_yaw   = abs(float(self._prev_tau_yaw)   - float(self._prev2_tau_yaw))
+                yaw_moving = (abs(self._prev_tau_yaw) > self.adaptive_q_tau_thresh)
+                yaw_moving = yaw_moving or (abs(dyaw_meas) > self.adaptive_q_w_thresh)
+               # pitch_jump = (d_tau_pitch > self.adaptive_q_tau_thresh)
+              #  yaw_jump   = (d_tau_yaw   > self.adaptive_q_tau_thresh)
+                pitch_scale = self.adaptive_q_scale_moving if pitch_moving else 1.0
+                yaw_scale = self.adaptive_q_scale_moving if yaw_moving else 1.0
+               # pitch_scale = self.adaptive_q_scale_moving if pitch_jump else 1.0
+               # yaw_scale   = self.adaptive_q_scale_moving if yaw_jump else 1.0
 
-            self.pitch_kalman.set_noise(
-                Q_angle=self._kalman_q_angle_base * pitch_scale,
-                Q_dangle=self._kalman_q_dangle_base * pitch_scale
-            )
-            self.yaw_kalman.set_noise(
-                Q_angle=self._kalman_q_angle_base * yaw_scale,
-                Q_dangle=self._kalman_q_dangle_base * yaw_scale
-            )
-        # --- Log KF noise actually used ---
-            if model == "PLANT":
-        # If adaptive-Q is enabled, you may have scaled Q inside self.pitch_kalman/self.yaw_kalman.
-        # We log the pitch filter's current values (you could also log max(pitch,yaw) if you prefer).
-              self.ocd.kalman_r = float(self.pitch_kalman.R)
-              self.ocd.kalman_q_angle = float(self.pitch_kalman.Q[0, 0])
-              self.ocd.kalman_q_dangle = float(self.pitch_kalman.Q[1, 1])
-              self.ocd.kalman_q_ddangle = 0.0  # not used in PLANT
-            else:
-        # CA mode: fixed Q (no adaptive-Q)
-              self.ocd.kalman_r = float(self.pitch_kalman_ca.R)
-              self.ocd.kalman_q_angle = float(self.pitch_kalman_ca.Q[0, 0])
-              self.ocd.kalman_q_dangle = float(self.pitch_kalman_ca.Q[1, 1])
-              self.ocd.kalman_q_ddangle = float(self.pitch_kalman_ca.Q[2, 2])
-
-        # Apply Kalman filtering if enabled
-        if self.kalman_enabled and dt_ctrl > 0:
-
-            if self.kalman_model == 'CA':
-              # CA model ignores torque/I_A/b (pure kinematics)
-              pitch_filtered, dpitch_filtered, ddpitch_filtered = self.pitch_kalman_ca.predict_and_update(
-               pitch_err_raw, dt_ctrl
-              )
-              yaw_filtered, dyaw_filtered, ddyaw_filtered = self.yaw_kalman_ca.predict_and_update(
-               yaw_err_raw, dt_ctrl
-              )
-
-              self.pitch_err = pitch_filtered
-              self.dpitch = dpitch_filtered
-              self.yaw_err = yaw_filtered
-              self.dyaw = dyaw_filtered
-              
-              # NEW: log CA accel states
-              self.ocd.ddpitch_error = float(ddpitch_filtered)
-              self.ocd.ddyaw_error = float(ddyaw_filtered)
-              # Optional: expose acceleration estimates if you want later
-              self.ddpitch = ddpitch_filtered
-              self.ddyaw = ddyaw_filtered
-            elif self.kalman_model == 'KKF':
-                # KKF uses measured angular acceleration from admittance node
-                # Map axes consistent with your tau_theta_vec = [tau_pitch, tau_yaw, 0]
-                a_pitch = float(self.rot_acc_cam[0])  # rad/s^2
-                a_yaw   = float(self.rot_acc_cam[1])  # rad/s^2
-
-                pitch_filtered, dpitch_filtered = self.pitch_kalman_kkf.predict_and_update(
-                    pitch_err_raw, dt_ctrl, a_pitch
+                self.pitch_kalman.set_noise(
+                    Q_angle=self._kalman_q_angle_base * pitch_scale,
+                    Q_dangle=self._kalman_q_dangle_base * pitch_scale
                 )
-                yaw_filtered, dyaw_filtered = self.yaw_kalman_kkf.predict_and_update(
-                    yaw_err_raw, dt_ctrl, a_yaw
+                self.yaw_kalman.set_noise(
+                    Q_angle=self._kalman_q_angle_base * yaw_scale,
+                    Q_dangle=self._kalman_q_dangle_base * yaw_scale
                 )
+            # --- Log KF noise actually used ---
+                if model == "PLANT":
+            # If adaptive-Q is enabled, you may have scaled Q inside self.pitch_kalman/self.yaw_kalman.
+            # We log the pitch filter's current values (you could also log max(pitch,yaw) if you prefer).
+                  self.ocd.kalman_r = float(self.pitch_kalman.R)
+                  self.ocd.kalman_q_angle = float(self.pitch_kalman.Q[0, 0])
+                  self.ocd.kalman_q_dangle = float(self.pitch_kalman.Q[1, 1])
+                  self.ocd.kalman_q_ddangle = 0.0  # not used in PLANT
+                else:
+            # CA mode: fixed Q (no adaptive-Q)
+                  self.ocd.kalman_r = float(self.pitch_kalman_ca.R)
+                  self.ocd.kalman_q_angle = float(self.pitch_kalman_ca.Q[0, 0])
+                  self.ocd.kalman_q_dangle = float(self.pitch_kalman_ca.Q[1, 1])
+                  self.ocd.kalman_q_ddangle = float(self.pitch_kalman_ca.Q[2, 2])
 
-                self.pitch_err = pitch_filtered
-                self.dpitch = dpitch_filtered
+            # Apply Kalman filtering if enabled
+            if self.kalman_enabled and dt_ctrl > 0:
+
+                if self.kalman_model == 'CA':
+                  # CA model ignores torque/I_A/b (pure kinematics)
+                  pitch_filtered, dpitch_filtered, ddpitch_filtered = self.pitch_kalman_ca.predict_and_update(
+                   pitch_err_raw, dt_ctrl
+                  )
+                  yaw_filtered, dyaw_filtered, ddyaw_filtered = self.yaw_kalman_ca.predict_and_update(
+                   yaw_err_raw, dt_ctrl
+                  )
+
+                  self.pitch_err = pitch_filtered
+                  self.dpitch = dpitch_filtered
+                  self.yaw_err = yaw_filtered
+                  self.dyaw = dyaw_filtered
+
+                  # NEW: log CA accel states
+                  self.ocd.ddpitch_error = float(ddpitch_filtered)
+                  self.ocd.ddyaw_error = float(ddyaw_filtered)
+                  # Optional: expose acceleration estimates if you want later
+                  self.ddpitch = ddpitch_filtered
+                  self.ddyaw = ddyaw_filtered
+                elif self.kalman_model == 'KKF':
+                    # KKF uses measured angular acceleration from admittance node
+                    # Map axes consistent with your tau_theta_vec = [tau_pitch, tau_yaw, 0]
+                    a_pitch = float(self.rot_acc_cam[0])  # rad/s^2
+                    a_yaw   = float(self.rot_acc_cam[1])  # rad/s^2
+
+                    pitch_filtered, dpitch_filtered = self.pitch_kalman_kkf.predict_and_update(
+                        pitch_err_raw, dt_ctrl, a_pitch
+                    )
+                    yaw_filtered, dyaw_filtered = self.yaw_kalman_kkf.predict_and_update(
+                        yaw_err_raw, dt_ctrl, a_yaw
+                    )
+
+                    self.pitch_err = pitch_filtered
+                    self.dpitch = dpitch_filtered
+                    self.yaw_err = yaw_filtered
+                    self.dyaw = dyaw_filtered
+
+                    # No accel state in 2-state KKF (we *use* accel as input)
+                    self.ocd.ddpitch_error = float(a_pitch)  # optional: log the input accel instead
+                    self.ocd.ddyaw_error   = float(a_yaw)
+
+                    # Log noise actually used
+                    self.ocd.kalman_r = float(self.pitch_kalman_kkf.R)
+                    self.ocd.kalman_q_angle = float(self.pitch_kalman_kkf.Qx[0, 0])
+                    self.ocd.kalman_q_dangle = float(self.pitch_kalman_kkf.Qx[1, 1])
+                    self.ocd.kalman_q_ddangle = float(self.pitch_kalman_kkf.Wa)  # treat as accel-input variance
+
+                else:
+                # Default: PLANT (your existing model-based KF)
+                  pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
+                   pitch_err_raw, dt_ctrl,
+                   u_prev=-self._prev_tau_pitch,
+                   I_A=inertia_A,
+                   b=b_damping
+                  )
+                  self.pitch_err = pitch_filtered
+                  self.dpitch = dpitch_filtered
+
+                  yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
+                   yaw_err_raw, dt_ctrl,
+                   u_prev=-self._prev_tau_yaw,
+                   I_A=inertia_A,
+                   b=b_damping
+                 )
                 self.yaw_err = yaw_filtered
                 self.dyaw = dyaw_filtered
-
-                # No accel state in 2-state KKF (we *use* accel as input)
-                self.ocd.ddpitch_error = float(a_pitch)  # optional: log the input accel instead
-                self.ocd.ddyaw_error   = float(a_yaw)
-
-                # Log noise actually used
-                self.ocd.kalman_r = float(self.pitch_kalman_kkf.R)
-                self.ocd.kalman_q_angle = float(self.pitch_kalman_kkf.Qx[0, 0])
-                self.ocd.kalman_q_dangle = float(self.pitch_kalman_kkf.Qx[1, 1])
-                self.ocd.kalman_q_ddangle = float(self.pitch_kalman_kkf.Wa)  # treat as accel-input variance
-
+                # NEW: PLANT has no accel state
+                self.ocd.ddpitch_error = 0.0
+                self.ocd.ddyaw_error = 0.0
             else:
-            # Default: PLANT (your existing model-based KF)
-              pitch_filtered, dpitch_filtered = self.pitch_kalman.predict_and_update(
-               pitch_err_raw, dt_ctrl,
-               u_prev=-self._prev_tau_pitch,
-               I_A=inertia_A,
-               b=b_damping
-              )
-              self.pitch_err = pitch_filtered
-              self.dpitch = dpitch_filtered
+                  # No Kalman: raw derivatives
+                self.pitch_err = pitch_err_raw
+                self.yaw_err = yaw_err_raw
+                if dt_ctrl > 0:
+                    self.dpitch = (self.pitch_err - self.last_pitch) / dt_ctrl
+                    self.dyaw = (self.yaw_err - self.last_yaw) / dt_ctrl
+                else:
+                    self.dpitch = 0.0
+                    self.dyaw = 0.0
+                self.ocd.ddpitch_error = 0.0
+                self.ocd.ddyaw_error = 0.0
 
-              yaw_filtered, dyaw_filtered = self.yaw_kalman.predict_and_update(
-               yaw_err_raw, dt_ctrl,
-               u_prev=-self._prev_tau_yaw,
-               I_A=inertia_A,
-               b=b_damping
-             )
-            self.yaw_err = yaw_filtered
-            self.dyaw = dyaw_filtered
-            # NEW: PLANT has no accel state
-            self.ocd.ddpitch_error = 0.0
-            self.ocd.ddyaw_error = 0.0
-        else:
-              # No Kalman: raw derivatives
-            self.pitch_err = pitch_err_raw
-            self.yaw_err = yaw_err_raw
-            if dt_ctrl > 0:
-                self.dpitch = (self.pitch_err - self.last_pitch) / dt_ctrl
-                self.dyaw = (self.yaw_err - self.last_yaw) / dt_ctrl
+            # keep your raw bookkeeping exactly as-is below...
+            self.pitch_err_raw = pitch_err_raw
+            self.yaw_err_raw = yaw_err_raw
+            self.dpitch_raw = (pitch_err_raw - self.last_pitch) / dt_ctrl if dt_ctrl > 0 else 0.0
+            self.dyaw_raw = (yaw_err_raw - self.last_yaw) / dt_ctrl if dt_ctrl > 0 else 0.0
+
+            self.last_pitch = float(pitch_err_raw)
+            self.last_yaw = float(yaw_err_raw)
+
+            tau_max = self.linear_drag * d * self.v_max
+            omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * math.pi / 180.0))
+            omega_n = omega_n_max
+
+            p_1 = -self.zeta * omega_n + omega_n * math.sqrt(self.zeta ** 2 - 1)
+            p_2 = -self.zeta * omega_n - omega_n * math.sqrt(self.zeta ** 2 - 1)
+            p_3 = self.integral_alpha * p_2
+
+            if self.controller_type == 'PD':
+                self.Kp = inertia_A * (p_1 * p_2)
+                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Ki = 0.0
+            elif self.controller_type == 'PID':
+                self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
+                self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+               # self.Ki = 0.0  # TEMP: disable I for now to see if it helps with stability
+                self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
             else:
-                self.dpitch = 0.0
-                self.dyaw = 0.0
-            self.ocd.ddpitch_error = 0.0
-            self.ocd.ddyaw_error = 0.0    
-           
-        # keep your raw bookkeeping exactly as-is below...
-        self.pitch_err_raw = pitch_err_raw
-        self.yaw_err_raw = yaw_err_raw
-        self.dpitch_raw = (pitch_err_raw - self.last_pitch) / dt_ctrl if dt_ctrl > 0 else 0.0
-        self.dyaw_raw = (yaw_err_raw - self.last_yaw) / dt_ctrl if dt_ctrl > 0 else 0.0  
+                self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
+                self.Kp = inertia_A * (p_1 * p_2)
+                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Ki = 0.0
 
-        self.last_pitch = float(pitch_err_raw)
-        self.last_yaw = float(yaw_err_raw)
+            tau_pitch_raw = self.Kp * self.pitch_err + self.Ki * self.int_pitch + self.Kd * self.dpitch
+            tau_yaw_raw = self.Kp * self.yaw_err + self.Ki * self.int_yaw + self.Kd * self.dyaw
 
-        tau_max = self.linear_drag * d * self.v_max
-        omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * math.pi / 180.0))
-        omega_n = omega_n_max
+            tau_magnitude = math.sqrt(tau_pitch_raw ** 2 + tau_yaw_raw ** 2)
+            if tau_magnitude > tau_max and tau_magnitude > 1e-9:
+                scale = tau_max / tau_magnitude
+                tau_pitch = tau_pitch_raw * scale
+                tau_yaw = tau_yaw_raw * scale
+                is_saturated = True
+            else:
+                tau_pitch = tau_pitch_raw
+                tau_yaw = tau_yaw_raw
+                is_saturated = False
 
-        p_1 = -self.zeta * omega_n + omega_n * math.sqrt(self.zeta ** 2 - 1)
-        p_2 = -self.zeta * omega_n - omega_n * math.sqrt(self.zeta ** 2 - 1)
-        p_3 = self.integral_alpha * p_2
-
-        if self.controller_type == 'PD':
-            self.Kp = inertia_A * (p_1 * p_2)
-            self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
-            self.Ki = 0.0
-        elif self.controller_type == 'PID':
-            self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
-            self.Ki = -inertia_A * (p_1 * p_2 * p_3)
-           # self.Ki = 0.0  # TEMP: disable I for now to see if it helps with stability
-            self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
-        else:
-            self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
-            self.Kp = inertia_A * (p_1 * p_2)
-            self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
-            self.Ki = 0.0
-
-        tau_pitch_raw = self.Kp * self.pitch_err + self.Ki * self.int_pitch + self.Kd * self.dpitch
-        tau_yaw_raw = self.Kp * self.yaw_err + self.Ki * self.int_yaw + self.Kd * self.dyaw
-
-        tau_magnitude = math.sqrt(tau_pitch_raw ** 2 + tau_yaw_raw ** 2)
-        if tau_magnitude > tau_max and tau_magnitude > 1e-9:
-            scale = tau_max / tau_magnitude
-            tau_pitch = tau_pitch_raw * scale
-            tau_yaw = tau_yaw_raw * scale
-            is_saturated = True
-        else:
-            tau_pitch = tau_pitch_raw
-            tau_yaw = tau_yaw_raw
-            is_saturated = False
-
-        if self.anti_windup_enabled and self.Ki > 1e-9 and dt_ctrl > 0.0:
-            if is_saturated:
-                if (tau_pitch_raw > 0 and self.pitch_err < 0) or (tau_pitch_raw < 0 and self.pitch_err > 0):
+            if self.anti_windup_enabled and self.Ki > 1e-9 and dt_ctrl > 0.0:
+                if is_saturated:
+                    if (tau_pitch_raw > 0 and self.pitch_err < 0) or (tau_pitch_raw < 0 and self.pitch_err > 0):
+                        self.int_pitch += self.pitch_err * dt_ctrl
+                    if (tau_yaw_raw > 0 and self.yaw_err < 0) or (tau_yaw_raw < 0 and self.yaw_err > 0):
+                        self.int_yaw += self.yaw_err * dt_ctrl
+                else:
                     self.int_pitch += self.pitch_err * dt_ctrl
-                if (tau_yaw_raw > 0 and self.yaw_err < 0) or (tau_yaw_raw < 0 and self.yaw_err > 0):
                     self.int_yaw += self.yaw_err * dt_ctrl
-            else:
+            elif dt_ctrl > 0.0:
                 self.int_pitch += self.pitch_err * dt_ctrl
                 self.int_yaw += self.yaw_err * dt_ctrl
-        elif dt_ctrl > 0.0:
-            self.int_pitch += self.pitch_err * dt_ctrl
-            self.int_yaw += self.yaw_err * dt_ctrl
 
-        int_lim = float(self.ie_clamp) * (math.pi / 180)
-        self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
-        self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
+            int_lim = float(self.ie_clamp) * (math.pi / 180)
+            self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
+            self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
 
-        if not self.orientation_control_enabled:
-            tau_pitch = 0.0
-            tau_yaw = 0.0
+            if not self.orientation_control_enabled:
+                tau_pitch = 0.0
+                tau_yaw = 0.0
 
-        # ===== Shift history for torque-jump detection =====
-      #  self._prev2_tau_pitch = float(self._prev_tau_pitch)
-      #  self._prev2_tau_yaw   = float(self._prev_tau_yaw)
+            # ===== Shift history for torque-jump detection =====
+          #  self._prev2_tau_pitch = float(self._prev_tau_pitch)
+          #  self._prev2_tau_yaw   = float(self._prev_tau_yaw)
 
-        self._prev_tau_pitch = float(tau_pitch)
-        self._prev_tau_yaw = float(tau_yaw)
+            self._prev_tau_pitch = float(tau_pitch)
+            self._prev_tau_yaw = float(tau_yaw)
 
-        tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
-        moment_tele_A = np.cross(r, self.force_teleop)
+            tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
+            moment_tele_A = np.cross(r, self.force_teleop)
 
-        tau_roll = roll_error 
-        F_z = -1 * self.Kp * (self.focal_distance - d)
-        
+            F_z = -1 * self.Kp * (self.focal_distance - d)
 
-        force_drag_B = -self.linear_drag * self.lin_vel_cam
-        moment_drag_B = -self.angular_drag * self.rot_vel_cam
-        moment_dragB_A = np.cross(r, force_drag_B)
-        self.ang_acc = (moment_dragB_A + tau_theta_vec + moment_tele_A) / inertia_A
+            force_drag_B = -self.linear_drag * self.lin_vel_cam
+            moment_drag_B = -self.angular_drag * self.rot_vel_cam
+            moment_dragB_A = np.cross(r, force_drag_B)
+            self.ang_acc = (moment_dragB_A + tau_theta_vec + moment_tele_A) / inertia_A
 
-        tau_out = tau_theta_vec.copy()
-        self._last_tau = tau_theta_vec.copy()
-        self.force_B = self.mass_B * np.cross(self.ang_acc, r) - force_drag_B - self.force_teleop
-        self.force_B[2] = F_z
-        self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop
-        self.tau_B[2] = tau_roll
+            tau_out = tau_theta_vec.copy()
+            self._last_tau = tau_theta_vec.copy()
+            self.force_B = self.mass_B * np.cross(self.ang_acc, r) - force_drag_B - self.force_teleop
+            self.force_B[2] = F_z
+            self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop
+            self.tau_B[2] = tau_roll
 
-        self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
+            self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
+        else:
+            self._handle_no_measurement()
 
+        # Always build and publish wrench with at least roll torque
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
         w.header.frame_id = self.main_camera_frame
         w.wrench.torque.z = float(tau_roll)
 
-        if self.orientation_control_enabled:
-            w.wrench.force.x = float(self.force_B[0])
-            w.wrench.force.y = float(self.force_B[1])
-            w.wrench.force.z = float(self.force_B[2])
-            w.wrench.torque.x = float(self.tau_B[0])
-            w.wrench.torque.y = float(self.tau_B[1])
-        else:
-            tau_out[0] = 0.0
-            tau_out[1] = 0.0
-            self._last_tau = tau_out.copy()
-            self._last_force[0] = 0.0
-            self._last_force[1] = 0.0
+        if has_measurement:
+            if self.orientation_control_enabled:
+                w.wrench.force.x = float(self.force_B[0])
+                w.wrench.force.y = float(self.force_B[1])
+                w.wrench.force.z = float(self.force_B[2])
+                w.wrench.torque.x = float(self.tau_B[0])
+                w.wrench.torque.y = float(self.tau_B[1])
+            else:
+                tau_out[0] = 0.0
+                tau_out[1] = 0.0
+                self._last_tau = tau_out.copy()
+                self._last_force[0] = 0.0
+                self._last_force[1] = 0.0
 
-        if self.autofocus_enabled:
-            w.wrench.force.z = float(F_z)
-            print(f"Applying autofocus force F_z: {F_z:.3f} N based on focal distance error {self.focal_distance - d:.3f} m")
+            if self.autofocus_enabled:
+                w.wrench.force.z = float(F_z)
+                print(f"Applying autofocus force F_z: {F_z:.3f} N based on focal distance error {self.focal_distance - d:.3f} m")
 
         self.pub_wrench_cmd.publish(w)
+
+        if not has_measurement:
+            return
 
         # Populate OrientationControlData
         if meas_stamp is not None:
@@ -2067,8 +2082,8 @@ class OrientationControlNode(Node):
         self.ocd.k_p = float(self.Kp)
         self.ocd.k_d = float(self.Kd)
         self.ocd.k_i = float(self.Ki)
-        self.ocd.kalman_model = self.kalman_model  
-       
+        self.ocd.kalman_model = self.kalman_model
+
         with self._joint_twist_lock:
             jacobian_twist_valid = self.jacobian_twist_valid
             jac_v = self.jacobian_lin_vel_cam.copy()
