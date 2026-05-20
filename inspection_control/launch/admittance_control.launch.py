@@ -28,8 +28,8 @@ def generate_launch_description():
         default_value='autofocus.yaml',
         description='Name of controller configuration file'
     )
-    teleop_config_file = DeclareLaunchArgument(
-        'teleop_config_file',
+    controller_config_file = DeclareLaunchArgument(
+        'controller_config_file',
         default_value='xbox_controller.yaml',
         description='Name of controller configuration file'
     )
@@ -74,12 +74,12 @@ def generate_launch_description():
     teleop_config = PathJoinSubstitution([
         FindPackageShare('inspection_control'),
         'config',
-        LaunchConfiguration('teleop_config_file')
+        LaunchConfiguration('controller')
     ])
    # admittance_control_config = PathJoinSubstitution([
-      #  FindPackageShare('inspection_control'),
-      #  'config',
-      #  LaunchConfiguration('admittance_config_file')
+    #  FindPackageShare('inspection_control'),
+    #  'config',
+    #  LaunchConfiguration('admittance_config_file')
    # ])
     admittance_control_combine_config = PathJoinSubstitution([
         FindPackageShare('inspection_control'),
@@ -91,7 +91,7 @@ def generate_launch_description():
         'config',
         LaunchConfiguration('turntable_config_file')
     ])
-    
+
     particle_filter_node = Node(
         package='inspection_control',
         executable='particle_filter_node',
@@ -133,13 +133,13 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
-    #admittance_control_node = Node(
-      #  package='inspection_control',
-      #  executable='admittance_control',
-      #  name='admittance_control',
-      #  parameters=[admittance_control_config],
-      #  output='screen',
-      #  emulate_tty=True
+    # admittance_control_node = Node(
+    #  package='inspection_control',
+    #  executable='admittance_control',
+    #  name='admittance_control',
+    #  parameters=[admittance_control_config],
+    #  output='screen',
+    #  emulate_tty=True
    # )
     admittance_control_combine_node = Node(
         package='inspection_control',
@@ -165,11 +165,11 @@ def generate_launch_description():
         autofocus_config_file,
         # autofocus_node,
         joy_node,
-        teleop_config_file,
+        controller_config_file,
         admittance_config_file,
         turntable_config_file,
         teleop_node,
-       # admittance_control_node,
+        # admittance_control_node,
         admittance_control_combine_node,
         turntable_joy_node,
     ])
