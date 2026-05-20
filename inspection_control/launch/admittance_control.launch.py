@@ -159,7 +159,7 @@ def generate_launch_description():
     )
     return LaunchDescription([
         particle_filter_config_file,
-        particle_filter_node,
+        # particle_filter_node,
         orientation_config_file,
         orientation_control_node,
         autofocus_config_file,

@@ -862,6 +862,7 @@ class OrientationControlNode(Node):
         self.converter_options = ConverterOptions(input_serialization_format='cdr', output_serialization_format='cdr')
         self.writer = SequentialWriter()
         self.topic_info = TopicMetadata(
+            id=0,
             name='orientation_control_data',
             type='viewpoint_generation_interfaces/msg/OrientationControlData',
             serialization_format='cdr'
