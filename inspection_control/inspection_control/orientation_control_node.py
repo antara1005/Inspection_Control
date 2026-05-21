@@ -2012,7 +2012,7 @@ class OrientationControlNode(Node):
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
         w.header.frame_id = self.main_camera_frame
-        w.wrench.torque.z = float(tau_roll)
+        w.wrench.torque.z = float(tau_roll) if self.orientation_control_enabled else 0.0
 
         if has_measurement:
             if self.orientation_control_enabled:
