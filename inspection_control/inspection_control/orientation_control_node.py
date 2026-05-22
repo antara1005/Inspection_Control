@@ -923,7 +923,7 @@ class OrientationControlNode(Node):
         self.ocd.ddyaw_error = 0.0
 
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_info, qos)
-        self.sub_depth = self.create_subscription(CompressedImage, self.depth_topic, self.on_depth, 1,
+        self.sub_depth = self.create_subscription(CompressedImage, self.depth_topic, self.on_depth, qos,
                                                   callback_group=sub_cb_group)
         self.bbox = self.create_subscription(Marker, self.bounding_box_topic, self.on_bbox, qos)
         self.create_subscription(TwistStamped, f'/servo_node/delta_twist_cmds', self.on_delta_twist, qos)
