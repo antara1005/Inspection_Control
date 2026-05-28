@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-CSV_PATH = "/home/macs/inspection-docker/data/OrientationControlData/_1771524065/_1771524065.csv"   # <-- change if your file is elsewhere
+CSV_PATH = "/home/macs/inspection-docker/data/OrientationControlData/_1775862660/ransacflat.csv"   # <-- change if your file is elsewhere
 COL = "yaw_error_raw"  # <-- change if your column has a different name (check the CSV header)
 
 # -------------------- 1) Load CSV + extract yaw_error_raw --------------------
@@ -32,7 +32,7 @@ plt.figure()
 plt.plot(yaw)
 plt.title("yaw Error Raw - Time Series")
 plt.xlabel("Sample Index")
-plt.ylabel("yaw Error (raw)")
+plt.ylabel("Yaw Error (raw)")
 plt.grid(True)
 plt.show()
 
@@ -48,8 +48,8 @@ plt.figure()
 plt.hist(yaw_demean, bins=50, density=True, alpha=0.7)
 x = np.linspace(yaw_demean.min(), yaw_demean.max(), 1000)
 plt.plot(x, stats.norm.pdf(x, loc=mu0, scale=sigma), linewidth=2)
-plt.title("Histogram of (yaw_error_raw - mean) with Gaussian Fit")
-plt.xlabel("yaw Error (demeaned)")
+plt.title("Histogram of (yaw_error_raw - mean)")
+plt.xlabel("Yaw Error (demeaned)")
 plt.ylabel("Probability Density")
 plt.grid(True)
 plt.show()
@@ -98,7 +98,7 @@ autocorr /= autocorr[0]                               # normalize
 max_lag = min(200, autocorr.size - 1)
 plt.figure()
 plt.plot(np.arange(max_lag + 1), autocorr[: max_lag + 1])
-plt.title("Autocorrelation of (yaw_error_raw - mean) [First 200 lags]")
+plt.title("Autocorrelation of (pitch_error_raw - mean) [First 200 lags]")
 plt.xlabel("Lag (samples)")
 plt.ylabel("Normalized autocorrelation")
 plt.grid(True)
@@ -108,7 +108,7 @@ print("\nWhiteness intuition:")
 print("  If autocorrelation drops close to 0 quickly after lag 0 -> closer to white noise")
 
 # -------------------- 5) Suggested Kalman measurement noise R --------------------
-# If yaw_error_raw is your measurement y = true + v, and v ~ N(0, R),
+# If pitch_error_raw is your measurement y = true + v, and v ~ N(0, R),
 # then R ≈ variance of (demeaned) measurement noise:
 R = sigma**2
 print(f"\nSuggested measurement noise variance R ≈ sigma^2 = {R:.6g}")

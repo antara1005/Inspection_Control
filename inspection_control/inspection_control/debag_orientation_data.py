@@ -531,7 +531,58 @@ def generate_roll_control_plots(csv_filepath):
     plt.savefig(plot_filename, dpi=150)
     plt.close()
     print(f"Roll control plot saved to {plot_filename}")
+def generate_rot_acc_comparison_plot(csv_filepath):
+    df = pd.read_csv(csv_filepath)
+    csv_path = pathlib.Path(csv_filepath)
 
+    t = (df['timestamp'] - df['timestamp'].iloc[0]) / 1e9
+
+    required = [
+        'current_accel_angular_x', 'current_accel_angular_y', 'current_accel_angular_z',
+        'commanded_accel_angular_x', 'commanded_accel_angular_y', 'commanded_accel_angular_z'
+    ]
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing commanded/current angular acceleration columns:\n" +
+            "\n".join(missing)
+        )
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    axes_names = ['x', 'y', 'z']
+
+    for i, ax_name in enumerate(axes_names):
+        axes[i].plot(
+            t,
+            df[f'current_accel_angular_{ax_name}'],
+            label=f'current α_{ax_name}',
+            linewidth=1.5
+        )
+
+        axes[i].plot(
+            t,
+            df[f'commanded_accel_angular_{ax_name}'],
+            '--',
+            label=f'commanded α_{ax_name}',
+            linewidth=1.5
+        )
+
+        axes[i].set_ylabel(f'α_{ax_name} (rad/s²)')
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend(loc='upper right')
+
+    axes[0].set_title('Angular Acceleration Comparison: Current vs Commanded')
+    axes[2].set_xlabel('Time (s)')
+
+    plt.tight_layout()
+
+    plot_filename = csv_path.parent / f'{csv_path.stem}_rot_acc_current_vs_commanded.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close()
+
+    print(f"Rotational acceleration comparison plot saved to {plot_filename}")
 
 # =========================
 #  Plant Discretization
@@ -957,6 +1008,7 @@ def debag(bag_file,
 
         'jacobian_twist_linear_x', 'jacobian_twist_linear_y', 'jacobian_twist_linear_z',
         'jacobian_twist_angular_x', 'jacobian_twist_angular_y', 'jacobian_twist_angular_z',
+        'commanded_accel_angular_x', 'commanded_accel_angular_y', 'commanded_accel_angular_z',
 
     ])
 
@@ -1023,6 +1075,9 @@ def debag(bag_file,
 
             msg.jacobian_twist.twist.linear.x, msg.jacobian_twist.twist.linear.y, msg.jacobian_twist.twist.linear.z,
             msg.jacobian_twist.twist.angular.x, msg.jacobian_twist.twist.angular.y, msg.jacobian_twist.twist.angular.z,
+            msg.commanded_accel.accel.angular.x,
+            msg.commanded_accel.accel.angular.y,
+            msg.commanded_accel.accel.angular.z,
         ])
 
     csv_file.close()
@@ -1033,6 +1088,7 @@ def debag(bag_file,
     generate_velocity_accel_plots(csv_filename)
     generate_vel_acc_imu_plots(csv_filename)
     generate_velocity_accel_plots_combine(csv_filename)
+    generate_rot_acc_comparison_plot(csv_filename)
 
     # UPDATED call: Option B inside estimator
     estimate_kalman_noise_parameters(

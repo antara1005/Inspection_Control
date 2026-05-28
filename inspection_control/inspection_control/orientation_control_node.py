@@ -929,6 +929,7 @@ class OrientationControlNode(Node):
         self.create_subscription(TwistStamped, f'/servo_node/delta_twist_cmds', self.on_delta_twist, qos)
         self.create_subscription(WrenchStamped, f'/teleop/wrench_cmds', self.on_wrench_cmd, qos)
         self.create_subscription(AccelStamped, f'/admittance/accel_cmds', self.on_accel_cmd, qos)
+        self.create_subscription(AccelStamped, f'/imu_processor/accel', self.on_rotacc, qos)
     
         self.last_joy_msg = None
         self.joy_sub = self.create_subscription(Joy, joy_topic, self.joy_callback, qos)
@@ -986,6 +987,7 @@ class OrientationControlNode(Node):
         self.rot_vel_cam = np.zeros(3, dtype=np.float32)
         self.lin_acc_cam = np.zeros(3, dtype=np.float32)
         self.rot_acc_cam = np.zeros(3, dtype=np.float32)
+        self.rot_acc_cam2 = np.zeros(3, dtype=np.float32)
         self._joint_twist_lock = threading.Lock()
         self.jacobian_lin_vel_cam = np.zeros(3, dtype=np.float64)
         self.jacobian_rot_vel_cam = np.zeros(3, dtype=np.float64)
@@ -1328,6 +1330,12 @@ class OrientationControlNode(Node):
         v_tip = -R_tip_base @ v_base
         w_tip = R_tip_base @ w_base
 
+        # print("\n===== EOAT Velocity =====")
+        # print(f"Linear in base frame (m/s):   {v_base}")
+        # print(f"Angular in base frame (rad/s): {w_base}")
+        # print(f"Linear in tip frame (m/s):    {v_tip}")
+        # print(f"Angular in tip frame (rad/s):  {w_tip}")
+
         with self._joint_twist_lock:
             self.jacobian_lin_vel_cam[:] = v_tip
             self.jacobian_rot_vel_cam[:] = w_tip
@@ -1351,6 +1359,11 @@ class OrientationControlNode(Node):
         self.lin_acc_cam[0] = msg.accel.linear.x
         self.lin_acc_cam[1] = msg.accel.linear.y
         self.lin_acc_cam[2] = msg.accel.linear.z
+        self.rot_acc_cam2[0] = msg.accel.angular.x
+        self.rot_acc_cam2[1] = msg.accel.angular.y
+        self.rot_acc_cam2[2] = msg.accel.angular.z
+
+    def on_rotacc(self, msg: AccelStamped):
         self.rot_acc_cam[0] = msg.accel.angular.x
         self.rot_acc_cam[1] = msg.accel.angular.y
         self.rot_acc_cam[2] = msg.accel.angular.z
@@ -2123,6 +2136,16 @@ class OrientationControlNode(Node):
         self.ocd.current_accel.accel.angular.x = float(self.rot_acc_cam[0])
         self.ocd.current_accel.accel.angular.y = float(self.rot_acc_cam[1])
         self.ocd.current_accel.accel.angular.z = float(self.rot_acc_cam[2])
+
+        self.ocd.commanded_accel.header.stamp = self.ocd.header.stamp
+        self.ocd.commanded_accel.header.frame_id = self.main_camera_frame
+        self.ocd.commanded_accel.accel.linear.x = float(self.lin_acc_cam[0])
+        self.ocd.commanded_accel.accel.linear.y = float(self.lin_acc_cam[1])
+        self.ocd.commanded_accel.accel.linear.z = float(self.lin_acc_cam[2])
+        self.ocd.commanded_accel.accel.angular.x = float(self.rot_acc_cam2[0])
+        self.ocd.commanded_accel.accel.angular.y = float(self.rot_acc_cam2[1])
+        self.ocd.commanded_accel.accel.angular.z = float(self.rot_acc_cam2[2])
+                
 
         self.ocd.jacobian_twist.header.stamp = self.ocd.header.stamp
         self.ocd.jacobian_twist.header.frame_id = self.main_camera_frame

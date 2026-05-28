@@ -42,7 +42,7 @@ orientation_controller:
     v_max: 0.10 # Maximum linear velocity (meters/second)
     theta_max_deg: 90.0 # Maximum angular displacement (degrees)
 
-    controller_type: PID # Options: PID, PD
+    controller_type: PD # Options: PID, PD
 
     Kp: 31.0
     Ki: 37.7
@@ -57,5 +57,5 @@ orientation_controller:
 
     zeta: 1.0
     integral_alpha: 50.0
-    kalman_model: PLANT # 'PLANT' or 'CA'
+    kalman_model: KKF # 'PLANT' or 'CA'
     kalman_Q_ddangle: 1.0 # CA-only process noise for acceleration state
