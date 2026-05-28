@@ -34,6 +34,7 @@ setup(
             'admittance_control_combine = inspection_control.admittance_control_node_combine:main',
             'orientation_control_node = inspection_control.orientation_control_node:main',
             'turntable_joy_node = inspection_control.turntable_joy_node:main',
+            'tsdf_pose_node = inspection_control.tsdf_pose_node:main',
         ],
     },
 )

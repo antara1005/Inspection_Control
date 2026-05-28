@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""
+TSDF-based pose estimation node.
+
+Fuses incoming depth frames from the RealSense D405 into an Open3D
+VoxelBlockGrid TSDF expressed in a fixed `fusion_frame` (default
+`object_frame`), extracts a fused point cloud every N frames, and
+registers it against the reference CAD point cloud (FPFH + RANSAC for
+initialization, point-to-plane ICP for refinement). Publishes the
+resulting 6-DOF object pose in the configured `world_frame` and a
+synthetic depth image rendered from the registered mesh.
+"""
+
+import struct
+import threading
+import numpy as np
+import cv2
+import open3d as o3d
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rcl_interfaces.srv import GetParameters
+
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
+from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
+from std_srvs.srv import Trigger
+
+import tf2_ros
+from tf2_ros import TransformBroadcaster
+from scipy.spatial.transform import Rotation
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+UNIT_TO_METERS = {
+    "m": 1.0, "meters": 1.0,
+    "mm": 0.001, "millimeters": 0.001,
+    "cm": 0.01, "centimeters": 0.01,
+    "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
+}
+
+
+def unit_scale(unit_str: str) -> float:
+    unit_str = unit_str.strip().lower()
+    if unit_str in UNIT_TO_METERS:
+        return UNIT_TO_METERS[unit_str]
+    raise ValueError(f"Unknown unit '{unit_str}'. Supported: {list(UNIT_TO_METERS.keys())}")
+
+
+def msg_to_matrix(transform_msg: TransformStamped) -> np.ndarray:
+    """Convert geometry_msgs/TransformStamped to a 4x4 numpy matrix.
+
+    The returned matrix maps points expressed in `child_frame_id` to points
+    expressed in `header.frame_id` (i.e. the pose of the child frame
+    expressed in the parent frame).
+    """
+    t = transform_msg.transform.translation
+    q = transform_msg.transform.rotation
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+    T[0, 3] = t.x; T[1, 3] = t.y; T[2, 3] = t.z
+    return T
+
+
+def matrix_to_pose(T: np.ndarray) -> Pose:
+    q = Rotation.from_matrix(T[:3, :3]).as_quat()  # [x, y, z, w]
+    p = Pose()
+    p.position.x = float(T[0, 3])
+    p.position.y = float(T[1, 3])
+    p.position.z = float(T[2, 3])
+    p.orientation.x = float(q[0])
+    p.orientation.y = float(q[1])
+    p.orientation.z = float(q[2])
+    p.orientation.w = float(q[3])
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+
+class TSDFPoseNode(Node):
+    def __init__(self):
+        super().__init__("tsdf_pose")
+
+        # -- Parameters -----------------------------------------------------
+        self.declare_parameters("", [
+            # Frames
+            ("fusion_frame",                "object_frame"),
+            ("world_frame",                 "world"),
+            ("model_frame",                 "model_frame"),
+            ("publish_tf",                  True),
+
+            # TSDF integration (VoxelBlockGrid)
+            ("voxel_size",                  0.003),    # m
+            ("sdf_trunc_mult",              4.0),      # sdf_trunc = mult * voxel_size
+            ("block_resolution",            16),
+            ("block_count",                 10000),
+            ("integration_device",          "CUDA:0"),  # "CUDA:0" if available
+            ("integrate_every_n_frames",    1),
+
+            # Depth sensor
+            ("depth_min",                   0.07),     # m
+            ("depth_max",                   0.50),     # m
+            ("depth_max_integration",       0.50),     # m – truncate depth before integrating
+
+            # Registration cadence
+            ("register_every_n_frames",     30),
+            ("min_integrations_before_register", 10),
+
+            # Registration: downsampling
+            ("fused_voxel_size",            0.003),    # m
+            ("reference_voxel_size",        0.003),    # m
+
+            # Registration: features
+            ("normal_radius_mult",          2.0),      # * voxel_size
+            ("fpfh_radius_mult",            5.0),      # * voxel_size
+
+            # Registration: RANSAC
+            ("ransac_distance_mult",        1.5),      # * voxel_size
+            ("ransac_max_iterations",       100000),
+            ("ransac_confidence",           0.999),
+
+            # Registration: ICP
+            ("icp_distance_mult",           1.5),      # * voxel_size
+            ("icp_max_iterations",          50),
+            ("icp_fitness_min",             0.3),
+
+            # External
+            ("viewpoint_generation_node",   "viewpoint_generation"),
+
+            # Topics
+            ("pose_topic",                  "tsdf_pose/pose"),
+            ("fused_cloud_topic",           "tsdf_pose/fused_cloud"),
+            ("synthetic_depth_topic",       "tsdf_pose/depth/synthetic"),
+        ])
+
+        # Convert to attributes
+        gp = self.get_parameter
+        self.fusion_frame    = gp("fusion_frame").value
+        self.world_frame     = gp("world_frame").value
+        self.model_frame     = gp("model_frame").value
+        self.publish_tf      = gp("publish_tf").value
+
+        self.voxel_size      = float(gp("voxel_size").value)
+        self.sdf_trunc       = float(gp("sdf_trunc_mult").value) * self.voxel_size
+        self.block_resolution = int(gp("block_resolution").value)
+        self.block_count     = int(gp("block_count").value)
+        self.device_str      = gp("integration_device").value
+        self.integrate_every = int(gp("integrate_every_n_frames").value)
+
+        self.depth_min       = float(gp("depth_min").value)
+        self.depth_max       = float(gp("depth_max").value)
+        self.depth_max_int   = float(gp("depth_max_integration").value)
+
+        self.register_every  = int(gp("register_every_n_frames").value)
+        self.min_int_before_reg = int(gp("min_integrations_before_register").value)
+
+        self.fused_voxel     = float(gp("fused_voxel_size").value)
+        self.ref_voxel       = float(gp("reference_voxel_size").value)
+
+        self.normal_r_mult   = float(gp("normal_radius_mult").value)
+        self.fpfh_r_mult     = float(gp("fpfh_radius_mult").value)
+
+        self.ransac_dist_mult = float(gp("ransac_distance_mult").value)
+        self.ransac_max_iter = int(gp("ransac_max_iterations").value)
+        self.ransac_conf     = float(gp("ransac_confidence").value)
+
+        self.icp_dist_mult   = float(gp("icp_distance_mult").value)
+        self.icp_max_iter    = int(gp("icp_max_iterations").value)
+        self.icp_fitness_min = float(gp("icp_fitness_min").value)
+
+        self.vg_node_name    = gp("viewpoint_generation_node").value
+
+        # -- State ----------------------------------------------------------
+        self.intrinsics = None       # dict with fx, fy, cx, cy, width, height
+        self.camera_frame = None
+        self.mesh = None             # o3d.geometry.TriangleMesh (metres, model frame)
+        self.ray_scene = None        # o3d.t.geometry.RaycastingScene for synth depth
+        self.ref_cloud = None        # o3d.geometry.PointCloud (downsampled, with normals)
+        self.ref_fpfh = None         # FPFH feature for global registration
+
+        self.device = o3d.core.Device(self.device_str)
+        self.vbg = None              # o3d.t.geometry.VoxelBlockGrid
+        self.frame_count = 0
+        self.integration_count = 0
+        self.have_global_init = False
+        self.T_model_in_fusion = None   # latest pose estimate (4x4)
+        self.last_pose_stamp = None
+
+        self.model_ready = False
+        self.integ_lock = threading.Lock()
+        self.reg_lock = threading.Lock()
+        self.processing_reg = False
+
+        # -- TF -------------------------------------------------------------
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
+
+        # -- QoS Profiles ------------------------------------------------------
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
+        )
+
+        # -- Publishers -----------------------------------------------------
+        synth_topic = gp("synthetic_depth_topic").value
+        pose_topic  = gp("pose_topic").value
+        cloud_topic = gp("fused_cloud_topic").value
+        self.pose_pub  = self.create_publisher(PoseStamped,    pose_topic,                  10)
+        self.cloud_pub = self.create_publisher(PointCloud2,    cloud_topic,                 10)
+        self.depth_pub = self.create_publisher(Image,          synth_topic,                 10)
+        self.depth_compressed_pub = self.create_publisher(
+            CompressedImage, synth_topic + "/compressedDepth", 10)
+        self.camera_info_pub = self.create_publisher(
+            CameraInfo, "tsdf_pose/depth/camera_info", 10)
+
+        # -- Subscribers ----------------------------------------------------
+        self._depth_cb_group = ReentrantCallbackGroup()
+        self.create_subscription(
+            CameraInfo,
+            "/camera/d405_camera/depth/camera_info",
+            self._camera_info_cb, qos)
+        self.create_subscription(
+            CompressedImage,
+            "/camera/d405_camera/depth/image_rect_raw/compressedDepth",
+            self._depth_cb, qos,
+            callback_group=self._depth_cb_group)
+
+        # -- Services -------------------------------------------------------
+        self.create_service(Trigger, "tsdf_pose/reset", self._on_reset)
+        self.create_service(Trigger, "tsdf_pose/register_now", self._on_register_now)
+
+        # -- Fetch model paths from viewpoint_generation node ---------------
+        self._param_client = self.create_client(
+            GetParameters, f"/{self.vg_node_name}/get_parameters")
+        self._current_mesh_file  = None
+        self._current_mesh_units = None
+        self._current_pc_file    = None
+        self._current_pc_units   = None
+
+        self.get_logger().info(
+            "Polling viewpoint_generation for model parameters every 5 s …")
+        self.create_timer(5.0, self._poll_model_params)
+
+    # -----------------------------------------------------------------------
+    # Model loading (mirrors particle_filter_node)
+    # -----------------------------------------------------------------------
+
+    def _poll_model_params(self):
+        if not self._param_client.service_is_ready():
+            self.get_logger().info(
+                "viewpoint_generation parameter service not ready yet, retrying …",
+                throttle_duration_sec=10.0)
+            return
+        request = GetParameters.Request()
+        request.names = [
+            "model.mesh.file", "model.mesh.units",
+            "model.point_cloud.file", "model.point_cloud.units",
+        ]
+        future = self._param_client.call_async(request)
+        future.add_done_callback(self._on_model_params)
+
+    def _on_model_params(self, future):
+        try:
+            result = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Failed to get parameters: {e}")
+            return
+
+        values = result.values
+        mesh_file  = values[0].string_value
+        mesh_units = values[1].string_value
+        pc_file    = values[2].string_value
+        pc_units   = values[3].string_value
+
+        if not mesh_file or not pc_file:
+            self.get_logger().info(
+                "Model file paths not yet set in viewpoint_generation, waiting …",
+                throttle_duration_sec=10.0)
+            return
+
+        changed = (mesh_file  != self._current_mesh_file  or
+                   mesh_units != self._current_mesh_units or
+                   pc_file    != self._current_pc_file    or
+                   pc_units   != self._current_pc_units)
+        if not changed:
+            return
+
+        if self._current_mesh_file is not None:
+            self.get_logger().info(
+                "Model parameters changed – reinitialising TSDF and reference cloud …")
+
+        self.get_logger().info(f"Mesh : {mesh_file} ({mesh_units})")
+        self.get_logger().info(f"Cloud: {pc_file} ({pc_units})")
+
+        try:
+            self.model_ready = False
+            self._load_models(mesh_file, mesh_units, pc_file, pc_units)
+            self._reset_tsdf()
+            self._current_mesh_file  = mesh_file
+            self._current_mesh_units = mesh_units
+            self._current_pc_file    = pc_file
+            self._current_pc_units   = pc_units
+            self.model_ready = True
+            self.get_logger().info("Model loaded; TSDF ready for integration.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load models: {e}")
+
+    def _load_models(self, mesh_path, mesh_units, pc_path, pc_units):
+        # Mesh (for raycast / synthetic depth)
+        mesh = o3d.io.read_triangle_mesh(mesh_path)
+        if mesh.is_empty():
+            raise RuntimeError(f"Failed to load mesh from {mesh_path}")
+        mesh.scale(unit_scale(mesh_units), center=(0, 0, 0))
+        mesh.compute_vertex_normals()
+        self.mesh = mesh
+
+        mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh)
+        self.ray_scene = o3d.t.geometry.RaycastingScene()
+        self.ray_scene.add_triangles(mesh_t)
+
+        # Reference point cloud (for registration target/source)
+        pcd = o3d.io.read_point_cloud(pc_path)
+        if pcd.is_empty():
+            raise RuntimeError(f"Failed to load point cloud from {pc_path}")
+        pcd.scale(unit_scale(pc_units), center=(0, 0, 0))
+        ref_down = pcd.voxel_down_sample(self.ref_voxel)
+        ref_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.ref_voxel * self.normal_r_mult, max_nn=30))
+        self.ref_cloud = ref_down
+        self.ref_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            ref_down,
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.ref_voxel * self.fpfh_r_mult, max_nn=100))
+        self.get_logger().info(
+            f"Reference cloud: {len(ref_down.points)} points "
+            f"(voxel {self.ref_voxel*1e3:.1f} mm), FPFH ready")
+
+    def _reset_tsdf(self):
+        """Clear the voxel grid and reset pose / counters."""
+        self.vbg = o3d.t.geometry.VoxelBlockGrid(
+            attr_names=('tsdf', 'weight'),
+            attr_dtypes=(o3d.core.float32, o3d.core.float32),
+            attr_channels=((1), (1)),
+            voxel_size=self.voxel_size,
+            block_resolution=self.block_resolution,
+            block_count=self.block_count,
+            device=self.device,
+        )
+        self.integration_count = 0
+        self.frame_count = 0
+        self.have_global_init = False
+        self.T_model_in_fusion = None
+
+    # -----------------------------------------------------------------------
+    # Callbacks
+    # -----------------------------------------------------------------------
+
+    def _camera_info_cb(self, msg: CameraInfo):
+        K = msg.k
+        self.intrinsics = {
+            "fx": K[0], "fy": K[4], "cx": K[2], "cy": K[5],
+            "width": msg.width, "height": msg.height,
+        }
+        self.camera_frame = msg.header.frame_id
+        self.camera_info_pub.publish(msg)
+
+    def _depth_cb(self, msg: CompressedImage):
+        if not self.model_ready or self.intrinsics is None:
+            return
+
+        self.frame_count += 1
+        do_integrate = (self.frame_count % max(1, self.integrate_every) == 0)
+        if do_integrate:
+            try:
+                self._integrate_frame(msg)
+            except Exception as e:
+                self.get_logger().error(f"Integration error: {e}",
+                                        throttle_duration_sec=2.0)
+
+        # Registration (non-blocking guard)
+        if (self.integration_count >= self.min_int_before_reg and
+                self.integration_count % max(1, self.register_every) == 0):
+            with self.reg_lock:
+                if not self.processing_reg:
+                    self.processing_reg = True
+                    try:
+                        self._run_registration(msg.header.stamp)
+                    except Exception as e:
+                        self.get_logger().error(f"Registration error: {e}",
+                                                throttle_duration_sec=2.0)
+                    finally:
+                        self.processing_reg = False
+
+        # Render synthetic depth at the latest known pose for every frame
+        if self.T_model_in_fusion is not None:
+            try:
+                self._render_synthetic_depth(msg)
+            except Exception as e:
+                self.get_logger().warn(f"Render failed: {e}",
+                                       throttle_duration_sec=2.0)
+
+    def _on_reset(self, _request, response):
+        with self.integ_lock:
+            self._reset_tsdf()
+        response.success = True
+        response.message = "TSDF reset."
+        self.get_logger().info("TSDF reset via service.")
+        return response
+
+    def _on_register_now(self, _request, response):
+        if self.integration_count < self.min_int_before_reg:
+            response.success = False
+            response.message = (
+                f"Need at least {self.min_int_before_reg} integrated frames; "
+                f"have {self.integration_count}.")
+            return response
+        with self.reg_lock:
+            if self.processing_reg:
+                response.success = False
+                response.message = "Registration already in progress."
+                return response
+            self.processing_reg = True
+        try:
+            ok = self._run_registration(self.get_clock().now().to_msg(),
+                                        force_global=True)
+            response.success = bool(ok)
+            response.message = "Registration complete." if ok else "Registration failed."
+        finally:
+            with self.reg_lock:
+                self.processing_reg = False
+        return response
+
+    # -----------------------------------------------------------------------
+    # Integration
+    # -----------------------------------------------------------------------
+
+    def _integrate_frame(self, msg: CompressedImage):
+        depth_raw, depth_scale = self._decode_compressed_depth(msg)
+        if depth_raw is None:
+            return
+
+        # TF: pose of camera expressed in fusion frame, then invert for extrinsic
+        try:
+            tf_cam_in_fusion = self.tf_buffer.lookup_transform(
+                self.fusion_frame, self.camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1))
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(f"TF lookup ({self.fusion_frame} <- {self.camera_frame}) failed: {e}",
+                                   throttle_duration_sec=2.0)
+            return
+
+        T_cam_in_fusion = msg_to_matrix(tf_cam_in_fusion)
+        # VoxelBlockGrid integrate expects extrinsic = world->camera, i.e. fusion->cam
+        extrinsic_np = np.linalg.inv(T_cam_in_fusion)
+
+        # Clamp depth to integration range (zero out invalid pixels)
+        depth_clipped = depth_raw.copy()
+        depth_m = depth_clipped * depth_scale
+        invalid = (depth_m < self.depth_min) | (depth_m > self.depth_max_int)
+        depth_clipped[invalid] = 0
+
+        fx = self.intrinsics["fx"]; fy = self.intrinsics["fy"]
+        cx = self.intrinsics["cx"]; cy = self.intrinsics["cy"]
+        intrinsic = o3d.core.Tensor(
+            [[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=o3d.core.float64)
+        extrinsic = o3d.core.Tensor(extrinsic_np, dtype=o3d.core.float64)
+
+        # Depth tensor MUST be on the same device as the VBG
+        depth_o3d = o3d.t.geometry.Image(
+            o3d.core.Tensor(depth_clipped, device=self.device))
+
+        # depth_scale here converts raw values -> metres (Open3D's convention)
+        # For uint16 depth at 1mm/unit, depth_scale=1000.0
+        ds_for_o3d = 1.0 / depth_scale  # convert "metres per raw unit" -> "raw units per metre"
+
+        with self.integ_lock:
+            frustum = self.vbg.compute_unique_block_coordinates(
+                depth_o3d, intrinsic, extrinsic, ds_for_o3d, self.depth_max_int)
+            self.vbg.integrate(
+                frustum, depth_o3d, intrinsic, extrinsic, ds_for_o3d, self.depth_max_int)
+        self.integration_count += 1
+
+    # -----------------------------------------------------------------------
+    # Registration
+    # -----------------------------------------------------------------------
+
+    def _extract_fused_cloud(self):
+        with self.integ_lock:
+            pcd_t = self.vbg.extract_point_cloud()
+        # extract_point_cloud may return zero points if no surface intersected
+        pcd_legacy = pcd_t.to_legacy()
+        if len(pcd_legacy.points) == 0:
+            return None
+        pcd_down = pcd_legacy.voxel_down_sample(self.fused_voxel)
+        # TODO: Filter out unwanted points here
+        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
+        max_bound = np.array([0.1, 0.1, np.inf], dtype=np.float64)
+        pcd_down_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
+        pcd_down = pcd_down.crop(bounding_box=pcd_down_bbox)
+        pcd_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.fused_voxel * self.normal_r_mult, max_nn=30))
+        return pcd_down
+
+    def _run_registration(self, stamp, force_global: bool = False) -> bool:
+        fused = self._extract_fused_cloud()
+        if fused is None or len(fused.points) < 100:
+            self.get_logger().warn(
+                f"Fused cloud has too few points "
+                f"({0 if fused is None else len(fused.points)}); skipping registration.",
+                throttle_duration_sec=2.0)
+            return False
+
+        self._publish_cloud(fused, stamp)
+
+        do_global = force_global or (not self.have_global_init)
+        if do_global:
+            self.get_logger().info("Running global FPFH+RANSAC initialisation …")
+            init_T = self._global_register(fused)
+            if init_T is None:
+                self.get_logger().warn("Global registration failed.")
+                return False
+        else:
+            init_T = self.T_model_in_fusion
+
+        # ICP refinement (point-to-plane). Source = reference, target = fused.
+        icp_dist = self.voxel_size * self.icp_dist_mult
+        icp_result = o3d.pipelines.registration.registration_icp(
+            self.ref_cloud, fused, icp_dist, init_T,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=self.icp_max_iter))
+
+        if icp_result.fitness < self.icp_fitness_min:
+            self.get_logger().warn(
+                f"ICP fitness {icp_result.fitness:.3f} below threshold "
+                f"{self.icp_fitness_min:.3f}; rejecting result.",
+                throttle_duration_sec=2.0)
+            return False
+
+        self.T_model_in_fusion = np.array(icp_result.transformation)
+        self.have_global_init = True
+        self.last_pose_stamp = stamp
+
+        self._publish_pose(self.T_model_in_fusion, stamp)
+        self.get_logger().info(
+            f"Registered pose: fitness={icp_result.fitness:.3f} "
+            f"inlier_rmse={icp_result.inlier_rmse*1e3:.2f} mm "
+            f"t=({self.T_model_in_fusion[0,3]:.3f},"
+            f"{self.T_model_in_fusion[1,3]:.3f},"
+            f"{self.T_model_in_fusion[2,3]:.3f})")
+        return True
+
+    def _global_register(self, fused: o3d.geometry.PointCloud):
+        # FPFH for the fused cloud
+        fused_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            fused,
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.fused_voxel * self.fpfh_r_mult, max_nn=100))
+
+        dist = self.voxel_size * self.ransac_dist_mult
+        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            self.ref_cloud, fused, self.ref_fpfh, fused_fpfh,
+            mutual_filter=True,
+            max_correspondence_distance=dist,
+            estimation_method=o3d.pipelines.registration
+                .TransformationEstimationPointToPoint(False),
+            ransac_n=3,
+            checkers=[
+                o3d.pipelines.registration
+                    .CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration
+                    .CorrespondenceCheckerBasedOnDistance(dist),
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                self.ransac_max_iter, self.ransac_conf))
+
+        if result.fitness == 0.0:
+            return None
+        return np.array(result.transformation)
+
+    # -----------------------------------------------------------------------
+    # Depth decoding
+    # -----------------------------------------------------------------------
+
+    def _decode_compressed_depth(self, msg: CompressedImage):
+        """Decode compressed/compressedDepth image -> (raw_array, metres_per_unit).
+
+        Returns (raw_uint_array, scale_to_metres) or (None, None) on failure.
+        For 16UC1 depth (D405 default), raw is uint16 with scale 1e-3.
+        """
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        if np_arr.size == 0:
+            return None, None
+
+        if "compressedDepth" in msg.format:
+            if np_arr.size <= 12:
+                return None, None
+            png_data = np_arr[12:]
+        else:
+            png_data = np_arr
+
+        depth = cv2.imdecode(png_data, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return None, None
+
+        if depth.dtype == np.uint16:
+            return depth, 1e-3
+        # Float depth (already in metres) — promote to uint16 mm so the
+        # tensor pipeline can use a single common code path.
+        depth_u16 = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+        return depth_u16, 1e-3
+
+    # -----------------------------------------------------------------------
+    # Publishing
+    # -----------------------------------------------------------------------
+
+    def _publish_cloud(self, pcd: o3d.geometry.PointCloud, stamp):
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.fusion_frame
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.data = pts.tobytes()
+        self.cloud_pub.publish(msg)
+
+    def _publish_pose(self, T_model_in_fusion: np.ndarray, stamp):
+        """Publish T_model_in_world by composing with TF (world <- fusion)."""
+        # Default to publishing in fusion_frame if world TF is missing
+        out_frame = self.world_frame
+        T_to_publish = T_model_in_fusion
+
+        if self.world_frame and self.world_frame != self.fusion_frame:
+            try:
+                tf_fusion_in_world = self.tf_buffer.lookup_transform(
+                    self.world_frame, self.fusion_frame,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.05))
+                T_fusion_in_world = msg_to_matrix(tf_fusion_in_world)
+                T_to_publish = T_fusion_in_world @ T_model_in_fusion
+            except (tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException) as e:
+                self.get_logger().warn(
+                    f"TF ({self.world_frame} <- {self.fusion_frame}) failed; "
+                    f"publishing pose in {self.fusion_frame}: {e}",
+                    throttle_duration_sec=5.0)
+                out_frame = self.fusion_frame
+
+        ps = PoseStamped()
+        ps.header.stamp = stamp
+        ps.header.frame_id = out_frame
+        ps.pose = matrix_to_pose(T_to_publish)
+        self.pose_pub.publish(ps)
+
+        if self.publish_tf and self.tf_broadcaster is not None:
+            ts = TransformStamped()
+            ts.header.stamp = stamp
+            ts.header.frame_id = out_frame
+            ts.child_frame_id = self.model_frame
+            ts.transform.translation.x = float(T_to_publish[0, 3])
+            ts.transform.translation.y = float(T_to_publish[1, 3])
+            ts.transform.translation.z = float(T_to_publish[2, 3])
+            q = Rotation.from_matrix(T_to_publish[:3, :3]).as_quat()
+            ts.transform.rotation.x = float(q[0])
+            ts.transform.rotation.y = float(q[1])
+            ts.transform.rotation.z = float(q[2])
+            ts.transform.rotation.w = float(q[3])
+            self.tf_broadcaster.sendTransform(ts)
+
+    # -----------------------------------------------------------------------
+    # Synthetic depth render (for visualisation / sanity check)
+    # -----------------------------------------------------------------------
+
+    def _render_synthetic_depth(self, msg: CompressedImage):
+        try:
+            tf_cam_in_fusion = self.tf_buffer.lookup_transform(
+                self.fusion_frame, self.camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.01))
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return
+
+        T_cam_in_fusion = msg_to_matrix(tf_cam_in_fusion)
+        T_fusion_in_cam = np.linalg.inv(T_cam_in_fusion)
+        # Render the mesh (in its model frame) seen from the camera:
+        # extrinsic = world(model)->camera = fusion->cam * model->fusion
+        T_model_to_cam = T_fusion_in_cam @ self.T_model_in_fusion
+
+        fx = self.intrinsics["fx"]; fy = self.intrinsics["fy"]
+        cx = self.intrinsics["cx"]; cy = self.intrinsics["cy"]
+        w  = self.intrinsics["width"]; h = self.intrinsics["height"]
+
+        intrinsic_t = o3d.core.Tensor(
+            [[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=o3d.core.float64)
+        extrinsic_t = o3d.core.Tensor(T_model_to_cam, dtype=o3d.core.float64)
+
+        rays = self.ray_scene.create_rays_pinhole(intrinsic_t, extrinsic_t, w, h)
+        result = self.ray_scene.cast_rays(rays)
+        t_hit = result["t_hit"].numpy()
+
+        u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
+        dx = (u_grid - cx) / fx
+        dy = (v_grid - cy) / fy
+        cos_factor = 1.0 / np.sqrt(dx**2 + dy**2 + 1.0)
+        z_depth = t_hit * cos_factor
+
+        z_depth[~np.isfinite(z_depth)] = 0.0
+        depth_uint16 = (z_depth * 1000.0).astype(np.uint16)
+
+        img = Image()
+        img.header.stamp = msg.header.stamp
+        img.header.frame_id = self.camera_frame
+        img.height = h; img.width = w
+        img.encoding = "16UC1"
+        img.is_bigendian = False
+        img.step = w * 2
+        img.data = depth_uint16.tobytes()
+        self.depth_pub.publish(img)
+
+        ok, png_buf = cv2.imencode(".png", depth_uint16)
+        if ok:
+            config_header = struct.pack("<iff", 0, 0.0, 0.0)
+            comp = CompressedImage()
+            comp.header = img.header
+            comp.format = "16UC1; compressedDepth png"
+            comp.data = config_header + png_buf.tobytes()
+            self.depth_compressed_pub.publish(comp)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TSDFPoseNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

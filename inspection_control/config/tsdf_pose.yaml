@@ -1,0 +1,50 @@
+tsdf_pose:
+  ros__parameters:
+    # -- Frames --
+    fusion_frame: "object_frame"      # frame in which the TSDF is built
+    world_frame:  "world"             # pose is published in this frame
+    model_frame:  "model_frame"       # TF child frame for the registered model
+    publish_tf:   true                # also broadcast world->model_frame TF
+
+    # -- TSDF integration (Open3D VoxelBlockGrid) --
+    voxel_size:                 0.003     # m
+    sdf_trunc_mult:             4.0       # sdf_trunc = mult * voxel_size
+    block_resolution:           16
+    block_count:                10000
+    integration_device:         "CPU:0"   # "CUDA:0" if Open3D was built with CUDA
+    integrate_every_n_frames:   1
+
+    # -- Depth sensor --
+    depth_min:                  0.07      # m – D405 min usable range
+    depth_max:                  0.50      # m – D405 max usable range
+    depth_max_integration:      0.50      # m – TSDF truncates beyond this
+
+    # -- Registration cadence --
+    register_every_n_frames:    30        # ICP refinement period (frames)
+    min_integrations_before_register: 10  # need enough fused surface first
+
+    # -- Registration: downsampling --
+    fused_voxel_size:           0.003     # m – downsample fused cloud
+    reference_voxel_size:       0.003     # m – downsample reference CAD cloud
+
+    # -- Registration: features --
+    normal_radius_mult:         2.0       # * voxel_size for normal estimation
+    fpfh_radius_mult:           5.0       # * voxel_size for FPFH descriptor
+
+    # -- Registration: RANSAC (global init) --
+    ransac_distance_mult:       1.5       # * voxel_size
+    ransac_max_iterations:      100000
+    ransac_confidence:          0.999
+
+    # -- Registration: ICP (refinement) --
+    icp_distance_mult:          1.5       # * voxel_size
+    icp_max_iterations:         50
+    icp_fitness_min:            0.3       # reject result below this fitness
+
+    # -- External --
+    viewpoint_generation_node: "viewpoint_generation"
+
+    # -- Topics --
+    pose_topic:             "tsdf_pose/pose"
+    fused_cloud_topic:      "tsdf_pose/fused_cloud"
+    synthetic_depth_topic:  "tsdf_pose/depth/synthetic"
