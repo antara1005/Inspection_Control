@@ -26,6 +26,6 @@ admittance_control:
     
     # Topic names
     wrench_topic: "/teleop/wrench_cmds"
-    wrench_teleop_topic: "/teleop/wrench_cmds"
-    wrench_orientation_topic: "/orientation_controller/wrench_cmds"
-    twist_topic: "/servo_node/delta_twist_cmds"  # Updated topic for inspection cell
+    teleop_wrench_topic: "/teleop/wrench_cmds"
+    orientation_wrench_topic: "/orientation_controller/wrench_cmds"
+    servo_twist_topic: "/servo_node/delta_twist_cmds"  # Updated topic for inspection cell

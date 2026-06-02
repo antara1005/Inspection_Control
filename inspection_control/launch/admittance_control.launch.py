@@ -13,11 +13,6 @@ def generate_launch_description():
     """Generate launch description for teleop_twist_stamped_joy node."""
 
     # Launch arguments
-    particle_filter_config_file = DeclareLaunchArgument(
-        'particle_filter_config_file',
-        default_value='particle_filter.yaml',
-        description='Name of particle filter configuration file'
-    )
     orientation_config_file = DeclareLaunchArgument(
         'orientation_config_file',
         default_value='orientation_controller.yaml',
@@ -76,12 +71,7 @@ def generate_launch_description():
         'config',
         LaunchConfiguration('controller')
     ])
-   # admittance_control_config = PathJoinSubstitution([
-    #  FindPackageShare('inspection_control'),
-    #  'config',
-    #  LaunchConfiguration('admittance_config_file')
-   # ])
-    admittance_control_combine_config = PathJoinSubstitution([
+    admittance_control_config = PathJoinSubstitution([
         FindPackageShare('inspection_control'),
         'config',
         LaunchConfiguration('admittance_config_file')
@@ -92,14 +82,6 @@ def generate_launch_description():
         LaunchConfiguration('turntable_config_file')
     ])
 
-    particle_filter_node = Node(
-        package='inspection_control',
-        executable='particle_filter_node',
-        name='particle_filter',
-        parameters=[particle_filter_config],
-        output='screen',
-        emulate_tty=True
-    )
     orientation_control_node = Node(
         package='inspection_control',
         executable='orientation_control_node',
@@ -114,17 +96,14 @@ def generate_launch_description():
         executable="joy_node",
         name='joy'
     )
-
-    # autofocus_node = Node(
-    #     package="inspection_control",
-    #     executable="autofocus_node",
-    #     name="autofocus",
-    #     parameters=[autofocus_config],
-    #     output="screen",
-    #     emulate_tty=True
-    # )
-
-    # Teleop node
+    autofocus_node = Node(
+        package="inspection_control",
+        executable="autofocus_node",
+        name="autofocus",
+        parameters=[autofocus_config],
+        output="screen",
+        emulate_tty=True
+    )
     teleop_node = Node(
         package='inspection_control',
         executable='teleop',
@@ -133,19 +112,11 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
-    # admittance_control_node = Node(
-    #  package='inspection_control',
-    #  executable='admittance_control',
-    #  name='admittance_control',
-    #  parameters=[admittance_control_config],
-    #  output='screen',
-    #  emulate_tty=True
-   # )
-    admittance_control_combine_node = Node(
+    admittance_control_node = Node(
         package='inspection_control',
-        executable='admittance_control_combine',
+        executable='admittance_control_node',
         name='admittance_control',
-        parameters=[admittance_control_combine_config],
+        parameters=[admittance_control_config],
         output='screen',
         emulate_tty=True
     )
@@ -157,9 +128,14 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
+    servo_logger_node = Node(
+        package='inspection_control',
+        executable='servo_logger',
+        name='servo_logger',
+        output='screen',
+        emulate_tty=True
+    )
     return LaunchDescription([
-        particle_filter_config_file,
-        # particle_filter_node,
         orientation_config_file,
         orientation_control_node,
         autofocus_config_file,
@@ -169,7 +145,7 @@ def generate_launch_description():
         admittance_config_file,
         turntable_config_file,
         teleop_node,
-        # admittance_control_node,
-        admittance_control_combine_node,
+        admittance_control_node,
         turntable_joy_node,
+        servo_logger_node,
     ])

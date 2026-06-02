@@ -8,6 +8,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import WrenchStamped, TwistStamped, AccelStamped  # <-- ADD
 
+
 class AdmittanceControlNode(Node):
     def __init__(self):
         super().__init__('admittance_control')
@@ -15,15 +16,14 @@ class AdmittanceControlNode(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('publish_rate', 50.0),
-                ('sphere_mass', 5.0),
-                ('sphere_radius', 0.1),
-                ('fluid_viscosity', 0.0010016),
+                ('publish_rate', 10.0),
+                ('sphere_mass', 2.5),
+                ('sphere_radius', 0.65),
+                ('fluid_viscosity', 1.0),
                 ('frame_id', 'eoat_camera_link'),
-                ('wrench_topic', '/teleop/wrench_cmds'),
-                ('wrench_teleop_topic', '/teleop/wrench_cmds'),
-                ('wrench_orientation_topic', '/orientation_controller/wrench_cmds'),
-                ('twist_topic', '/servo_node/delta_twist_cmds'),
+                ('teleop_wrench_topic', '/teleop/wrench_cmds'),
+                ('orientation_wrench_topic', '/orientation_controller/wrench_cmds'),
+                ('servo_twist_topic', '/servo_node/delta_twist_cmds'),
 
                 # NEW: accel topic
                 ('accel_topic', '/admittance/accel_cmds'),
@@ -36,19 +36,25 @@ class AdmittanceControlNode(Node):
         self.publish_rate = float(self.get_parameter('publish_rate').value)
         self.mass = float(self.get_parameter('sphere_mass').value)
         self.sphere_radius = float(self.get_parameter('sphere_radius').value)
-        self.fluid_viscosity = float(self.get_parameter('fluid_viscosity').value)
-        self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+        self.fluid_viscosity = float(
+            self.get_parameter('fluid_viscosity').value)
+        self.update_inertia_and_drag(
+            self.mass, self.sphere_radius, self.fluid_viscosity)
 
         self.frame_id = str(self.get_parameter('frame_id').value)
-        wrench_teleop_topic = str(self.get_parameter('wrench_teleop_topic').value)
-        wrench_orientation_topic = str(self.get_parameter('wrench_orientation_topic').value)
-        twist_topic = str(self.get_parameter('twist_topic').value)
+        teleop_wrench_topic = str(
+            self.get_parameter('teleop_wrench_topic').value)
+        orientation_wrench_topic = str(
+            self.get_parameter('orientation_wrench_topic').value)
+        servo_twist_topic = str(self.get_parameter('servo_twist_topic').value)
 
         # NEW: accel topic
         accel_topic = str(self.get_parameter('accel_topic').value)
 
-        self.max_linear_speed = float(self.get_parameter('max_linear_speed').value)
-        self.max_angular_speed = float(self.get_parameter('max_angular_speed').value)
+        self.max_linear_speed = float(
+            self.get_parameter('max_linear_speed').value)
+        self.max_angular_speed = float(
+            self.get_parameter('max_angular_speed').value)
 
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -56,23 +62,25 @@ class AdmittanceControlNode(Node):
             depth=10
         )
 
-        self.twist_pub = self.create_publisher(TwistStamped, twist_topic, qos_profile)
+        self.twist_pub = self.create_publisher(
+            TwistStamped, servo_twist_topic, qos_profile)
 
         # NEW: accel publisher
-        self.accel_pub = self.create_publisher(AccelStamped, accel_topic, qos_profile)
+        self.accel_pub = self.create_publisher(
+            AccelStamped, accel_topic, qos_profile)
 
         self.teleop_sub = self.create_subscription(
-            WrenchStamped, wrench_teleop_topic, self.wrench_callback_teleop, qos_profile
+            WrenchStamped, teleop_wrench_topic, self.wrench_callback_teleop, qos_profile
         )
         self.orient_sub = self.create_subscription(
-            WrenchStamped, wrench_orientation_topic, self.wrench_callback_orientation, qos_profile
+            WrenchStamped, orientation_wrench_topic, self.wrench_callback_orientation, qos_profile
         )
 
-        self.linear_vel  = [0.0, 0.0, 0.0]
+        self.linear_vel = [0.0, 0.0, 0.0]
         self.angular_vel = [0.0, 0.0, 0.0]
 
         # NEW: store last computed accelerations (optional, but convenient)
-        self.linear_accel  = [0.0, 0.0, 0.0]   # m/s^2
+        self.linear_accel = [0.0, 0.0, 0.0]   # m/s^2
         self.angular_accel = [0.0, 0.0, 0.0]   # rad/s^2
 
         self.teleop_F = [0.0, 0.0, 0.0]
@@ -90,14 +98,16 @@ class AdmittanceControlNode(Node):
         self.current_accel.header.frame_id = self.frame_id
 
         self.last_time = None
-        self.timer = self.create_timer(1.0 / self.publish_rate, self.publish_twist)
+        self.timer = self.create_timer(
+            1.0 / self.publish_rate, self.publish_twist)
 
         self.add_on_set_parameters_callback(self._on_param_update)
 
     def update_inertia_and_drag(self, mass: float, radius: float, fluid_viscosity: float):
         self.inertia = (2.0 / 5.0) * mass * (radius ** 2)
         self.linear_drag = 6.0 * 3.141592653589793 * fluid_viscosity * radius
-        self.angular_drag = 2.4 * 3.141592653589793 * fluid_viscosity * (radius ** 3)
+        self.angular_drag = 2.4 * 3.141592653589793 * \
+            fluid_viscosity * (radius ** 3)
 
     def wrench_callback_teleop(self, msg: WrenchStamped):
         self.teleop_F[0], self.teleop_F[1], self.teleop_F[2] = msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z
@@ -124,14 +134,20 @@ class AdmittanceControlNode(Node):
         self.last_time = now
 
         F_cmd = [
-            self.teleop_F[0] + self.orient_F[0] - self.linear_drag * self.linear_vel[0],
-            self.teleop_F[1] + self.orient_F[1] - self.linear_drag * self.linear_vel[1],
-            self.teleop_F[2] + self.orient_F[2] - self.linear_drag * self.linear_vel[2],
+            self.teleop_F[0] + self.orient_F[0] -
+            self.linear_drag * self.linear_vel[0],
+            self.teleop_F[1] + self.orient_F[1] -
+            self.linear_drag * self.linear_vel[1],
+            self.teleop_F[2] + self.orient_F[2] -
+            self.linear_drag * self.linear_vel[2],
         ]
         T_cmd = [
-            self.teleop_T[0] + self.orient_T[0] - self.angular_drag * self.angular_vel[0],
-            self.teleop_T[1] + self.orient_T[1] - self.angular_drag * self.angular_vel[1],
-            self.teleop_T[2] + self.orient_T[2] - self.angular_drag * self.angular_vel[2],
+            self.teleop_T[0] + self.orient_T[0] -
+            self.angular_drag * self.angular_vel[0],
+            self.teleop_T[1] + self.orient_T[1] -
+            self.angular_drag * self.angular_vel[1],
+            self.teleop_T[2] + self.orient_T[2] -
+            self.angular_drag * self.angular_vel[2],
         ]
 
         inv_m = 1.0 / max(self.mass, 1e-9)
@@ -150,20 +166,24 @@ class AdmittanceControlNode(Node):
         # Optional speed clamps (same as before)
         if self.max_linear_speed > 0.0:
             for i in range(3):
-                if self.linear_vel[i] >  self.max_linear_speed: self.linear_vel[i] =  self.max_linear_speed
-                if self.linear_vel[i] < -self.max_linear_speed: self.linear_vel[i] = -self.max_linear_speed
+                if self.linear_vel[i] > self.max_linear_speed:
+                    self.linear_vel[i] = self.max_linear_speed
+                if self.linear_vel[i] < -self.max_linear_speed:
+                    self.linear_vel[i] = -self.max_linear_speed
         if self.max_angular_speed > 0.0:
             for i in range(3):
-                if self.angular_vel[i] >  self.max_angular_speed: self.angular_vel[i] =  self.max_angular_speed
-                if self.angular_vel[i] < -self.max_angular_speed: self.angular_vel[i] = -self.max_angular_speed
+                if self.angular_vel[i] > self.max_angular_speed:
+                    self.angular_vel[i] = self.max_angular_speed
+                if self.angular_vel[i] < -self.max_angular_speed:
+                    self.angular_vel[i] = -self.max_angular_speed
 
         # Publish TwistStamped
         tw = self.current_twist
         tw.header.stamp = now.to_msg()
         tw.header.frame_id = self.frame_id
-        tw.twist.linear.x  = round(self.linear_vel[0], 3)
-        tw.twist.linear.y  = round(self.linear_vel[1], 3)
-        tw.twist.linear.z  = round(self.linear_vel[2], 3)
+        tw.twist.linear.x = round(self.linear_vel[0], 3)
+        tw.twist.linear.y = round(self.linear_vel[1], 3)
+        tw.twist.linear.z = round(self.linear_vel[2], 3)
         tw.twist.angular.x = round(self.angular_vel[0], 3)
         tw.twist.angular.y = round(self.angular_vel[1], 3)
         tw.twist.angular.z = round(self.angular_vel[2], 3)
@@ -176,9 +196,9 @@ class AdmittanceControlNode(Node):
         ac = self.current_accel
         ac.header.stamp = now.to_msg()
         ac.header.frame_id = self.frame_id
-        ac.accel.linear.x  = float(self.linear_accel[0])
-        ac.accel.linear.y  = float(self.linear_accel[1])
-        ac.accel.linear.z  = float(self.linear_accel[2])
+        ac.accel.linear.x = float(self.linear_accel[0])
+        ac.accel.linear.y = float(self.linear_accel[1])
+        ac.accel.linear.z = float(self.linear_accel[2])
         ac.accel.angular.x = float(self.angular_accel[0])
         ac.accel.angular.y = float(self.angular_accel[1])
         ac.accel.angular.z = float(self.angular_accel[2])
@@ -193,16 +213,20 @@ class AdmittanceControlNode(Node):
             if p.name == 'publish_rate' and p.type_ == p.Type.DOUBLE:
                 self.publish_rate = float(p.value)
                 self.timer.cancel()
-                self.timer = self.create_timer(1.0 / self.publish_rate, self.publish_twist)
+                self.timer = self.create_timer(
+                    1.0 / self.publish_rate, self.publish_twist)
             elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
                 self.mass = float(p.value)
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.update_inertia_and_drag(
+                    self.mass, self.sphere_radius, self.fluid_viscosity)
             elif p.name == 'sphere_radius' and p.type_ == p.Type.DOUBLE:
                 self.sphere_radius = float(p.value)
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.update_inertia_and_drag(
+                    self.mass, self.sphere_radius, self.fluid_viscosity)
             elif p.name == 'fluid_viscosity' and p.type_ == p.Type.DOUBLE:
                 self.fluid_viscosity = float(p.value)
-                self.update_inertia_and_drag(self.mass, self.sphere_radius, self.fluid_viscosity)
+                self.update_inertia_and_drag(
+                    self.mass, self.sphere_radius, self.fluid_viscosity)
             elif p.name == 'max_linear_speed' and p.type_ == p.Type.DOUBLE:
                 self.max_linear_speed = float(p.value)
             elif p.name == 'max_angular_speed' and p.type_ == p.Type.DOUBLE:
@@ -223,6 +247,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
