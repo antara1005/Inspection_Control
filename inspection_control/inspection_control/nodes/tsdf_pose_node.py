@@ -23,6 +23,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rcl_interfaces.srv import GetParameters
+from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
@@ -97,7 +98,7 @@ class TSDFPoseNode(Node):
             ("publish_tf",                  True),
 
             # TSDF integration (VoxelBlockGrid)
-            ("voxel_size",                  0.003),    # m
+            ("voxel_size",                  0.001),    # m
             ("sdf_trunc_mult",              4.0),      # sdf_trunc = mult * voxel_size
             ("block_resolution",            16),
             ("block_count",                 10000),
@@ -112,6 +113,9 @@ class TSDFPoseNode(Node):
             # Registration cadence
             ("register_every_n_frames",     30),
             ("min_integrations_before_register", 10),
+
+            # Point cloud extraction from VBG
+            ("extract_weight_threshold",    3.0),      # min TSDF weight per voxel
 
             # Registration: downsampling
             ("fused_voxel_size",            0.003),    # m
@@ -137,6 +141,7 @@ class TSDFPoseNode(Node):
             # Topics
             ("pose_topic",                  "tsdf_pose/pose"),
             ("fused_cloud_topic",           "tsdf_pose/fused_cloud"),
+            ("full_cloud_topic",         "tsdf_pose/full_cloud"),
             ("synthetic_depth_topic",       "tsdf_pose/depth/synthetic"),
         ])
 
@@ -148,7 +153,8 @@ class TSDFPoseNode(Node):
         self.publish_tf      = gp("publish_tf").value
 
         self.voxel_size      = float(gp("voxel_size").value)
-        self.sdf_trunc       = float(gp("sdf_trunc_mult").value) * self.voxel_size
+        self.sdf_trunc_mult  = float(gp("sdf_trunc_mult").value)
+        self.sdf_trunc       = self.sdf_trunc_mult * self.voxel_size
         self.block_resolution = int(gp("block_resolution").value)
         self.block_count     = int(gp("block_count").value)
         self.device_str      = gp("integration_device").value
@@ -160,6 +166,8 @@ class TSDFPoseNode(Node):
 
         self.register_every  = int(gp("register_every_n_frames").value)
         self.min_int_before_reg = int(gp("min_integrations_before_register").value)
+
+        self.extract_weight_threshold = float(gp("extract_weight_threshold").value)
 
         self.fused_voxel     = float(gp("fused_voxel_size").value)
         self.ref_voxel       = float(gp("reference_voxel_size").value)
@@ -184,6 +192,7 @@ class TSDFPoseNode(Node):
         self.ray_scene = None        # o3d.t.geometry.RaycastingScene for synth depth
         self.ref_cloud = None        # o3d.geometry.PointCloud (downsampled, with normals)
         self.ref_fpfh = None         # FPFH feature for global registration
+        self._ref_pcd_raw = None     # full-res reference cloud (for live rebuild)
 
         self.device = o3d.core.Device(self.device_str)
         self.vbg = None              # o3d.t.geometry.VoxelBlockGrid
@@ -215,8 +224,10 @@ class TSDFPoseNode(Node):
         synth_topic = gp("synthetic_depth_topic").value
         pose_topic  = gp("pose_topic").value
         cloud_topic = gp("fused_cloud_topic").value
+        full_cloud_topic = gp("full_cloud_topic").value
         self.pose_pub  = self.create_publisher(PoseStamped,    pose_topic,                  10)
         self.cloud_pub = self.create_publisher(PointCloud2,    cloud_topic,                 10)
+        self.full_cloud_pub = self.create_publisher(PointCloud2, full_cloud_topic, 10)
         self.depth_pub = self.create_publisher(Image,          synth_topic,                 10)
         self.depth_compressed_pub = self.create_publisher(
             CompressedImage, synth_topic + "/compressedDepth", 10)
@@ -250,6 +261,151 @@ class TSDFPoseNode(Node):
         self.get_logger().info(
             "Polling viewpoint_generation for model parameters every 5 s …")
         self.create_timer(5.0, self._poll_model_params)
+
+        # React to live parameter updates (e.g. `ros2 param set ...`).
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+    # -----------------------------------------------------------------------
+    # Live parameter updates
+    # -----------------------------------------------------------------------
+
+    def _on_set_parameters(self, params):
+        """Apply on-the-fly parameter changes.
+
+        Scalar tuning values take effect immediately. Changes to the reference
+        cloud sampling trigger a reference rebuild; changes to the VBG geometry
+        rebuild the voxel grid (which clears accumulated fusion).
+        """
+        pending = {}             # attr name -> new value (applied only if all valid)
+        rebuild_reference = False
+        rebuild_tsdf = False
+
+        def reject(reason):
+            return SetParametersResult(successful=False, reason=reason)
+
+        for p in params:
+            n, v = p.name, p.value
+
+            # --- live scalars ------------------------------------------
+            if n == "publish_tf":
+                pending["publish_tf"] = bool(v)
+            elif n == "integrate_every_n_frames":
+                if int(v) < 1:
+                    return reject("integrate_every_n_frames must be >= 1")
+                pending["integrate_every"] = int(v)
+            elif n == "depth_min":
+                pending["depth_min"] = float(v)
+            elif n == "depth_max":
+                pending["depth_max"] = float(v)
+            elif n == "depth_max_integration":
+                pending["depth_max_int"] = float(v)
+            elif n == "register_every_n_frames":
+                if int(v) < 1:
+                    return reject("register_every_n_frames must be >= 1")
+                pending["register_every"] = int(v)
+            elif n == "min_integrations_before_register":
+                pending["min_int_before_reg"] = int(v)
+            elif n == "extract_weight_threshold":
+                if float(v) < 0:
+                    return reject("extract_weight_threshold must be >= 0")
+                pending["extract_weight_threshold"] = float(v)
+            elif n == "fused_voxel_size":
+                if float(v) <= 0:
+                    return reject("fused_voxel_size must be > 0")
+                pending["fused_voxel"] = float(v)
+            elif n == "ransac_distance_mult":
+                pending["ransac_dist_mult"] = float(v)
+            elif n == "ransac_max_iterations":
+                pending["ransac_max_iter"] = int(v)
+            elif n == "ransac_confidence":
+                pending["ransac_conf"] = float(v)
+            elif n == "icp_distance_mult":
+                pending["icp_dist_mult"] = float(v)
+            elif n == "icp_max_iterations":
+                pending["icp_max_iter"] = int(v)
+            elif n == "icp_fitness_min":
+                pending["icp_fitness_min"] = float(v)
+
+            # --- frames ------------------------------------------------
+            elif n == "fusion_frame":
+                pending["fusion_frame"] = str(v)
+            elif n == "world_frame":
+                pending["world_frame"] = str(v)
+            elif n == "model_frame":
+                pending["model_frame"] = str(v)
+
+            # --- reference-cloud rebuild -------------------------------
+            elif n == "reference_voxel_size":
+                if float(v) <= 0:
+                    return reject("reference_voxel_size must be > 0")
+                pending["ref_voxel"] = float(v)
+                rebuild_reference = True
+            elif n == "normal_radius_mult":
+                pending["normal_r_mult"] = float(v)
+                rebuild_reference = True
+            elif n == "fpfh_radius_mult":
+                pending["fpfh_r_mult"] = float(v)
+                rebuild_reference = True
+
+            # --- VBG structural rebuild --------------------------------
+            elif n == "voxel_size":
+                if float(v) <= 0:
+                    return reject("voxel_size must be > 0")
+                pending["voxel_size"] = float(v)
+                rebuild_tsdf = True
+            elif n == "sdf_trunc_mult":
+                # sdf_trunc is derived but not consumed by the VBG in this
+                # node, so updating it does not require clearing fusion.
+                pending["sdf_trunc_mult"] = float(v)
+            elif n == "block_resolution":
+                if int(v) < 1:
+                    return reject("block_resolution must be >= 1")
+                pending["block_resolution"] = int(v)
+                rebuild_tsdf = True
+            elif n == "block_count":
+                if int(v) < 1:
+                    return reject("block_count must be >= 1")
+                pending["block_count"] = int(v)
+                rebuild_tsdf = True
+            elif n == "integration_device":
+                pending["device_str"] = str(v)
+                rebuild_tsdf = True
+            # else: unknown / static parameter — accept without side effects.
+
+        # All validated — commit cached attributes.
+        for attr, value in pending.items():
+            setattr(self, attr, value)
+
+        # Recompute derived values.
+        if "voxel_size" in pending or "sdf_trunc_mult" in pending:
+            self.sdf_trunc = self.sdf_trunc_mult * self.voxel_size
+
+        # toggle TF broadcaster on/off if publish_tf changed
+        if "publish_tf" in pending:
+            if self.publish_tf and self.tf_broadcaster is None:
+                self.tf_broadcaster = TransformBroadcaster(self)
+            elif not self.publish_tf:
+                self.tf_broadcaster = None
+
+        if rebuild_reference:
+            try:
+                self._build_reference()
+                self.get_logger().info("Reference cloud rebuilt from parameter update.")
+            except Exception as e:
+                return reject(f"Reference rebuild failed: {e}")
+
+        if rebuild_tsdf:
+            try:
+                if "device_str" in pending:
+                    self.device = o3d.core.Device(self.device_str)
+                with self.integ_lock:
+                    self._reset_tsdf()
+                self.get_logger().warn(
+                    "VBG rebuilt from parameter update; accumulated fusion cleared.")
+            except Exception as e:
+                return reject(f"VBG rebuild failed: {e}")
+
+        return SetParametersResult(successful=True)
 
     # -----------------------------------------------------------------------
     # Model loading (mirrors particle_filter_node)
@@ -333,7 +489,20 @@ class TSDFPoseNode(Node):
         if pcd.is_empty():
             raise RuntimeError(f"Failed to load point cloud from {pc_path}")
         pcd.scale(unit_scale(pc_units), center=(0, 0, 0))
-        ref_down = pcd.voxel_down_sample(self.ref_voxel)
+        # Keep the full-resolution cloud so the reference can be rebuilt on the
+        # fly when ref_voxel / feature-radius parameters change.
+        self._ref_pcd_raw = pcd
+        self._build_reference()
+
+    def _build_reference(self):
+        """(Re)build the downsampled reference cloud + FPFH from the raw cloud.
+
+        Uses the current ref_voxel / normal_radius / fpfh_radius parameters, so
+        it can be re-run after a live parameter update.
+        """
+        if self._ref_pcd_raw is None:
+            return
+        ref_down = self._ref_pcd_raw.voxel_down_sample(self.ref_voxel)
         ref_down.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
                 radius=self.ref_voxel * self.normal_r_mult, max_nn=30))
@@ -500,32 +669,52 @@ class TSDFPoseNode(Node):
 
     def _extract_fused_cloud(self):
         with self.integ_lock:
-            pcd_t = self.vbg.extract_point_cloud()
+            pcd_t = self.vbg.extract_point_cloud(
+                weight_threshold=self.extract_weight_threshold)
         # extract_point_cloud may return zero points if no surface intersected
         pcd_legacy = pcd_t.to_legacy()
         if len(pcd_legacy.points) == 0:
             return None
         pcd_down = pcd_legacy.voxel_down_sample(self.fused_voxel)
-        # TODO: Filter out unwanted points here
-        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
-        max_bound = np.array([0.1, 0.1, np.inf], dtype=np.float64)
-        pcd_down_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-        pcd_down = pcd_down.crop(bounding_box=pcd_down_bbox)
+        pcd_down = self._crop_fused_cloud(pcd_down)
         pcd_down.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
                 radius=self.fused_voxel * self.normal_r_mult, max_nn=30))
         return pcd_down
+    
+    def _crop_fused_cloud(self, cloud: o3d.geometry.PointCloud):
+        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
+        max_bound = np.array([0.1, 0.1, 0.1], dtype=np.float64)
+        cloud_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
+        cloud_cropped = cloud.crop(bounding_box=cloud_bbox)
+        return cloud_cropped
+
 
     def _run_registration(self, stamp, force_global: bool = False) -> bool:
         fused = self._extract_fused_cloud()
+        full =  self.vbg.extract_point_cloud(
+            weight_threshold=self.extract_weight_threshold)
+        full = full.to_legacy()
+        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
+        max_bound = np.array([0.1, 0.1, np.inf], dtype=np.float64)
+        pcd_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
+        full= full.crop(bounding_box=pcd_bbox)
         if fused is None or len(fused.points) < 100:
             self.get_logger().warn(
                 f"Fused cloud has too few points "
                 f"({0 if fused is None else len(fused.points)}); skipping registration.",
                 throttle_duration_sec=2.0)
             return False
+        if full is None or len(full.points) < 100:
+            self.get_logger().warn(
+                f"Full cloud has too few points "
+                f"({0 if full is None else len(full.points)}); skipping registration.",
+                throttle_duration_sec=2.0)
+            return False
+
 
         self._publish_cloud(fused, stamp)
+        self._publish_full_cloud(full, stamp)
 
         do_global = force_global or (not self.have_global_init)
         if do_global:
@@ -647,6 +836,25 @@ class TSDFPoseNode(Node):
         msg.is_dense = True
         msg.data = pts.tobytes()
         self.cloud_pub.publish(msg)
+        
+    def _publish_full_cloud(self, pcd: o3d.geometry.PointCloud, stamp):
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.fusion_frame
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.data = pts.tobytes()
+        self.full_cloud_pub.publish(msg)
 
     def _publish_pose(self, T_model_in_fusion: np.ndarray, stamp):
         """Publish T_model_in_world by composing with TF (world <- fusion)."""
