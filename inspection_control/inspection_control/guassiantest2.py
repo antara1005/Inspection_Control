@@ -6,8 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-CSV_PATH = "/home/macs/inspection-docker/data/OrientationControlData/_1775862660/ransacflat.csv"
-COL = "pitch_error_raw"
+CSV_PATH = "/home/macs/inspection-docker/data/OrientationControlData/_1780957749/_1780957749.csv"
+COL = "yaw_error_raw"
 
 # -------------------- Global Font Sizes --------------------
 TITLE_SIZE  = 20
@@ -37,9 +37,9 @@ print("Max:", np.max(yaw))
 plt.figure(figsize=(10,5))
 plt.plot(yaw, linewidth=1.8)
 
-plt.title("Pitch Error Raw - Time Series", fontsize=TITLE_SIZE)
+plt.title("Yaw Error Raw - Time Series", fontsize=TITLE_SIZE)
 plt.xlabel("Sample Index", fontsize=LABEL_SIZE)
-plt.ylabel("Pitch Error (raw)", fontsize=LABEL_SIZE)
+plt.ylabel("Yaw Error (raw)", fontsize=LABEL_SIZE)
 
 plt.xticks(fontsize=TICK_SIZE)
 plt.yticks(fontsize=TICK_SIZE)
@@ -74,9 +74,9 @@ print(f"Standard deviation (sigma) of detrended+demean data: {sigma:.6g}")
 plt.figure(figsize=(10,5))
 plt.plot(yaw_noise, linewidth=1.8)
 
-plt.title("Pitch Error After Detrending + Demeaning", fontsize=TITLE_SIZE)
+plt.title("Yaw Error After Detrending + Demeaning", fontsize=TITLE_SIZE)
 plt.xlabel("Sample Index", fontsize=LABEL_SIZE)
-plt.ylabel("Pitch Error Noise Estimate", fontsize=LABEL_SIZE)
+plt.ylabel("Yaw Error Noise Estimate", fontsize=LABEL_SIZE)
 
 plt.xticks(fontsize=TICK_SIZE)
 plt.yticks(fontsize=TICK_SIZE)
@@ -99,7 +99,7 @@ plt.plot(
 )
 
 plt.title("Histogram with Gaussian Fit", fontsize=TITLE_SIZE)
-plt.xlabel("Pitch Error Noise Estimate", fontsize=LABEL_SIZE)
+plt.xlabel("Yaw Error Noise Estimate", fontsize=LABEL_SIZE)
 plt.ylabel("Probability Density", fontsize=LABEL_SIZE)
 
 plt.xticks(fontsize=TICK_SIZE)
@@ -116,7 +116,7 @@ plt.figure(figsize=(7,7))
 
 stats.probplot(yaw_noise, dist="norm", plot=plt)
 
-plt.title("Q-Q Plot of Detrended pitch_error_raw", fontsize=TITLE_SIZE)
+plt.title("Q-Q Plot of Detrended yaw_error_raw", fontsize=TITLE_SIZE)
 
 plt.xlabel("Theoretical Quantiles", fontsize=LABEL_SIZE)
 plt.ylabel("Ordered Values", fontsize=LABEL_SIZE)
@@ -170,7 +170,7 @@ plt.plot(
 )
 
 plt.title(
-    "Autocorrelation of Detrended + Demeaned pitch_error_raw",
+    "Autocorrelation of Detrended + Demeaned yaw_error_raw",
     fontsize=TITLE_SIZE
 )
 
