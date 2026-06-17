@@ -10,7 +10,7 @@ The control math mirrors the real nodes so insights port straight back:
 | sandbox file        | mirrors node                  | law |
 |---------------------|-------------------------------|-----|
 | `dynamics.py`       | `admittance_control_node.py`  | coupled **pendulum** plant about the surface pivot — generalized coords `(slide a, standoff d, swing φ)`, `I_A=I_B+m·d²` |
-| `controllers.py`    | `orientation_control_node.py` | pole-placement PD **torque on the swing** `φ` about the surface point (no Newton-Euler feedforward) |
+| `controllers.py`    | `orientation_control_node.py` | pole-placement **PD/PID torque on the swing** `φ` about the surface point (no Newton-Euler feedforward) |
 | `controllers.py`    | `autofocus_node.py`           | PD **force on the standoff** `d` toward a known true peak |
 
 The coupled-dynamics rewrite (why the old point-mass + Newton-Euler feedforward went
@@ -41,12 +41,17 @@ All teleop acts in the **surface-pivot frame** of the coupled pendulum plant:
 | `f`        | toggle **autofocus** drive (to the known true peak distance) |
 | `space`    | reset camera + plant |
 
-Sliders (left): `zeta`, autofocus `v_max`, `mass`, `viscosity`, and white **sensor
-noise** std — `dist noise σ` (m) and `norm noise σ°` (degrees, rotates the measured
-normal). Noise is injected into the measurement, so the controllers *and* the drawn
+Sliders (left): orientation tuning — `zeta`, `orient v_max` (speed: raises the torque
+budget `c·d·v_max`), `theta_max`, `integral_alpha` (PID) — plus autofocus `v_max`,
+`mass`, `viscosity`, and white **sensor noise** std (`dist noise σ` in m, `norm noise σ°`
+in degrees). Noise is injected into the measurement, so the controllers *and* the drawn
 ray/normal reflect the noisy values.
-Radio buttons (left): surface shape. The HUD (top-left of the plot) shows focal
-distance, focus value, orientation swing error + `Δ`, and autofocus state/target.
+Radio buttons (left): **orientation controller (PD / PID)** and surface shape. The HUD
+shows focal distance, focus value, orientation controller + swing error + `Δ`, and
+autofocus state/target.
+
+> Orientation feels slow? Raise `orient v_max` (≈1.0 settles in ~5 s vs tens of seconds
+> at 0.1). PID adds integral action for steady-state/disturbance rejection.
 
 ### Coupled pendulum dynamics
 The plant models the camera as a **pendulum bob** swinging about the surface contact

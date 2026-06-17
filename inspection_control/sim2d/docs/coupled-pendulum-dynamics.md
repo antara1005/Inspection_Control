@@ -130,7 +130,7 @@ teleop translation cannot pump energy into the swing.
 
 | Controller   | Effort | Law |
 |--------------|--------|-----|
-| Orientation  | `Q_φ += τ_θ` | pole-placement PD on `φ − φ_ref`, `φ_ref = atan2(−n) + Δ`, gains from `pole_placement_pd(I_A, c·d² + c_ang, τ_max, θ_max, ζ)` |
+| Orientation  | `Q_φ += τ_θ` | pole-placement **PD or PID** on `φ − φ_ref`, `φ_ref = atan2(−n) + Δ`, poles from `(I_A, b=c·d²+c_ang, τ_max=c·d·v_max, θ_max, ζ)`; PID adds `p3 = integral_alpha·p2` (per `orientation_control_node.py`) |
 | Autofocus    | `Q_d += F`   | PD on `d − d_focus`, `pole_placement_pd(m, c, …)` |
 | Teleop       | `Q_a, Q_d`   | surface-frame translation (slide along **t**, standoff along **n**) |
 | Teleop (rot) | `Δ`          | sets the reference swing offset → pivot the view about the target |
@@ -192,21 +192,26 @@ Two refinements were needed beyond the initial design, both stemming from the sa
 **high-drag regime** (`mass≈2.5, radius≈0.65, viscosity≈1.0` ⇒ `c·d² ≈ 50`, far more
 damped than the near-inertial real system at `viscosity≈0.001`):
 
-1. **Clamp `Kd ≥ 0` (no anti-damping).** Pole-placement targets a bandwidth
-   (`ωₙ≈0.67`) well below the natural drag pole (`≈4.9`), so `Kd = −m(p1+p2) − c` comes
-   out **negative** — the controller would *cancel* real drag. That anti-damping is
-   fragile and, with the slide coupling, diverges. `pole_placement_pd(..., clamp_kd=True)`
-   floors `Kd` at 0: in the over-damped regime the controller leans on the natural drag
-   rather than fighting it. Closed loop stays over-damped but stable.
+1. **Decouple the drag and inertia (§2.2–2.3) — the real fix.** The exact Lagrangian's
+   slide↔swing cross terms let a fast tangential slide torque the swing; the camera
+   tilted, the measured `d` grew, and that fed back (tilt → larger `d` → larger
+   disturbance) into a runaway. A diagonal mass + pivot-relative diagonal drag removes
+   the cross-coupling: teleop slide now produces **exactly zero** swing (the intended
+   "teleop translates, doesn't pivot" behavior) and each coordinate is passive.
 
-2. **Decouple the drag and inertia (§2.2–2.3).** The exact Lagrangian's slide↔swing
-   cross terms let a fast tangential slide torque the swing; the over-damped controller
-   could not reject it, the camera tilted, the measured `d` grew, and that fed back
-   (tilt → larger `d` → larger disturbance) into a runaway. Using a diagonal mass +
-   pivot-relative diagonal drag removes the cross-coupling: teleop slide now produces
-   **exactly zero** swing, which is the intended "teleop translates, doesn't pivot"
-   behavior and is guaranteed passive.
+2. **No `Kd` clamp — match the nodes.** With the decoupled swing dynamics, the
+   pole-placement gains (`Kd = −I_A(p1+p2) − b`, possibly negative) give a closed loop
+   whose *total* damping `b + Kd = 2ζωₙ·I_A > 0` is always positive, so it is stable
+   **without** clamping. An earlier stopgap clamped `Kd ≥ 0`, but that made the
+   controller heavily over-damped/slow; it was removed so PD/PID reproduce
+   `orientation_control_node.py` exactly. **Speed is tuned via `v_max`** (raises the
+   torque budget `τ_max = c·d·v_max` → higher `ωₙ`): settling drops from tens of
+   seconds at `v_max=0.1` to ~5 s at `v_max=1.0`.
+
+**PD / PID** (`controller_type`) follow the node: PID adds a slow integral pole
+`p3 = integral_alpha·p2` with conditional anti-windup and an `ie_clamp` limit. Both,
+plus `zeta`, `v_max`, `theta_max`, `integral_alpha`, are exposed as GUI sliders/radio.
 
 Residual (acceptable): sliding *aggressively across a curved surface* makes the swing
 **lag** the fast-changing normal (bounded error, stays on the surface) — a bandwidth
-limit of the over-damped regime, not an instability.
+limit, not an instability; raise `v_max` to tighten it.

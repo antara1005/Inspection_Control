@@ -13,8 +13,9 @@ Controls (all in the surface-pivot frame of the coupled pendulum plant)
   o          toggle orientation control (pure swing torque about the target)
   f          toggle autofocus drive (to the known true peak distance)
   space      reset camera + plant
-  (sliders)  zeta, autofocus v_max, mass, viscosity, sensor-noise std
-  (radio)    surface shape
+  (sliders)  zeta, orient v_max, theta_max, integral_alpha, autofocus v_max,
+             mass, viscosity, sensor-noise std
+  (radios)   orientation controller (PD / PID), surface shape
 """
 
 from __future__ import annotations
@@ -87,32 +88,40 @@ class SimApp:
     # -- widgets ------------------------------------------------------------ #
     def _build_widgets(self):
         w = self.world
-        ax_zeta = self.fig.add_axes([0.06, 0.88, 0.17, 0.03])
-        ax_vmax = self.fig.add_axes([0.06, 0.83, 0.17, 0.03])
-        ax_mass = self.fig.add_axes([0.06, 0.78, 0.17, 0.03])
-        ax_visc = self.fig.add_axes([0.06, 0.73, 0.17, 0.03])
-        ax_dn = self.fig.add_axes([0.06, 0.68, 0.17, 0.03])
-        ax_nn = self.fig.add_axes([0.06, 0.63, 0.17, 0.03])
-
-        self.s_zeta = Slider(ax_zeta, "zeta", 1.0, 4.0,
-                             valinit=w.orientation.zeta)
-        self.s_vmax = Slider(ax_vmax, "af v_max", 0.01, 0.5,
-                             valinit=w.autofocus.v_max)
-        self.s_mass = Slider(ax_mass, "mass", 0.5, 8.0, valinit=w.plant.mass)
-        self.s_visc = Slider(ax_visc, "viscosity", 0.1, 4.0,
-                             valinit=w.plant.viscosity)
-        # Sensor noise std: distance in metres, normal in degrees.
-        self.s_dn = Slider(ax_dn, "dist noise σ", 0.0, 0.3,
-                           valinit=w.distance_noise_std)
-        self.s_nn = Slider(ax_nn, "norm noise σ°", 0.0, 30.0,
-                           valinit=np.degrees(w.normal_noise_std))
-
-        for s in (self.s_zeta, self.s_vmax, self.s_mass, self.s_visc,
-                  self.s_dn, self.s_nn):
+        o = w.orientation
+        # Stack of sliders down the left margin.
+        defs = [
+            ("s_zeta",   "zeta",          1.0,  4.0,  o.zeta),
+            ("s_ovmax",  "orient v_max",  0.05, 2.0,  o.v_max),
+            ("s_thetam", "theta_max °",   5.0,  60.0, np.degrees(o.theta_max)),
+            ("s_ialpha", "integral_alpha", 1.0, 10.0, o.integral_alpha),
+            ("s_vmax",   "af v_max",      0.01, 0.5,  w.autofocus.v_max),
+            ("s_mass",   "mass",          0.5,  8.0,  w.plant.mass),
+            ("s_visc",   "viscosity",     0.1,  4.0,  w.plant.viscosity),
+            ("s_dn",     "dist noise σ",  0.0,  0.3,  w.distance_noise_std),
+            ("s_nn",     "norm noise σ°", 0.0,  30.0, np.degrees(w.normal_noise_std)),
+        ]
+        y = 0.95
+        self._sliders = []
+        for attr, label, lo, hi, val in defs:
+            ax = self.fig.add_axes([0.07, y, 0.16, 0.022])
+            s = Slider(ax, label, lo, hi, valinit=val)
+            s.label.set_fontsize(8)
             s.on_changed(self._on_sliders)
+            setattr(self, attr, s)
+            self._sliders.append(s)
+            y -= 0.042
 
-        ax_radio = self.fig.add_axes([0.06, 0.30, 0.17, 0.30])
-        ax_radio.set_title("shape", fontsize=9)
+        # Controller type (PD / PID), then surface shape.
+        ax_ctrl = self.fig.add_axes([0.07, 0.40, 0.16, 0.10])
+        ax_ctrl.set_title("orient controller", fontsize=8)
+        types = ["PD", "PID"]
+        self.radio_ctrl = RadioButtons(ax_ctrl, types,
+                                       active=types.index(o.controller_type))
+        self.radio_ctrl.on_clicked(self._on_ctrl_type)
+
+        ax_radio = self.fig.add_axes([0.07, 0.12, 0.16, 0.24])
+        ax_radio.set_title("shape", fontsize=8)
         names = list(SHAPES.keys())
         self.radio = RadioButtons(ax_radio, names,
                                   active=names.index(w.shape_name))
@@ -121,12 +130,19 @@ class SimApp:
     def _on_sliders(self, _):
         w = self.world
         w.orientation.zeta = self.s_zeta.val
+        w.orientation.v_max = self.s_ovmax.val
+        w.orientation.theta_max = np.radians(self.s_thetam.val)
+        w.orientation.integral_alpha = self.s_ialpha.val
         w.autofocus.zeta = self.s_zeta.val
         w.autofocus.v_max = self.s_vmax.val
         w.plant.set_inertia_and_drag(self.s_mass.val, w.plant.radius,
                                      self.s_visc.val)
         w.distance_noise_std = self.s_dn.val
         w.normal_noise_std = np.radians(self.s_nn.val)
+
+    def _on_ctrl_type(self, label):
+        self.world.orientation.controller_type = label
+        self.world.orientation.reset_integral()
 
     def _on_shape(self, name):
         self.world.set_shape(name)
@@ -207,7 +223,7 @@ class SimApp:
             f"distance : {d}\n"
             f"focus    : {af.focus_value:5.3f}  (true peak {af.d_focus:.2f} m)\n"
             f"orient   : {'ON ' if w.orientation.enabled else 'off'}  "
-            f"err {ang:+6.1f} deg  Δ {delta:+5.1f} deg\n"
+            f"[{w.orientation.controller_type}]  err {ang:+6.1f} deg  Δ {delta:+5.1f} deg\n"
             f"autofocus: {'ON ' if af.enabled else 'off'}  target {af.d_focus:.3f} m\n"
             f"shape    : {w.shape_name}"
         )
