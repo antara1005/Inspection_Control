@@ -11,7 +11,7 @@ tsdf_pose:
     sdf_trunc_mult:             4.0       # sdf_trunc = mult * voxel_size
     block_resolution:           16
     block_count:                10000
-    integration_device:         "CPU:0"   # "CUDA:0" if Open3D was built with CUDA
+    integration_device:         "CUDA:0"   # "CUDA:0" if Open3D was built with CUDA
     integrate_every_n_frames:   1
 
     # -- Depth sensor --
@@ -22,6 +22,14 @@ tsdf_pose:
     # -- Registration cadence --
     register_every_n_frames:    30        # ICP refinement period (frames)
     min_integrations_before_register: 10  # need enough fused surface first
+
+    # -- Extracted surface point cloud --
+    extract_weight_threshold:   10.0       # only points with weight >= this are extracted
+
+    # -- Fused-cloud crop (axis-aligned box in fusion_frame, metres) --
+    crop_enabled:               true
+    crop_min:                   [-0.5, -0.5, 0.01]   # x, y, z lower bound
+    crop_max:                   [0.5,  0.5,  1.0]    # x, y, z upper bound
 
     # -- Registration: downsampling --
     fused_voxel_size:           0.003     # m – downsample fused cloud

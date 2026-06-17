@@ -19,66 +19,12 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 
-try:
-    import PyKDL
-    from urdf_parser_py.urdf import URDF as _URDF
-    _KDL_AVAILABLE = True
-    _KDL_IMPORT_ERROR = None
-except ImportError as e:
-    PyKDL = None
-    _URDF = None
-    _KDL_AVAILABLE = False
-    _KDL_IMPORT_ERROR = str(e)
-
-
-def _kdl_frame_from_origin(origin):
-    if origin is None:
-        return PyKDL.Frame()
-    xyz = list(origin.xyz) if origin.xyz is not None else [0.0, 0.0, 0.0]
-    rpy = list(origin.rpy) if origin.rpy is not None else [0.0, 0.0, 0.0]
-    return PyKDL.Frame(PyKDL.Rotation.RPY(*rpy), PyKDL.Vector(*xyz))
-
-
-def _kdl_joint_from_urdf(jnt):
-    f = _kdl_frame_from_origin(jnt.origin)
-    if jnt.joint_type == 'fixed':
-        return PyKDL.Joint(jnt.name, PyKDL.Joint.Fixed)
-    axis_arr = list(jnt.axis) if jnt.axis is not None else [1.0, 0.0, 0.0]
-    axis = f.M * PyKDL.Vector(*axis_arr)
-    type_map = {
-        'revolute':   PyKDL.Joint.RotAxis,
-        'continuous': PyKDL.Joint.RotAxis,
-        'prismatic':  PyKDL.Joint.TransAxis,
-    }
-    if jnt.joint_type in type_map:
-        return PyKDL.Joint(jnt.name, f.p, axis, type_map[jnt.joint_type])
-    return PyKDL.Joint(jnt.name, PyKDL.Joint.Fixed)
-
-
-def _kdl_tree_from_urdf_string(xml_string):
-    """Inline replacement for kdl_parser_py.urdf.treeFromString.
-
-    Returns (ok, tree, link_names) — link_names is the full list from the
-    URDF so callers can produce a useful error message when getChain fails.
-    """
-    model = _URDF.from_xml_string(xml_string)
-    link_names = sorted(model.link_map.keys())
-    tree = PyKDL.Tree(model.get_root())
-
-    def add_children(parent_name):
-        for joint_name, child_name in model.child_map.get(parent_name, []):
-            urdf_joint = model.joint_map[joint_name]
-            kdl_joint = _kdl_joint_from_urdf(urdf_joint)
-            f_parent_jnt = _kdl_frame_from_origin(urdf_joint.origin)
-            kdl_segment = PyKDL.Segment(
-                child_name, kdl_joint, f_parent_jnt, PyKDL.RigidBodyInertia())
-            if not tree.addSegment(kdl_segment, parent_name):
-                return False
-            if not add_children(child_name):
-                return False
-        return True
-    ok = add_children(model.get_root())
-    return ok, tree, link_names
+from inspection_control.kdl_jacobian import (
+    PyKDL,
+    KDL_AVAILABLE as _KDL_AVAILABLE,
+    KDL_IMPORT_ERROR as _KDL_IMPORT_ERROR,
+    kdl_tree_from_urdf_string as _kdl_tree_from_urdf_string,
+)
 
 
 SERVO_STATUS_NAMES = {

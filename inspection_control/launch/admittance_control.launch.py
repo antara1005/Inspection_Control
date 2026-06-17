@@ -38,6 +38,11 @@ def generate_launch_description():
         default_value='turntable_joy.yaml',
         description='Name of turntable joy configuration file'
     )
+    tsdf_config_file = DeclareLaunchArgument(
+        'tsdf_config_file',
+        default_value='tsdf_pose.yaml',
+        description='Name of TSDF pose-estimation configuration file'
+    )
 
     moveit_config = (
         MoveItConfigsBuilder("inspection_cell")
@@ -80,6 +85,11 @@ def generate_launch_description():
         FindPackageShare('inspection_control'),
         'config',
         LaunchConfiguration('turntable_config_file')
+    ])
+    tsdf_config = PathJoinSubstitution([
+        FindPackageShare('inspection_control'),
+        'config',
+        LaunchConfiguration('tsdf_config_file')
     ])
 
     orientation_control_node = Node(
@@ -135,11 +145,19 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
+    tsdf_pose_node = Node(
+        package='inspection_control',
+        executable='tsdf_pose_node',
+        name='tsdf_pose',
+        parameters=[tsdf_config],
+        output='screen',
+        emulate_tty=True
+    )
     return LaunchDescription([
         orientation_config_file,
         orientation_control_node,
         autofocus_config_file,
-        # autofocus_node,
+        autofocus_node,
         joy_node,
         controller_config_file,
         admittance_config_file,
@@ -148,4 +166,6 @@ def generate_launch_description():
         admittance_control_node,
         turntable_joy_node,
         servo_logger_node,
+        tsdf_config_file,
+        tsdf_pose_node,
     ])

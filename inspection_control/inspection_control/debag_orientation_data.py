@@ -94,113 +94,6 @@ def create_time_gradient_color(t_normalized, cmap_name='viridis'):
     return np.array(cmap(t_normalized)[:3])
 
 
-def visualize_pointclouds_over_time(point_clouds, normals, centroids, torque_vectors, timestamps, output_path):
-    """
-    Create an Open3D visualization with all point clouds colored by time gradient.
-    Also shows normals and torque vectors at each centroid.
-    """
-    if not point_clouds:
-        print("No point clouds to visualize")
-        return
-
-    t_min = min(timestamps)
-    t_max = max(timestamps)
-    t_range = t_max - t_min if t_max > t_min else 1.0
-
-    valid_centroids = [c for c in centroids if c is not None]
-    avg_centroid = np.mean(valid_centroids, axis=0) if valid_centroids else np.zeros(3)
-
-    combined_pcd = o3d.geometry.PointCloud()
-    geometries = []
-    torque_lines = []
-
-    for points, normal, centroid, torque_vec, t in zip(point_clouds, normals, centroids, torque_vectors, timestamps):
-        if len(points) == 0:
-            continue
-
-        t_normalized = (t - t_min) / t_range
-        color = create_time_gradient_color(t_normalized)
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        pcd.colors = o3d.utility.Vector3dVector(np.tile(color, (len(points), 1)))
-        combined_pcd += pcd
-
-        if centroid is not None and normal is not None:
-            flipped_normal = -normal
-            arrow_length = 0.05
-            line_points = [centroid, centroid + flipped_normal * arrow_length]
-            line = o3d.geometry.LineSet()
-            line.points = o3d.utility.Vector3dVector(line_points)
-            line.lines = o3d.utility.Vector2iVector([[0, 1]])
-            line.colors = o3d.utility.Vector3dVector([color])
-            geometries.append(line)
-
-        if centroid is not None and torque_vec is not None:
-            torque_norm = np.linalg.norm(torque_vec)
-            if torque_norm > 1e-6:
-                torque_dir = torque_vec / torque_norm
-                arrow_length = 0.03
-                line_points = [centroid, centroid + torque_dir * arrow_length]
-                line = o3d.geometry.LineSet()
-                line.points = o3d.utility.Vector3dVector(line_points)
-                line.lines = o3d.utility.Vector2iVector([[0, 1]])
-                line.colors = o3d.utility.Vector3dVector([[1.0, 0.0, 1.0]])
-                torque_lines.append(line)
-
-    if combined_pcd.has_points():
-        print(f"Raw combined cloud: {len(combined_pcd.points)} points")
-        voxel_size = 0.002
-        combined_pcd = combined_pcd.voxel_down_sample(voxel_size)
-        print(f"After voxel downsampling ({voxel_size*1000:.1f}mm): {len(combined_pcd.points)} points")
-
-        if len(combined_pcd.points) > 20:
-            combined_pcd, _ = combined_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            print(f"After statistical outlier removal: {len(combined_pcd.points)} points")
-
-    geometries.insert(0, combined_pcd)
-    geometries.extend(torque_lines)
-
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-    geometries.append(coord_frame)
-
-    ply_path = output_path.parent / f'{output_path.stem}_pointclouds.ply'
-    o3d.io.write_point_cloud(str(ply_path), combined_pcd)
-    print(f"Combined point cloud saved to {ply_path}")
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False, width=1920, height=1080)
-    for geom in geometries:
-        vis.add_geometry(geom)
-
-    ctr = vis.get_view_control()
-
-    if valid_centroids:
-        distances = [np.linalg.norm(c) for c in valid_centroids]
-        d = np.mean(distances)
-    else:
-        d = 1.0
-
-    camera_offset = np.array([-d / 2, -d / 2, -d / 2])
-    camera_pos = avg_centroid + camera_offset
-    front = avg_centroid - camera_pos
-    front = front / (np.linalg.norm(front) + 1e-12)
-
-    ctr.set_lookat(avg_centroid)
-    ctr.set_front(-front)
-    ctr.set_up([0, 0, -1])
-    ctr.set_zoom(0.5)
-
-    vis.poll_events()
-    vis.update_renderer()
-
-    screenshot_path = output_path.parent / f'{output_path.stem}_pointclouds.png'
-    vis.capture_screen_image(str(screenshot_path))
-    vis.destroy_window()
-    print(f"Point cloud visualization saved to {screenshot_path}")
-
-    return combined_pcd
-
 
 # =========================
 #  Plotting Helpers
@@ -1100,15 +993,6 @@ def debag(bag_file,
         optionB_polyorder=3
     )
 
-    print(f"Creating point cloud visualization from {len(all_point_clouds)} clouds...")
-    # visualize_pointclouds_over_time(
-    #     all_point_clouds,
-    #     all_normals,
-    #     all_centroids,
-    #     all_torque_vectors,
-    #     all_timestamps,
-    #     output_base
-    # )
 
     if bag_file.exists():
         shutil.rmtree(bag_file)

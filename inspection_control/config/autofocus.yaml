@@ -1,21 +1,38 @@
 autofocus:
   ros__parameters:
-    autofocus_enabled: false
-    control_rate: 10.0
-    ddfv_threshold: -0.2
-    dfv_threshold: 0.2
-    ehc_distance: 0.15
-    focus_algorithm: default
-    focus_metric: sobel
-    image_topic: /camera/image_raw/compressed
-    kv: 0.2
-    N_ema: 3
-    object: ''
-    roi_height: 100
+    # -- Sensing --
+    focus_metric: fswm                  # sobel | squared_gradient | fswm | sobel_laplacian
+    image_topic: /pi_camera/image_raw/compressed
+    distance_topic: /orientation_controller/focal_distance_m
+    # Centered ROI: (roi_x, roi_y) fractional centre; width/height in pixels.
     roi_width: 100
+    roi_height: 100
     roi_x: 0.5
     roi_y: 0.5
-    save_data: false
+    # -- Debug image --
+    visualize: true
+    publish_focus: true
+
+    # -- Active control (peak-hold PD) --
+    frame_id: eoat_camera_link
+    wrench_topic: /autofocus/wrench_cmds
+    joy_topic: joy
+    record_button: 2          # toggle peak recording (sweep the robot manually)
+    drive_button: 3           # toggle PD drive-to-peak
+    control_rate: 50.0        # Hz
+    # Plant dynamics — MUST match admittance_control.yaml (m d'' + c d' = F).
+    sphere_mass: 2.5
+    sphere_radius: 0.65
+    fluid_viscosity: 1.0
+    # PD pole-placement tuning
+    zeta: 1.0                 # closed-loop damping ratio (>=1, critically damped)
+    v_max: 0.05               # m/s focal-axis speed budget (start small!)
+    max_distance_error: 0.05   # m, error scale for omega_n cap
+    focus_axis_sign: 1.0      # flip to -1.0 if the robot drives AWAY from focus
+    focus_tolerance_m: 0.001  # stop when within this of target
+    deriv_tau: 0.05           # s, EMA time constant for d/dt(distance)
+    # Fine refinement: parabola-fit the recording sweep to refine the target.
+    fit_enabled: true
+    fit_peak_fraction: 0.5    # fit window: focus >= frac * max_focus
+    fit_min_points: 5         # min window samples to attempt a fit
     use_sim_time: false
-    data_path: '/data/AutofocusData'
-    autofocus_enabled: false

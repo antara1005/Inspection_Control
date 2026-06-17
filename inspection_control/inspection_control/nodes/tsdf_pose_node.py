@@ -19,7 +19,7 @@ import open3d as o3d
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rcl_interfaces.srv import GetParameters
@@ -114,8 +114,16 @@ class TSDFPoseNode(Node):
             ("register_every_n_frames",     30),
             ("min_integrations_before_register", 10),
 
+            # Surface-cloud publish cadence (decoupled from registration)
+            ("surface_publish_every_n_frames", 10),
+
             # Point cloud extraction from VBG
             ("extract_weight_threshold",    3.0),      # min TSDF weight per voxel
+
+            # Fused-cloud crop (axis-aligned box in fusion_frame, metres)
+            ("crop_enabled",                True),
+            ("crop_min",                    [-0.5, -0.5, 0.01]),
+            ("crop_max",                    [0.5,  0.5,  1.0]),
 
             # Registration: downsampling
             ("fused_voxel_size",            0.003),    # m
@@ -141,7 +149,7 @@ class TSDFPoseNode(Node):
             # Topics
             ("pose_topic",                  "tsdf_pose/pose"),
             ("fused_cloud_topic",           "tsdf_pose/fused_cloud"),
-            ("full_cloud_topic",         "tsdf_pose/full_cloud"),
+            ("surface_cloud_topic",         "/perception/surface_cloud"),
             ("synthetic_depth_topic",       "tsdf_pose/depth/synthetic"),
         ])
 
@@ -166,8 +174,13 @@ class TSDFPoseNode(Node):
 
         self.register_every  = int(gp("register_every_n_frames").value)
         self.min_int_before_reg = int(gp("min_integrations_before_register").value)
+        self.surface_publish_every = int(gp("surface_publish_every_n_frames").value)
 
         self.extract_weight_threshold = float(gp("extract_weight_threshold").value)
+
+        self.crop_enabled = bool(gp("crop_enabled").value)
+        self.crop_min = np.asarray(gp("crop_min").value, dtype=np.float64)
+        self.crop_max = np.asarray(gp("crop_max").value, dtype=np.float64)
 
         self.fused_voxel     = float(gp("fused_voxel_size").value)
         self.ref_voxel       = float(gp("reference_voxel_size").value)
@@ -202,7 +215,13 @@ class TSDFPoseNode(Node):
         self.T_model_in_fusion = None   # latest pose estimate (4x4)
         self.last_pose_stamp = None
 
-        self.model_ready = False
+        # Independent readiness flags (decoupled from CAD availability):
+        #   tsdf_ready      -> VBG exists; integration + surface publishing allowed
+        #   reference_ready -> CAD point cloud loaded; registration / ICP allowed
+        #   mesh_ready      -> CAD mesh loaded; synthetic-depth render allowed
+        self.tsdf_ready = False
+        self.reference_ready = False
+        self.mesh_ready = False
         self.integ_lock = threading.Lock()
         self.reg_lock = threading.Lock()
         self.processing_reg = False
@@ -224,10 +243,19 @@ class TSDFPoseNode(Node):
         synth_topic = gp("synthetic_depth_topic").value
         pose_topic  = gp("pose_topic").value
         cloud_topic = gp("fused_cloud_topic").value
-        full_cloud_topic = gp("full_cloud_topic").value
+        surface_topic = gp("surface_cloud_topic").value
         self.pose_pub  = self.create_publisher(PoseStamped,    pose_topic,                  10)
         self.cloud_pub = self.create_publisher(PointCloud2,    cloud_topic,                 10)
-        self.full_cloud_pub = self.create_publisher(PointCloud2, full_cloud_topic, 10)
+        # Source-agnostic surface contract: latched (TRANSIENT_LOCAL) so a late-joining
+        # consumer (orientation control / future Zivid swap) immediately gets the most
+        # recent fused surface. Carries per-point normals.
+        surface_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.surface_pub = self.create_publisher(PointCloud2, surface_topic, surface_qos)
         self.depth_pub = self.create_publisher(Image,          synth_topic,                 10)
         self.depth_compressed_pub = self.create_publisher(
             CompressedImage, synth_topic + "/compressedDepth", 10)
@@ -264,6 +292,12 @@ class TSDFPoseNode(Node):
 
         # React to live parameter updates (e.g. `ros2 param set ...`).
         self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        # Build the voxel grid up front so fusion can run before — or entirely
+        # without — CAD. Only registration (ICP) and the CAD synthetic-depth render
+        # depend on model data; integration does not.
+        self._reset_tsdf()
+        self.tsdf_ready = True
 
     # -----------------------------------------------------------------------
     # Live parameter updates
@@ -303,12 +337,26 @@ class TSDFPoseNode(Node):
                 if int(v) < 1:
                     return reject("register_every_n_frames must be >= 1")
                 pending["register_every"] = int(v)
+            elif n == "surface_publish_every_n_frames":
+                if int(v) < 1:
+                    return reject("surface_publish_every_n_frames must be >= 1")
+                pending["surface_publish_every"] = int(v)
             elif n == "min_integrations_before_register":
                 pending["min_int_before_reg"] = int(v)
             elif n == "extract_weight_threshold":
                 if float(v) < 0:
                     return reject("extract_weight_threshold must be >= 0")
                 pending["extract_weight_threshold"] = float(v)
+            elif n == "crop_enabled":
+                pending["crop_enabled"] = bool(v)
+            elif n == "crop_min":
+                if len(v) != 3:
+                    return reject("crop_min must have 3 elements")
+                pending["crop_min"] = np.asarray(v, dtype=np.float64)
+            elif n == "crop_max":
+                if len(v) != 3:
+                    return reject("crop_max must have 3 elements")
+                pending["crop_max"] = np.asarray(v, dtype=np.float64)
             elif n == "fused_voxel_size":
                 if float(v) <= 0:
                     return reject("fused_voxel_size must be > 0")
@@ -438,41 +486,55 @@ class TSDFPoseNode(Node):
         pc_file    = values[2].string_value
         pc_units   = values[3].string_value
 
-        if not mesh_file or not pc_file:
+        # Reset accumulated fusion ONLY when the object identity changes, i.e. a
+        # previously-loaded non-empty path switches to a *different* non-empty path.
+        # The empty->set transition (we fused CAD-free, then CAD is provided for the
+        # same object) must keep the fused surface and merely enable the CAD-dependent
+        # capabilities (registration / synthetic depth).
+        def _identity_change(old, new):
+            return bool(old) and bool(new) and old != new
+
+        reset_needed = (_identity_change(self._current_mesh_file, mesh_file) or
+                        _identity_change(self._current_pc_file, pc_file))
+
+        # --- CAD mesh -> enables synthetic-depth render (mesh_ready) ---
+        if mesh_file and (mesh_file != self._current_mesh_file or
+                          mesh_units != self._current_mesh_units):
+            try:
+                self.mesh_ready = False
+                self._load_mesh(mesh_file, mesh_units)
+                self._current_mesh_file  = mesh_file
+                self._current_mesh_units = mesh_units
+                self.get_logger().info(f"Mesh loaded: {mesh_file} ({mesh_units})")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load mesh: {e}")
+
+        # --- CAD reference cloud -> enables registration / ICP (reference_ready) ---
+        if pc_file and (pc_file != self._current_pc_file or
+                        pc_units != self._current_pc_units):
+            try:
+                self.reference_ready = False
+                self._load_reference(pc_file, pc_units)
+                self._current_pc_file  = pc_file
+                self._current_pc_units = pc_units
+                self.get_logger().info(f"Reference cloud loaded: {pc_file} ({pc_units})")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load reference cloud: {e}")
+
+        if not mesh_file and not pc_file:
             self.get_logger().info(
-                "Model file paths not yet set in viewpoint_generation, waiting …",
-                throttle_duration_sec=10.0)
-            return
+                "No CAD model set in viewpoint_generation; fusing CAD-free "
+                "(registration and synthetic depth disabled).",
+                throttle_duration_sec=30.0)
 
-        changed = (mesh_file  != self._current_mesh_file  or
-                   mesh_units != self._current_mesh_units or
-                   pc_file    != self._current_pc_file    or
-                   pc_units   != self._current_pc_units)
-        if not changed:
-            return
+        if reset_needed:
+            with self.integ_lock:
+                self._reset_tsdf()
+            self.get_logger().warn(
+                "Object identity changed; cleared accumulated TSDF fusion.")
 
-        if self._current_mesh_file is not None:
-            self.get_logger().info(
-                "Model parameters changed – reinitialising TSDF and reference cloud …")
-
-        self.get_logger().info(f"Mesh : {mesh_file} ({mesh_units})")
-        self.get_logger().info(f"Cloud: {pc_file} ({pc_units})")
-
-        try:
-            self.model_ready = False
-            self._load_models(mesh_file, mesh_units, pc_file, pc_units)
-            self._reset_tsdf()
-            self._current_mesh_file  = mesh_file
-            self._current_mesh_units = mesh_units
-            self._current_pc_file    = pc_file
-            self._current_pc_units   = pc_units
-            self.model_ready = True
-            self.get_logger().info("Model loaded; TSDF ready for integration.")
-        except Exception as e:
-            self.get_logger().error(f"Failed to load models: {e}")
-
-    def _load_models(self, mesh_path, mesh_units, pc_path, pc_units):
-        # Mesh (for raycast / synthetic depth)
+    def _load_mesh(self, mesh_path, mesh_units):
+        """Load the CAD mesh for raycast / synthetic depth (sets mesh_ready)."""
         mesh = o3d.io.read_triangle_mesh(mesh_path)
         if mesh.is_empty():
             raise RuntimeError(f"Failed to load mesh from {mesh_path}")
@@ -483,8 +545,10 @@ class TSDFPoseNode(Node):
         mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh)
         self.ray_scene = o3d.t.geometry.RaycastingScene()
         self.ray_scene.add_triangles(mesh_t)
+        self.mesh_ready = True
 
-        # Reference point cloud (for registration target/source)
+    def _load_reference(self, pc_path, pc_units):
+        """Load the CAD reference point cloud for registration (sets reference_ready)."""
         pcd = o3d.io.read_point_cloud(pc_path)
         if pcd.is_empty():
             raise RuntimeError(f"Failed to load point cloud from {pc_path}")
@@ -493,6 +557,7 @@ class TSDFPoseNode(Node):
         # fly when ref_voxel / feature-radius parameters change.
         self._ref_pcd_raw = pcd
         self._build_reference()
+        self.reference_ready = True
 
     def _build_reference(self):
         """(Re)build the downsampled reference cloud + FPFH from the raw cloud.
@@ -545,7 +610,8 @@ class TSDFPoseNode(Node):
         self.camera_info_pub.publish(msg)
 
     def _depth_cb(self, msg: CompressedImage):
-        if not self.model_ready or self.intrinsics is None:
+        # Integration needs only the VBG + intrinsics + TF — NOT CAD.
+        if not self.tsdf_ready or self.intrinsics is None:
             return
 
         self.frame_count += 1
@@ -557,8 +623,19 @@ class TSDFPoseNode(Node):
                 self.get_logger().error(f"Integration error: {e}",
                                         throttle_duration_sec=2.0)
 
-        # Registration (non-blocking guard)
-        if (self.integration_count >= self.min_int_before_reg and
+        # Publish the fused surface on its own cadence, independent of CAD /
+        # registration, so it flows as soon as geometry accumulates.
+        if (self.integration_count > 0 and
+                self.frame_count % max(1, self.surface_publish_every) == 0):
+            try:
+                self._publish_surface_cloud(msg.header.stamp)
+            except Exception as e:
+                self.get_logger().error(f"Surface publish error: {e}",
+                                        throttle_duration_sec=2.0)
+
+        # Registration (non-blocking guard) — requires the CAD reference cloud.
+        if (self.reference_ready and
+                self.integration_count >= self.min_int_before_reg and
                 self.integration_count % max(1, self.register_every) == 0):
             with self.reg_lock:
                 if not self.processing_reg:
@@ -571,8 +648,8 @@ class TSDFPoseNode(Node):
                     finally:
                         self.processing_reg = False
 
-        # Render synthetic depth at the latest known pose for every frame
-        if self.T_model_in_fusion is not None:
+        # Render synthetic depth from the CAD mesh at the latest known pose.
+        if self.mesh_ready and self.T_model_in_fusion is not None:
             try:
                 self._render_synthetic_depth(msg)
             except Exception as e:
@@ -683,38 +760,19 @@ class TSDFPoseNode(Node):
         return pcd_down
     
     def _crop_fused_cloud(self, cloud: o3d.geometry.PointCloud):
-        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
-        max_bound = np.array([0.1, 0.1, 0.1], dtype=np.float64)
-        cloud_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-        cloud_cropped = cloud.crop(bounding_box=cloud_bbox)
-        return cloud_cropped
-
+        if not self.crop_enabled:
+            return cloud
+        cloud_bbox = o3d.geometry.AxisAlignedBoundingBox(self.crop_min, self.crop_max)
+        return cloud.crop(bounding_box=cloud_bbox)
 
     def _run_registration(self, stamp, force_global: bool = False) -> bool:
         fused = self._extract_fused_cloud()
-        full =  self.vbg.extract_point_cloud(
-            weight_threshold=self.extract_weight_threshold)
-        full = full.to_legacy()
-        min_bound = np.array([-0.1, -0.1, 0.01], dtype=np.float64)
-        max_bound = np.array([0.1, 0.1, np.inf], dtype=np.float64)
-        pcd_bbox = o3d.cuda.pybind.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-        full= full.crop(bounding_box=pcd_bbox)
         if fused is None or len(fused.points) < 100:
             self.get_logger().warn(
                 f"Fused cloud has too few points "
                 f"({0 if fused is None else len(fused.points)}); skipping registration.",
                 throttle_duration_sec=2.0)
             return False
-        if full is None or len(full.points) < 100:
-            self.get_logger().warn(
-                f"Full cloud has too few points "
-                f"({0 if full is None else len(full.points)}); skipping registration.",
-                throttle_duration_sec=2.0)
-            return False
-
-
-        self._publish_cloud(fused, stamp)
-        self._publish_full_cloud(full, stamp)
 
         do_global = force_global or (not self.have_global_init)
         if do_global:
@@ -836,25 +894,58 @@ class TSDFPoseNode(Node):
         msg.is_dense = True
         msg.data = pts.tobytes()
         self.cloud_pub.publish(msg)
-        
-    def _publish_full_cloud(self, pcd: o3d.geometry.PointCloud, stamp):
+
+    def _publish_surface_cloud(self, stamp):
+        """Extract the fused surface (one VBG extraction) and publish it on the
+        source-agnostic surface contract (with normals) plus the legacy xyz-only
+        fused_cloud. Independent of CAD and registration so it flows as soon as
+        geometry accumulates."""
+        fused = self._extract_fused_cloud()
+        if fused is None or len(fused.points) == 0:
+            return
+        self._publish_surface_cloud_with_normals(fused, stamp)
+        self._publish_cloud(fused, stamp)              # legacy xyz-only fused_cloud
+
+    def _publish_surface_cloud_with_normals(self, pcd: o3d.geometry.PointCloud, stamp):
+        """Publish a fused cloud carrying per-point normals on the surface contract
+        (sensor_msgs/PointCloud2 with x,y,z + normal_x,normal_y,normal_z)."""
         pts = np.asarray(pcd.points, dtype=np.float32)
+        if pts.shape[0] == 0:
+            return
+        if pcd.has_normals():
+            nrm = np.asarray(pcd.normals, dtype=np.float32).copy()
+            # Best-effort outward orientation (away from the cloud centroid). The
+            # consumer is the authority on final sign (it re-orients toward the
+            # camera); this is a convenience for RViz / other subscribers.
+            center = pts.mean(axis=0)
+            flip = np.einsum('ij,ij->i', nrm, pts - center) < 0.0
+            nrm[flip] = -nrm[flip]
+        else:
+            nrm = np.zeros_like(pts)
+
+        data = np.empty((pts.shape[0], 6), dtype=np.float32)
+        data[:, 0:3] = pts
+        data[:, 3:6] = nrm
+
         msg = PointCloud2()
         msg.header.stamp = stamp
         msg.header.frame_id = self.fusion_frame
         msg.height = 1
-        msg.width = len(pts)
+        msg.width = pts.shape[0]
         msg.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="x",        offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y",        offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z",        offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="normal_x", offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name="normal_y", offset=16, datatype=PointField.FLOAT32, count=1),
+            PointField(name="normal_z", offset=20, datatype=PointField.FLOAT32, count=1),
         ]
         msg.is_bigendian = False
-        msg.point_step = 12
+        msg.point_step = 24
         msg.row_step = msg.point_step * msg.width
         msg.is_dense = True
-        msg.data = pts.tobytes()
-        self.full_cloud_pub.publish(msg)
+        msg.data = data.tobytes()
+        self.surface_pub.publish(msg)
 
     def _publish_pose(self, T_model_in_fusion: np.ndarray, stamp):
         """Publish T_model_in_world by composing with TF (world <- fusion)."""

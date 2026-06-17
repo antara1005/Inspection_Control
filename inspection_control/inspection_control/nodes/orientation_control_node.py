@@ -12,21 +12,18 @@ from scipy.linalg import expm
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 from geometry_msgs.msg import Vector3Stamped
 from geometry_msgs.msg import WrenchStamped, TwistStamped
 
 from sensor_msgs import msg
 from sensor_msgs.msg import JointState
-from moveit.core.robot_state import RobotState
-#from moveit.core.robot_model_loader import RobotModelLoader
-from moveit.planning import MoveItPy
 
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2, PointField
-from std_msgs.msg import Header, Float64
+from std_msgs.msg import Header, Float64, String
 from cv_bridge import CvBridge
 from builtin_interfaces.msg import Time
 from visualization_msgs.msg import Marker
@@ -43,6 +40,9 @@ from rclpy.serialization import serialize_message
 from tf2_ros import Buffer, TransformListener, TransformException, TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from inspection_control.debag_orientation_data import debag
+from inspection_control.surface_patch import (
+    transform_points_normals, estimate_patch_normal, nearest_axis_point)
+from inspection_control.kdl_jacobian import KdlChain, KDL_AVAILABLE, KDL_IMPORT_ERROR
 
 class AngleKalmanFilterKKF:
     """
@@ -707,18 +707,29 @@ class OrientationControlNode(Node):
                 ('pcd_downsampling_stride', 4),
                 ('target_frame', 'object_frame'),
                 ('main_camera_frame', 'eoat_camera_link'),
+                # KDL Jacobian chain (replaces MoveItPy)
+                ('robot_description_topic', '/robot_description'),
+                ('jacobian_base_frame', 'ur_base_link'),
+                ('jacobian_tip_frame', 'eoat_camera_link'),
                 ('crop_radius', 0.05),
                 ('crop_z_min', 0.05),
                 ('crop_z_max', 0.40),
                 ('standoff_m', 0.10),
                 ('standoff_mode', 'euclidean'),
+                # Surface source: 'depth' (legacy single-frame depth) or 'cloud'
+                # (fused surface cloud with normals on surface_cloud_topic).
+                ('surface_source', 'depth'),
+                ('surface_cloud_topic', '/perception/surface_cloud'),
+                ('surface_max_angle_deg', 30.0),
+                # Min points in the optical-axis patch for a valid measurement.
+                # Lower this if a small crop_radius starves the patch.
+                ('surface_min_points', 10),
                 ('ema_enable', True),
                 ('ema_tau', 0.25),
                 ('normal_estimation_method', 'PCA'),
                 ('visualize_normal_estimation', False),
                 ('no_target_timeout_s', 0.25),
                 ('orientation_control_enabled', False),
-                ('autofocus_enabled', False),
                 ('save_data', False),
                 ('data_path', '/tmp'),
                 ('object', ''),
@@ -783,6 +794,10 @@ class OrientationControlNode(Node):
         self.crop_z_max = float(self.get_parameter('crop_z_max').value)
         self.standoff_m = float(self.get_parameter('standoff_m').value)
         self.standoff_mode = str(self.get_parameter('standoff_mode').value).lower()
+        self.surface_source = str(self.get_parameter('surface_source').value).lower()
+        self.surface_cloud_topic = str(self.get_parameter('surface_cloud_topic').value)
+        self.surface_max_angle_deg = float(self.get_parameter('surface_max_angle_deg').value)
+        self.surface_min_points = int(self.get_parameter('surface_min_points').value)
         self.ema_enable = bool(self.get_parameter('ema_enable').value)
         self.ema_tau = float(self.get_parameter('ema_tau').value)
 
@@ -852,7 +867,6 @@ class OrientationControlNode(Node):
         self._had_target_last_cycle = False
         self._last_target_time_s = None
         self.orientation_control_enabled = bool(self.get_parameter('orientation_control_enabled').value)
-        self.autofocus_enabled = bool(self.get_parameter('autofocus_enabled').value)
 
         # save data parameters
         self.save_data = bool(self.get_parameter('save_data').value)
@@ -888,30 +902,34 @@ class OrientationControlNode(Node):
         self._tf_ready = False
 
         # =============================
-        # MoveIt Jacobian Setup
+        # KDL Jacobian Setup (replaces MoveItPy)
         # =============================
-      #  self.model_loader = RobotModelLoader(self, "robot_description")
-        moveit = MoveItPy(node_name="moveit_py")
-        robot_model = moveit.get_robot_model()
-        self.robot_model = robot_model
+        # The chain is built once the latched /robot_description arrives. The
+        # ur5e MoveIt group is base_link="ur_base_link", tip="eoat_camera_link",
+        # so we mirror that here to keep the EE twist in the same frame.
+        self.robot_description_topic = self.get_parameter('robot_description_topic').get_parameter_value().string_value
+        self.jacobian_base_frame = self.get_parameter('jacobian_base_frame').get_parameter_value().string_value
+        self.jacobian_tip_frame = self.get_parameter('jacobian_tip_frame').get_parameter_value().string_value
+        self.kdl_chain = None
 
-        self.robot_state = RobotState(self.robot_model)
-        self.robot_state.set_to_default_values()
+        if KDL_AVAILABLE:
+            urdf_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.create_subscription(
+                String, self.robot_description_topic, self._on_robot_description, urdf_qos)
+        else:
+            self.get_logger().warn(
+                f"Jacobian twist logging disabled: {KDL_IMPORT_ERROR}. "
+                "Install python3-pykdl and urdfdom-py to enable.")
 
-        self.jmg = self.robot_model.get_joint_model_group("ur5e")
-       # self.ee_link_model = self.robot_model.get_link_model("tool0")
-        self.ee_link_model= "eoat_camera_link"
-        self.joint_positions = None
-        self.joint_velocities = None
-
-       # Subscribe to joint states
+        # Subscribe to joint states
         self.create_subscription(
-        JointState,
-        "/joint_states",
-        self.on_joint_states,
-        10
-      )
- 
+            JointState, "/joint_states", self.on_joint_states, 10)
+
         self.ocd = OrientationControlData()
         # Defaults for new KF logging fields
         self.ocd.kalman_model = "PLANT"
@@ -930,7 +948,21 @@ class OrientationControlNode(Node):
         self.create_subscription(WrenchStamped, f'/teleop/wrench_cmds', self.on_wrench_cmd, qos)
         self.create_subscription(AccelStamped, f'/admittance/accel_cmds', self.on_accel_cmd, qos)
         self.create_subscription(AccelStamped, f'/imu_processor/accel', self.on_rotacc, qos)
-    
+
+        # Source-agnostic fused surface (TSDF now, Zivid later). Latched QoS to match
+        # the publisher so we get the most recent surface immediately on (re)subscribe.
+        self._surface_lock = threading.Lock()
+        self._latest_surface = None
+        surface_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            PointCloud2, self.surface_cloud_topic, self._on_surface_cloud,
+            surface_qos, callback_group=sub_cb_group)
+
         self.last_joy_msg = None
         self.joy_sub = self.create_subscription(Joy, joy_topic, self.joy_callback, qos)
         self.depth_msg = None
@@ -1015,9 +1047,6 @@ class OrientationControlNode(Node):
         self.dyaw = 0.0
         self._prev_tau_yaw = 0.0
         #self._prev2_tau_yaw = 0.0    # NEW: torque history k-2
-
-        # Focus distance PID state
-        self.focal_distance = 0.2810768097639084
 
         self._measurement_lock = threading.Lock()
         self._latest_measurement = {
@@ -1106,11 +1135,6 @@ class OrientationControlNode(Node):
             elif msg.buttons[self.enable_button] and self.orientation_control_enabled:
                 self.disable_orientation_control()
 
-        if not self.last_joy_msg.buttons[1]:
-            if msg.buttons[1] and not self.autofocus_enabled:
-                self.enable_autofocus()
-            elif msg.buttons[1] and self.autofocus_enabled:
-                self.disable_autofocus()
 
         if not self.last_joy_msg.buttons[9]:
             if msg.buttons[9] and not self.visualize_normal_estimation:
@@ -1127,214 +1151,47 @@ class OrientationControlNode(Node):
         self.last_joy_msg = msg
 
 
-    # def on_joint_states(self, msg: JointState):
+    def _on_robot_description(self, msg: String):
+        """Build the KDL chain once the latched /robot_description arrives."""
+        if self.kdl_chain is not None:
+            return
+        try:
+            self.kdl_chain = KdlChain(
+                msg.data, self.jacobian_base_frame, self.jacobian_tip_frame)
+        except Exception as e:
+            self.get_logger().error(f"Failed to build KDL chain: {e}")
+            return
+        self.get_logger().info(
+            f"KDL chain {self.jacobian_base_frame} -> {self.jacobian_tip_frame}, "
+            f"joints={self.kdl_chain.joint_names}")
 
-    #     if len(msg.velocity) == 0:
-    #         return
-
-    #     #ap by name (safe ordering)
-    #     idx = {name: i for i, name in enumerate(msg.name)}
-
-    #     #var_names = self.jmg.get_variable_names()
-        
-    #     if hasattr(self.jmg, "get_active_joint_model_names"):
-    #         var_names = list(self.jmg.get_active_joint_model_names())
-    #         print(var_names)
-    #     elif hasattr(self.jmg, "get_joint_model_names"):
-    #         var_names = list(self.jmg.get_joint_model_names())
-    #     else:
-    #         print("JointModelGroup has no supported joint-name getter in this build")
-    #     N = len(var_names)
-
-    #     q = np.zeros(N)
-    #     qdot = np.zeros(N)
-
-    #     for k, joint_name in enumerate(var_names):
-    #         if joint_name not in idx:
-    #             return
-    #         i = idx[joint_name]
-    #         q[k] = msg.position[i]
-    #         qdot[k] = msg.velocity[i]
-
-    #     #Update state
-    #     self.robot_state.set_joint_group_positions(self.jmg, q)
-    #     self.robot_state.update_link_transforms()
-
-    #     #Compute Jacobian (6xN)
-    #     J = self.robot_state.get_jacobian(
-    #         self.jmg,
-    #         self.ee_link_model,
-    #         [0.0, 0.0, 0.0]
-    #     )
-
-    #     J = np.array(J)
-
-    #     twist = J @ qdot
-
-    #     v = twist[0:3]
-    #     w = twist[3:6]
-
-    # def on_joint_states(self, msg):
-    #     # need positions at least
-    #     if len(msg.position) == 0 or len(msg.name) == 0:
-    #         return
-
-    #     # if velocities missing, set to zeros (or return if you require them)
-    #     has_vel = (len(msg.velocity) == len(msg.name))
-
-    #     # 1) Update RobotState by joint names (no need for var_names from group)
-    #     name_to_pos = {n: msg.position[i] for i, n in enumerate(msg.name)}
-    #     self.robot_state.set_variable_positions(name_to_pos)
-    #     self.robot_state.update_link_transforms()
-
-    #     # 2) Compute Jacobian for the group and your tip link
-    #     tip = "eoat_camera_link"  # or "tool0" if that’s what you want
-    #     J = np.array(self.robot_state.get_jacobian(self.jmg, tip, [0.0, 0.0, 0.0]))
-
-    # # 3) Build qdot vector that matches the Jacobian columns (group DOFs)
-    # # Since your build can’t give group variable names, simplest is:
-    # # - require velocities for all joints contributing to the group
-    # # - OR compute twist only when you know the ordering.
-    # #
-    # # Practical workaround: restrict to UR5e only and manually define order:
-    #     ur_order = [
-    #         "shoulder_pan_joint",
-    #         "shoulder_lift_joint",
-    #         "elbow_joint",
-    #         "wrist_1_joint",
-    #         "wrist_2_joint",
-    #         "wrist_3_joint",
-    #     ]
-
-    #     if not has_vel:
-    #         return
-
-    #     idx = {n: i for i, n in enumerate(msg.name)}
-    #     qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
-
-    #     twist = J @ qdot
-    #     v, w = twist[:3], twist[3:]
-    #     print("v:", v, "w:", w)
-
-    #     print("\n===== EOAT Velocity (from joint states) =====")
-    #     print(f"Linear velocity  (m/s): {v}")
-    #     print(f"Angular velocity (rad/s): {w}")
-    # def on_joint_states(self, msg):
-    #     # require velocities if you want twist (otherwise you can set zeros)
-    #     if len(msg.name) == 0 or len(msg.position) == 0:
-    #         return
-    #     if len(msg.velocity) == 0:
-    #         return
-
-    #     idx = {n: i for i, n in enumerate(msg.name)}
-
-    #     # UR5e joint order (matches MoveIt group DOF order in essentially all UR configs)
-    #     ur_order = [
-    #         "shoulder_pan_joint",
-    #         "shoulder_lift_joint",
-    #         "elbow_joint",
-    #         "wrist_1_joint",
-    #         "wrist_2_joint",
-    #         "wrist_3_joint",
-    #     ]
-
-    #     # build q, qdot in that order
-    #     try:
-    #         q    = np.array([msg.position[idx[j]] for j in ur_order], dtype=float)
-    #         qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
-    #     except KeyError as e:
-    #         self.get_logger().warn(f"Missing joint in /joint_states: {e}")
-    #         return
-
-    #     # update robot state
-    #     self.robot_state.set_joint_group_positions("ur5e", q)
-    #     #self.robot_state.update_link_transforms()
-    #     if hasattr(self.robot_state, "update"):
-    #         self.robot_state.update()
-    #     ref = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
-
-    #     # Jacobian for the link you care about
-    #     tip_link = "eoat_camera_link"  # or "tool0" if that’s what you want
-    #     J = np.array(self.robot_state.get_jacobian("ur5e", tip_link, ref, False))
-
-    #     # sanity: J should be 6x6 for UR5e group
-    #     if J.shape[1] != qdot.shape[0]:
-    #         self.get_logger().error(f"Jacobian cols {J.shape[1]} != qdot len {qdot.shape[0]}")
-    #         return
-
-    #     twist = J @ qdot
-    #     v = twist[:3]
-    #     w = twist[3:]
-
-    #     print("\n===== EOAT Velocity (from joint states) =====")
-    #     print(f"Linear  (m/s):  {v}")
-    #     print(f"Angular (rad/s): {w}")
-    #     with self._joint_twist_lock:
-    #         self.jacobian_lin_vel_cam[:] = v
-    #         self.jacobian_rot_vel_cam[:] = w
-    #         self.jacobian_twist_valid = True
-    
     def on_joint_states(self, msg):
         if len(msg.name) == 0 or len(msg.position) == 0:
             return
         if len(msg.velocity) == 0:
             return
-
-        idx = {n: i for i, n in enumerate(msg.name)}
-
-        ur_order = [
-            "shoulder_pan_joint",
-            "shoulder_lift_joint",
-            "elbow_joint",
-            "wrist_1_joint",
-            "wrist_2_joint",
-            "wrist_3_joint",
-        ]
-
-        try:
-            q    = np.array([msg.position[idx[j]] for j in ur_order], dtype=float)
-            qdot = np.array([msg.velocity[idx[j]] for j in ur_order], dtype=float)
-        except KeyError as e:
-            self.get_logger().warn(f"Missing joint in /joint_states: {e}")
+        if self.kdl_chain is None:
             return
 
-        self.robot_state.set_joint_group_positions("ur5e", q)
+        name_to_pos = dict(zip(msg.name, msg.position))
+        name_to_vel = dict(zip(msg.name, msg.velocity))
 
-        if hasattr(self.robot_state, "update"):
-            self.robot_state.update()
-
-        tip_link = "eoat_camera_link"
-        ref = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
-
-        J = np.array(self.robot_state.get_jacobian("ur5e", tip_link, ref, False))
-
-        if J.shape[1] != qdot.shape[0]:
-            self.get_logger().error(f"Jacobian cols {J.shape[1]} != qdot len {qdot.shape[0]}")
+        result = self.kdl_chain.compute(name_to_pos, name_to_vel)
+        if result is None:
+            self.get_logger().warn(
+                "Missing a chain joint in /joint_states; skipping Jacobian twist.",
+                throttle_duration_sec=2.0)
             return
+        J, R_base_tip, qdot = result
 
+        # Geometric twist of the tip relative to the chain base, expressed in
+        # the base frame (J and the FK rotation come from the same chain so the
+        # frame is consistent); rotate into the tip frame so it is directly
+        # comparable to the commanded twist (frame_id = eoat_camera_link).
         twist_base = J @ qdot
-        v_base = twist_base[:3]
-        w_base = twist_base[3:]
-
-        # Get tip-link transform w.r.t. group/base/world model frame
-        T = self.robot_state.get_global_link_transform(tip_link)
-
-        # Convert rotation to numpy
-        # Depending on your MoveIt Python binding, T may already be a 4x4 numpy array,
-        # or an Eigen/Isometry-like object. The common case below assumes 4x4-like access.
-        T_np = np.array(T)
-        R_base_tip = T_np[:3, :3]
-
-        # Express base-frame twist in tip-link coordinates
         R_tip_base = R_base_tip.T
-        v_tip = -R_tip_base @ v_base
-        w_tip = R_tip_base @ w_base
-
-        # print("\n===== EOAT Velocity =====")
-        # print(f"Linear in base frame (m/s):   {v_base}")
-        # print(f"Angular in base frame (rad/s): {w_base}")
-        # print(f"Linear in tip frame (m/s):    {v_tip}")
-        # print(f"Angular in tip frame (rad/s):  {w_tip}")
+        v_tip = R_tip_base @ twist_base[:3]
+        w_tip = R_tip_base @ twist_base[3:]
 
         with self._joint_twist_lock:
             self.jacobian_lin_vel_cam[:] = v_tip
@@ -1455,8 +1312,293 @@ class OrientationControlNode(Node):
             return x.copy()
         return (1.0 - alpha) * prev + alpha * x
 
+    # ===========================
+    # Source-agnostic measurement emission (shared by depth + cloud paths)
+    # ===========================
+    def _emit_measurement(self, centroid, normal, stamp, surface_points):
+        """Apply EMA to a raw (centroid, normal) in main_camera_frame, compute the
+        goal pose / errors, publish viz + TF, and fill the latest measurement.
+        Returns True on a valid emission; False (leaving prior measurement intact) on
+        a transient TF failure."""
+        now_s = float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+
+        centroid = np.asarray(centroid, dtype=np.float32)
+        normal = np.asarray(normal, dtype=np.float32)
+
+        # --- EMA smoothing of centroid + normal ---
+        if not self.ema_enable:
+            cen_s = centroid
+            nrm_s = normal
+            self._ema_centroid = centroid
+            self._ema_normal = normal
+            self._ema_last_t = now_s
+        else:
+            if self._ema_last_t is None:
+                self._ema_centroid = centroid.copy()
+                self._ema_normal = normal.copy()
+                self._ema_last_t = now_s
+
+            dt = max(0.0, now_s - (self._ema_last_t if self._ema_last_t is not None else now_s))
+            alpha = 1.0 - math.exp(-dt / max(1e-3, self.ema_tau))
+            alpha = min(1.0, max(0.0, alpha))
+
+            self._ema_centroid = self._ema_update(self._ema_centroid, centroid, alpha)
+            self._ema_normal = self._ema_update(self._ema_normal, normal, alpha)
+
+            n = LA.norm(self._ema_normal) + 1e-12
+            self._ema_normal /= n
+
+            cen_s = self._ema_centroid
+            nrm_s = self._ema_normal
+            self._ema_last_t = now_s
+
+        r = -cen_s
+
+        try:
+            T = self.tf_buffer.lookup_transform(
+                'object_frame', self.main_camera_frame, Time(sec=0, nanosec=0),
+                timeout=Duration(seconds=0.001))
+        except TransformException as e:
+            self.get_logger().warn(
+                f'No TF object_frame <- {self.main_camera_frame}: {e}',
+                throttle_duration_sec=2.0)
+            return False
+
+        camera_transform_out = T
+        q = T.transform.rotation
+        R_tf = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
+        x_cf, y_cf, z_cf = R_tf[:, 0], R_tf[:, 1], R_tf[:, 2]
+        t = T.transform.translation
+        t_vec = np.array([t.x, t.y, t.z], dtype=np.float32)
+        surface_position_of = (R_tf @ cen_s) + t_vec
+        surface_normal_of = R_tf @ nrm_s
+
+        surface_normal_pose = PoseStamped()
+        surface_normal_pose.header.stamp = stamp
+        surface_normal_pose.header.frame_id = 'object_frame'
+        surface_normal_pose.pose.position.x = float(surface_position_of[0])
+        surface_normal_pose.pose.position.y = float(surface_position_of[1])
+        surface_normal_pose.pose.position.z = float(surface_position_of[2])
+        surface_normal_pose.pose.orientation = _quaternion_from_z(surface_normal_of)
+        self.normal_estimate_pub.publish(surface_normal_pose)
+
+        tf_msg = TransformStamped()
+        tf_msg.header = surface_normal_pose.header
+        tf_msg.child_frame_id = self.surface_normal_frame
+        tf_msg.transform.translation.x = surface_normal_pose.pose.position.x
+        tf_msg.transform.translation.y = surface_normal_pose.pose.position.y
+        tf_msg.transform.translation.z = surface_normal_pose.pose.position.z
+        tf_msg.transform.rotation = surface_normal_pose.pose.orientation
+        self.tf_broadcaster.sendTransform(tf_msg)
+
+        if self.standoff_mode == 'euclidean':
+            d = float(LA.norm(cen_s))
+        elif self.standoff_mode == 'along_normal':
+            d = float(max(0.0, float(np.dot(nrm_s, cen_s))))
+        else:
+            d = self.standoff_m
+
+        goal_position_cf = cen_s - d * nrm_s
+        goal_orientation_of = _quaternion_from_z(surface_normal_of)
+        R_goal_of = _quat_to_R_xyzw(goal_orientation_of.x, goal_orientation_of.y,
+                                    goal_orientation_of.z, goal_orientation_of.w)
+        R_goal_cf = R_tf.T @ R_goal_of
+        goal_orientation_cf = _R_to_quat_xyzw(R_goal_cf)
+
+        goal_pose = PoseStamped()
+        goal_pose.header.stamp = stamp
+        goal_pose.header.frame_id = self.main_camera_frame
+        goal_pose.pose.position.x = float(goal_position_cf[0])
+        goal_pose.pose.position.y = float(goal_position_cf[1])
+        goal_pose.pose.position.z = float(goal_position_cf[2])
+        goal_pose.pose.orientation = goal_orientation_cf
+        self.pub_eoat_pose_crop.publish(goal_pose)
+
+        nx, ny, nz = nrm_s[0], nrm_s[1], nrm_s[2]
+        pitch_err = math.atan2(float(ny), float(nz))
+        yaw_err = math.atan2(float(nx), float(nz))
+        roll_error = _roll_error(x_cf)
+        rot_vec_error = np.array([pitch_err, yaw_err, roll_error], dtype=np.float32)
+
+        err_msg = Vector3Stamped()
+        err_msg.header.stamp = stamp
+        err_msg.header.frame_id = self.main_camera_frame
+        err_msg.vector.x, err_msg.vector.y, err_msg.vector.z = map(float, rot_vec_error)
+        self.pub_z_rotvec_err.publish(err_msg)
+
+        if surface_points is not None:
+            pcd_msg = make_pointcloud2(surface_points, frame_id=self.main_camera_frame, stamp=stamp)
+            self.point_cloud_publisher.publish(pcd_msg)
+
+        with self._measurement_lock:
+            self._latest_measurement['valid'] = True
+            self._latest_measurement['centroid'] = cen_s.astype(np.float32).copy()
+            self._latest_measurement['normal'] = nrm_s.astype(np.float32).copy()
+            self._latest_measurement['timestamp'] = now_s
+            self._latest_measurement['stamp'] = stamp
+            self._latest_measurement['rot_vec_error'] = rot_vec_error.astype(np.float32)
+            self._latest_measurement['pitch_err'] = float(pitch_err)
+            self._latest_measurement['yaw_err'] = float(yaw_err)
+            self._latest_measurement['surface_points'] = (
+                surface_points.copy() if surface_points is not None else None)
+            self._latest_measurement['d'] = float(d)
+            self._latest_measurement['roll_error'] = float(roll_error)
+            self._latest_measurement['r'] = r.copy()
+            self._latest_measurement['goal_pose'] = goal_pose
+            self._latest_measurement['camera_transform'] = camera_transform_out
+
+        self._had_target_last_cycle = True
+        self._last_target_time_s = now_s
+        return True
+
+    def _emit_no_measurement(self, stamp, surface_points=None):
+        """Mark the latest measurement invalid and run the no-target EMA reset on
+        timeout. Mirrors the legacy 'no valid target' tail."""
+        now_s = float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+
+        if surface_points is not None:
+            pcd_msg = make_pointcloud2(surface_points, frame_id=self.main_camera_frame, stamp=stamp)
+            self.point_cloud_publisher.publish(pcd_msg)
+
+        with self._measurement_lock:
+            self._latest_measurement['valid'] = False
+            self._latest_measurement['centroid'] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            self._latest_measurement['normal'] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            self._latest_measurement['timestamp'] = now_s
+            self._latest_measurement['stamp'] = stamp
+            self._latest_measurement['rot_vec_error'] = np.zeros(3, dtype=np.float32)
+            self._latest_measurement['pitch_err'] = 0.0
+            self._latest_measurement['yaw_err'] = 0.0
+            self._latest_measurement['surface_points'] = (
+                surface_points.copy() if surface_points is not None else None)
+            self._latest_measurement['d'] = 0.0
+            self._latest_measurement['roll_error'] = 0.0
+            self._latest_measurement['r'] = np.zeros(3, dtype=np.float32)
+            self._latest_measurement['goal_pose'] = None
+            self._latest_measurement['camera_transform'] = None
+
+        if (self._last_target_time_s is None) or ((now_s - self._last_target_time_s) > self.no_target_timeout_s):
+            if self._had_target_last_cycle:
+                self.get_logger().warn('No valid target: lost')
+            self._ema_normal = None
+            self._ema_centroid = None
+            self._ema_last_t = None
+            self._had_target_last_cycle = False
+        return False
+
+    # ===========================
+    # Cloud path (fused surface -> measurement)
+    # ===========================
+    def _on_surface_cloud(self, msg: PointCloud2):
+        """Store the latest fused surface cloud (with normals) for cloud-mode control."""
+        try:
+            points, normals, confidence = self._parse_surface_cloud(msg)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to parse surface cloud: {e}',
+                                   throttle_duration_sec=5.0)
+            return
+        with self._surface_lock:
+            self._latest_surface = {
+                'points': points,
+                'normals': normals,
+                'confidence': confidence,
+                'frame_id': msg.header.frame_id,
+            }
+
+    @staticmethod
+    def _parse_surface_cloud(msg: PointCloud2):
+        """Parse PointCloud2 with x,y,z (+ optional normal_x/y/z, confidence) into
+        numpy arrays. Returns (points Nx3, normals Nx3 or None, confidence N or None)."""
+        offsets = {f.name: f.offset for f in msg.fields}
+        n = msg.width * msg.height
+        step = msg.point_step
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        if n == 0 or raw.size < n * step:
+            return np.zeros((0, 3), np.float32), None, None
+        raw = raw[:n * step].reshape(n, step)
+
+        def col(name):
+            off = offsets[name]
+            return raw[:, off:off + 4].copy().view(np.float32).reshape(-1)
+
+        points = np.stack([col('x'), col('y'), col('z')], axis=1).astype(np.float32)
+        normals = None
+        if all(k in offsets for k in ('normal_x', 'normal_y', 'normal_z')):
+            normals = np.stack(
+                [col('normal_x'), col('normal_y'), col('normal_z')], axis=1).astype(np.float32)
+        confidence = col('confidence').astype(np.float32) if 'confidence' in offsets else None
+        return points, normals, confidence
+
+    def _process_surface_cloud(self):
+        """Cloud-mode measurement: transform the latest fused surface into the camera
+        frame with CURRENT TF, select the optical-axis patch, and emit a measurement.
+        Prefers provided normals; falls back to plane fitting when absent."""
+        stamp = self.get_clock().now().to_msg()
+
+        with self._surface_lock:
+            surface = self._latest_surface
+        if surface is None or surface['points'].shape[0] == 0:
+            self._emit_no_measurement(stamp, None)
+            return
+
+        try:
+            T = self.tf_buffer.lookup_transform(
+                self.main_camera_frame, surface['frame_id'], Time(sec=0, nanosec=0),
+                timeout=Duration(seconds=0.005))
+        except TransformException as e:
+            self.get_logger().warn(
+                f"No TF {self.main_camera_frame} <- {surface['frame_id']}: {e}",
+                throttle_duration_sec=2.0)
+            self._emit_no_measurement(stamp, None)
+            return
+
+        q = T.transform.rotation
+        R = _quat_to_R_xyzw(q.x, q.y, q.z, q.w).astype(np.float64)
+        tr = T.transform.translation
+        t = np.array([tr.x, tr.y, tr.z], dtype=np.float64)
+
+        pts_cam, nrm_cam = transform_points_normals(
+            surface['points'], surface['normals'], R, t)
+
+        # Focal distance: distance to the surface point nearest the optical axis
+        # (x,y = 0) over the FULL cloud, independent of crop_radius and of the
+        # normal-estimation patch validity. Published whenever a cloud exists.
+        self._publish_focal_distance(pts_cam)
+
+        res = estimate_patch_normal(
+            pts_cam, nrm_cam,
+            crop_radius=self.crop_radius, z_min=self.crop_z_min, z_max=self.crop_z_max,
+            confidence=surface['confidence'],
+            min_points=self.surface_min_points, max_angle_deg=self.surface_max_angle_deg)
+
+        if res is None:
+            self._emit_no_measurement(stamp, None)
+            return
+
+        patch = res['patch_points']
+        if res['has_normal']:
+            centroid, normal = res['centroid'], res['normal']
+        else:
+            # Source shipped no normals -> fall back to plane fitting on the patch.
+            if self.normal_estimation_method == 'RANSAC':
+                centroid, normal = _ransac_plane_normal(patch)
+            else:
+                centroid, normal = _pca_plane_normal(patch)
+
+        self._emit_measurement(centroid, normal, stamp, patch)
+
+    def _publish_focal_distance(self, pts_cam):
+        """Publish focal_distance_m as the distance to the point nearest the
+        optical axis (x,y = 0), depth-gated by crop_z_min/max only."""
+        axis_pt = nearest_axis_point(pts_cam, self.crop_z_min, self.crop_z_max)
+        if axis_pt is not None:
+            self.distance_pub.publish(Float64(data=float(LA.norm(axis_pt))))
+
     def on_depth(self, msg: CompressedImage):
         self.depth_msg = msg
+        # In cloud mode the fused surface drives control; skip the live-depth path.
+        if self.surface_source == 'cloud':
+            return
         self.process_depth(msg)
 
     # ===========================
@@ -1500,6 +1642,8 @@ class OrientationControlNode(Node):
 
         points1 = np.zeros((0, 3), dtype=np.float32)
         points2 = np.zeros((0, 3), dtype=np.float32)
+        meas_centroid = None
+        meas_normal = None
 
         pitch_err = 0.0
         yaw_err = 0.0
@@ -1581,139 +1725,13 @@ class OrientationControlNode(Node):
                             self.get_logger().info('Re-enabling orientation_control_enabled after visualization closed')
                         self._orientation_control_before_viz = False
 
-                    if not self.ema_enable:
-                        cen_s = centroid
-                        nrm_s = normal
-                        self._ema_centroid = centroid
-                        self._ema_normal = normal
-                        self._ema_last_t = now_s
-                    else:
-                        if self._ema_last_t is None:
-                            self._ema_centroid = centroid.copy()
-                            self._ema_normal = normal.copy()
-                            self._ema_last_t = now_s
+                    meas_centroid = centroid
+                    meas_normal = normal
 
-                        dt = max(0.0, now_s - (self._ema_last_t if self._ema_last_t is not None else now_s))
-                        alpha = 1.0 - math.exp(-dt / max(1e-3, self.ema_tau))
-                        alpha = min(1.0, max(0.0, alpha))
-
-                        self._ema_centroid = self._ema_update(self._ema_centroid, centroid, alpha)
-                        self._ema_normal = self._ema_update(self._ema_normal, normal, alpha)
-
-                        n = LA.norm(self._ema_normal) + 1e-12
-                        self._ema_normal /= n
-
-                        cen_s = self._ema_centroid
-                        nrm_s = self._ema_normal
-                        self._ema_last_t = now_s
-
-                    r = -cen_s
-
-                    T = self.tf_buffer.lookup_transform(
-                        'object_frame', self.main_camera_frame, Time(sec=0, nanosec=0), timeout=Duration(seconds=0.001))
-                    camera_transform_out = T
-                    q = T.transform.rotation
-                    R_tf = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
-                    x_cf, y_cf, z_cf = R_tf[:, 0], R_tf[:, 1], R_tf[:, 2]
-                    t = T.transform.translation
-                    t_vec = np.array([t.x, t.y, t.z], dtype=np.float32)
-                    surface_position_of = (R_tf @ cen_s) + t_vec
-                    surface_normal_of = R_tf @ nrm_s
-
-                    surface_normal_pose = PoseStamped()
-                    surface_normal_pose.header = msg.header
-                    surface_normal_pose.header.frame_id = 'object_frame'
-                    surface_normal_pose.pose.position.x = float(surface_position_of[0])
-                    surface_normal_pose.pose.position.y = float(surface_position_of[1])
-                    surface_normal_pose.pose.position.z = float(surface_position_of[2])
-                    surface_normal_pose.pose.orientation = _quaternion_from_z(surface_normal_of)
-                    self.normal_estimate_pub.publish(surface_normal_pose)
-
-                    tf_msg = TransformStamped()
-                    tf_msg.header = surface_normal_pose.header
-                    tf_msg.child_frame_id = self.surface_normal_frame
-                    tf_msg.transform.translation.x = surface_normal_pose.pose.position.x
-                    tf_msg.transform.translation.y = surface_normal_pose.pose.position.y
-                    tf_msg.transform.translation.z = surface_normal_pose.pose.position.z
-                    tf_msg.transform.rotation = surface_normal_pose.pose.orientation
-                    self.tf_broadcaster.sendTransform(tf_msg)
-
-                    if self.standoff_mode == 'euclidean':
-                        d = float(LA.norm(cen_s))
-                    elif self.standoff_mode == 'along_normal':
-                        d = float(max(0.0, float(np.dot(nrm_s, cen_s))))
-                    else:
-                        d = self.standoff_m
-
-                    goal_position_cf = cen_s - d * nrm_s
-                    goal_orientation_of = _quaternion_from_z(surface_normal_of)
-                    R_goal_of = _quat_to_R_xyzw(goal_orientation_of.x, goal_orientation_of.y,
-                                                goal_orientation_of.z, goal_orientation_of.w)
-                    R_goal_cf = R_tf.T @ R_goal_of
-                    goal_orientation_cf = _R_to_quat_xyzw(R_goal_cf)
-
-                    goal_pose = PoseStamped()
-                    goal_pose.header = msg.header
-                    goal_pose.header.frame_id = self.main_camera_frame
-                    goal_pose.pose.position.x = float(goal_position_cf[0])
-                    goal_pose.pose.position.y = float(goal_position_cf[1])
-                    goal_pose.pose.position.z = float(goal_position_cf[2])
-                    goal_pose.pose.orientation = goal_orientation_cf
-                    self.pub_eoat_pose_crop.publish(goal_pose)
-
-                    nx, ny, nz = nrm_s[0], nrm_s[1], nrm_s[2]
-                    pitch_err = math.atan2(float(ny), float(nz))
-                    yaw_err = math.atan2(float(nx), float(nz))
-
-                    roll_error = _roll_error(x_cf)
-
-                    rot_vec_error = np.array([pitch_err, yaw_err, roll_error], dtype=np.float32)
-
-                    centroid_out = cen_s.astype(np.float32)
-                    normal_out = nrm_s.astype(np.float32)
-                    rotvec_err_out = rot_vec_error.astype(np.float32)
-
-                    err_msg = Vector3Stamped()
-                    err_msg.header = msg.header
-                    err_msg.header.frame_id = self.main_camera_frame
-                    err_msg.vector.x, err_msg.vector.y, err_msg.vector.z = map(float, rot_vec_error)
-                    self.pub_z_rotvec_err.publish(err_msg)
-
-                    measurement_ok = True
-                    self._had_target_last_cycle = True
-                    self._last_target_time_s = now_s
-
-        pcd_msg = make_pointcloud2(points2, frame_id=self.main_camera_frame, stamp=msg.header.stamp)
-        self.point_cloud_publisher.publish(pcd_msg)
-
-        goal_pose_out = None
-        if measurement_ok:
-            goal_pose_out = goal_pose
-
-        with self._measurement_lock:
-            self._latest_measurement['valid'] = measurement_ok
-            self._latest_measurement['centroid'] = centroid_out.copy()
-            self._latest_measurement['normal'] = normal_out.copy()
-            self._latest_measurement['timestamp'] = now_s
-            self._latest_measurement['stamp'] = msg.header.stamp
-            self._latest_measurement['rot_vec_error'] = rotvec_err_out.copy()
-            self._latest_measurement['pitch_err'] = float(pitch_err)
-            self._latest_measurement['yaw_err'] = float(yaw_err)
-            self._latest_measurement['surface_points'] = points2.copy() if points2 is not None else None
-            self._latest_measurement['d'] = float(d)
-            self._latest_measurement['roll_error'] = float(roll_error)
-            self._latest_measurement['r'] = r.copy()
-            self._latest_measurement['goal_pose'] = goal_pose_out
-            self._latest_measurement['camera_transform'] = camera_transform_out
-
-        if not measurement_ok:
-            if (self._last_target_time_s is None) or ((now_s - self._last_target_time_s) > self.no_target_timeout_s):
-                if self._had_target_last_cycle:
-                    self.get_logger().warn('No valid target: lost')
-                self._ema_normal = None
-                self._ema_centroid = None
-                self._ema_last_t = None
-                self._had_target_last_cycle = False
+        if meas_centroid is not None:
+            self._emit_measurement(meas_centroid, meas_normal, msg.header.stamp, points2)
+        else:
+            self._emit_no_measurement(msg.header.stamp, points2)
 
     def _handle_no_measurement(self):
         now_s = self.get_clock().now().nanoseconds * 1e-9
@@ -1744,6 +1762,11 @@ class OrientationControlNode(Node):
     # process_controller (CHANGED)
     # ===========================
     def process_controller(self):
+        # In cloud mode, refresh the measurement from the latest fused surface using
+        # CURRENT TF before the controller reads it (keeps the camera-frame normal
+        # current even when the surface cloud is stale).
+        if self.surface_source == 'cloud':
+            self._process_surface_cloud()
         with self._measurement_lock:
             has_measurement = self._latest_measurement['valid']
             if has_measurement:
@@ -2003,8 +2026,6 @@ class OrientationControlNode(Node):
             tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
             moment_tele_A = np.cross(r, self.force_teleop)
 
-            F_z = -1 * self.Kp * (self.focal_distance - d)
-
             force_drag_B = -self.linear_drag * self.lin_vel_cam
             moment_drag_B = -self.angular_drag * self.rot_vel_cam
             moment_dragB_A = np.cross(r, force_drag_B)
@@ -2013,11 +2034,13 @@ class OrientationControlNode(Node):
             tau_out = tau_theta_vec.copy()
             self._last_tau = tau_theta_vec.copy()
             self.force_B = self.mass_B * np.cross(self.ang_acc, r) - force_drag_B - self.force_teleop
-            self.force_B[2] = F_z
             self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop
             self.tau_B[2] = tau_roll
 
-            self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
+            # Cloud mode publishes focal_distance_m from the full cloud in
+            # _process_surface_cloud; only the legacy depth path publishes here.
+            if self.surface_source != 'cloud':
+                self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
         else:
             self._handle_no_measurement()
 
@@ -2040,10 +2063,6 @@ class OrientationControlNode(Node):
                 self._last_tau = tau_out.copy()
                 self._last_force[0] = 0.0
                 self._last_force[1] = 0.0
-
-            if self.autofocus_enabled:
-                w.wrench.force.z = float(F_z)
-                print(f"Applying autofocus force F_z: {F_z:.3f} N based on focal distance error {self.focal_distance - d:.3f} m")
 
         self.pub_wrench_cmd.publish(w)
 
@@ -2152,9 +2171,9 @@ class OrientationControlNode(Node):
 
         if jacobian_twist_valid:
             self.ocd.jacobian_twist.twist.linear.x = float(jac_v[0])
-            self.ocd.jacobian_twist.twist.linear.y = float(-jac_v[1])
+            self.ocd.jacobian_twist.twist.linear.y = float(jac_v[1])
             self.ocd.jacobian_twist.twist.linear.z = float(jac_v[2])
-            self.ocd.jacobian_twist.twist.angular.x = float(-jac_w[0])
+            self.ocd.jacobian_twist.twist.angular.x = float(jac_w[0])
             self.ocd.jacobian_twist.twist.angular.y = float(jac_w[1])
             self.ocd.jacobian_twist.twist.angular.z = float(jac_w[2])
         else:
@@ -2254,14 +2273,6 @@ class OrientationControlNode(Node):
         self.orientation_control_enabled = False
         self.get_logger().info('Orientation control DISABLED.')
 
-    def enable_autofocus(self):
-        self.autofocus_enabled = True
-        self.get_logger().info('Autofocus ENABLED.')
-
-    def disable_autofocus(self):
-        self.autofocus_enabled = False
-        self.get_logger().info('Autofocus DISABLED.')
-
     def _on_param_update(self, params):
         for p in params:
             if p.name == 'dmap_filter_min':
@@ -2278,6 +2289,8 @@ class OrientationControlNode(Node):
                     self.main_camera_frame = new_frame
             elif p.name == 'crop_radius':
                 self.crop_radius = float(p.value)
+            elif p.name == 'surface_min_points':
+                self.surface_min_points = int(p.value)
             elif p.name == 'crop_z_min':
                 self.crop_z_min = float(p.value)
             elif p.name == 'crop_z_max':
@@ -2311,12 +2324,6 @@ class OrientationControlNode(Node):
                     self.enable_orientation_control()
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
-
-            elif p.name == 'autofocus_enabled':
-                if not self.autofocus_enabled and p.value:
-                    self.enable_autofocus()
-                elif self.autofocus_enabled and not p.value:
-                    self.disable_autofocus()
 
             elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
                 self.mass_B = float(p.value)

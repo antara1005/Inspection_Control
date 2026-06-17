@@ -23,6 +23,7 @@ class AdmittanceControlNode(Node):
                 ('frame_id', 'eoat_camera_link'),
                 ('teleop_wrench_topic', '/teleop/wrench_cmds'),
                 ('orientation_wrench_topic', '/orientation_controller/wrench_cmds'),
+                ('autofocus_wrench_topic', '/autofocus/wrench_cmds'),
                 ('servo_twist_topic', '/servo_node/delta_twist_cmds'),
 
                 # NEW: accel topic
@@ -46,6 +47,8 @@ class AdmittanceControlNode(Node):
             self.get_parameter('teleop_wrench_topic').value)
         orientation_wrench_topic = str(
             self.get_parameter('orientation_wrench_topic').value)
+        autofocus_wrench_topic = str(
+            self.get_parameter('autofocus_wrench_topic').value)
         servo_twist_topic = str(self.get_parameter('servo_twist_topic').value)
 
         # NEW: accel topic
@@ -75,6 +78,9 @@ class AdmittanceControlNode(Node):
         self.orient_sub = self.create_subscription(
             WrenchStamped, orientation_wrench_topic, self.wrench_callback_orientation, qos_profile
         )
+        self.autofocus_sub = self.create_subscription(
+            WrenchStamped, autofocus_wrench_topic, self.wrench_callback_autofocus, qos_profile
+        )
 
         self.linear_vel = [0.0, 0.0, 0.0]
         self.angular_vel = [0.0, 0.0, 0.0]
@@ -87,6 +93,8 @@ class AdmittanceControlNode(Node):
         self.teleop_T = [0.0, 0.0, 0.0]
         self.orient_F = [0.0, 0.0, 0.0]
         self.orient_T = [0.0, 0.0, 0.0]
+        self.autofocus_F = [0.0, 0.0, 0.0]
+        self.autofocus_T = [0.0, 0.0, 0.0]
 
         self.have_any_wrench = False
 
@@ -119,6 +127,11 @@ class AdmittanceControlNode(Node):
         self.orient_T[0], self.orient_T[1], self.orient_T[2] = msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z
         self.have_any_wrench = True
 
+    def wrench_callback_autofocus(self, msg: WrenchStamped):
+        self.autofocus_F[0], self.autofocus_F[1], self.autofocus_F[2] = msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z
+        self.autofocus_T[0], self.autofocus_T[1], self.autofocus_T[2] = msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z
+        self.have_any_wrench = True
+
     def publish_twist(self):
         if not self.have_any_wrench:
             return
@@ -134,19 +147,19 @@ class AdmittanceControlNode(Node):
         self.last_time = now
 
         F_cmd = [
-            self.teleop_F[0] + self.orient_F[0] -
+            self.teleop_F[0] + self.orient_F[0] + self.autofocus_F[0] -
             self.linear_drag * self.linear_vel[0],
-            self.teleop_F[1] + self.orient_F[1] -
+            self.teleop_F[1] + self.orient_F[1] + self.autofocus_F[1] -
             self.linear_drag * self.linear_vel[1],
-            self.teleop_F[2] + self.orient_F[2] -
+            self.teleop_F[2] + self.orient_F[2] + self.autofocus_F[2] -
             self.linear_drag * self.linear_vel[2],
         ]
         T_cmd = [
-            self.teleop_T[0] + self.orient_T[0] -
+            self.teleop_T[0] + self.orient_T[0] + self.autofocus_T[0] -
             self.angular_drag * self.angular_vel[0],
-            self.teleop_T[1] + self.orient_T[1] -
+            self.teleop_T[1] + self.orient_T[1] + self.autofocus_T[1] -
             self.angular_drag * self.angular_vel[1],
-            self.teleop_T[2] + self.orient_T[2] -
+            self.teleop_T[2] + self.orient_T[2] + self.autofocus_T[2] -
             self.angular_drag * self.angular_vel[2],
         ]
 

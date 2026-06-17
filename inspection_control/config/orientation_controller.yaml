@@ -15,7 +15,7 @@ orientation_controller:
     target_frame: object_frame #frame of the target object
     main_camera_frame: eoat_camera_link #frame of the eoat camera
     #cropped parameters in eoat camera frame
-    crop_radius: 0.025
+    crop_radius: 0.01
     crop_z_min: 0.05
     crop_z_max: 0.40
     
@@ -26,6 +26,15 @@ orientation_controller:
 
     normal_estimation_method: RANSAC #options: PCA, RANSAC
     visualize_normal_estimation: False
+
+    # Surface source for normal estimation.
+    #   depth -> legacy single live depth frame (deproject + plane fit)
+    #   cloud -> fused surface cloud with normals on surface_cloud_topic
+    surface_source: cloud
+    surface_cloud_topic: /perception/surface_cloud
+    surface_max_angle_deg: 30.0  # angular outlier rejection for fused normals
+    surface_min_points: 10       # min patch points for a valid measurement;
+                                 # lower if a small crop_radius starves the patch
 
     no_target_timeout: 0.25
     publish_zero_when_lost: True

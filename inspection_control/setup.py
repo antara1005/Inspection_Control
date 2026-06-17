@@ -29,6 +29,7 @@ setup(
             'focus_monitor = inspection_control.nodes.focus_monitor_node:main',
             'multi_speed_autofocus = inspection_control.nodes.multi_speed_autofocus_node:main',
             'autofocus_node = inspection_control.nodes.autofocus_node:main',
+            'autofocus_node_old = inspection_control.nodes.autofocus_node_old:main',
             'admittance_control_node = inspection_control.nodes.admittance_control_node:main',
             'orientation_control_node = inspection_control.nodes.orientation_control_node:main',
             'turntable_joy_node = inspection_control.nodes.turntable_joy_node:main',
