@@ -97,6 +97,8 @@ class World:
         q_d += od + ad
         q_phi += ophi + aphi
 
-        # 3. Integrate the coupled pendulum and update the pose.
-        self.plant.step(self.camera, ray, q_a, q_d, q_phi, dt)
+        # 3. Integrate the plant: pendulum about the surface pivot when orientation is
+        #    engaged, else a free body in camera coordinates (COM rotation).
+        self.plant.step(self.camera, ray, q_a, q_d, q_phi, dt,
+                        pivot=self.orientation.enabled)
         return ray

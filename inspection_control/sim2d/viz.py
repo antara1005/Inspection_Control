@@ -4,13 +4,17 @@ A ``FuncAnimation`` advances :meth:`World.step` at a fixed rate and redraws the
 surface, camera, optical-axis ray, surface normal, and a text HUD. Keyboard nudges the
 camera (manual teleop) and toggles controllers; sliders tune gains live.
 
-Controls (all in the surface-pivot frame of the coupled pendulum plant)
+Controls — teleop meaning depends on whether orientation is engaged.
 --------
-  W / S      standoff −/+ (move camera toward / away from the surface, changes d)
-  A / D      slide the pivot along the surface tangent (−/+ t)
-  Q / E      swing: nudge the orientation reference Δ when orientation is ON,
-             else apply a manual swing torque about the pivot
-  o          toggle orientation control (pure swing torque about the target)
+  Orientation ON (pendulum about the surface pivot):
+    W / S    standoff −/+ (toward / away from the surface, changes d)
+    A / D    slide the pivot along the surface tangent (−/+ t)
+    Q / E    nudge the orientation reference Δ (pivot the view about the target)
+  Orientation OFF (free body in camera coordinates):
+    W / S    forward / backward along the optical axis
+    A / D    left / right (camera frame)
+    Q / E    rotate the camera about its COM
+  o          toggle orientation control
   f          toggle autofocus drive (to the known true peak distance)
   space      reset camera + plant
   (sliders)  zeta, orient v_max, theta_max, integral_alpha, autofocus v_max,
@@ -159,14 +163,16 @@ class SimApp:
     def _on_key(self, event):
         k = (event.key or "").lower()
         w = self.world
-        # Teleop in the surface-pivot frame (generalized efforts).
-        if k == "w":                       # toward the surface -> decrease d
+        # Generalized efforts. The plant interprets them in the surface-pivot frame
+        # when orientation is ON (pendulum) and in the camera frame when OFF (free
+        # body): standoff↔optical axis, tangential↔camera-right, swing↔COM rotation.
+        if k == "w":                       # toward the surface / forward -> decrease d
             w.teleop_standoff -= TELEOP_FORCE
-        elif k == "s":                     # away from the surface -> increase d
+        elif k == "s":                     # away / backward -> increase d
             w.teleop_standoff += TELEOP_FORCE
-        elif k == "d":                     # slide pivot along +t
+        elif k == "d":                     # +tangential (slide) / camera-right
             w.teleop_tangential += TELEOP_FORCE
-        elif k == "a":                     # slide pivot along -t
+        elif k == "a":                     # -tangential (slide) / camera-left
             w.teleop_tangential -= TELEOP_FORCE
         elif k in ("q", "e"):              # swing
             sign = 1.0 if k == "q" else -1.0

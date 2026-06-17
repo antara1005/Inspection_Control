@@ -63,17 +63,20 @@ class PendulumPlant:
         self.ang_vel = 0.0
 
     # ------------------------------------------------------------------ #
-    def step(self, camera, ray, q_a: float, q_d: float, q_phi: float, dt: float):
+    def step(self, camera, ray, q_a: float, q_d: float, q_phi: float, dt: float,
+             pivot: bool = True):
         """Integrate one tick from generalized efforts ``(q_a, q_d, q_phi)``.
 
-        ``q_a`` slides the pivot along the surface tangent, ``q_d`` is the standoff
-        force, ``q_phi`` the swing torque. Updates ``camera.pos``/``camera.theta`` and
-        the persistent world velocity.
+        With ``pivot`` (orientation engaged): pendulum about the surface contact —
+        ``q_a`` slides the pivot along the tangent, ``q_d`` is the standoff force,
+        ``q_phi`` the swing torque. Without ``pivot`` (or off-surface / grazing): a
+        **free body in camera coordinates** — ``q_a`` is camera-right, ``q_d`` along the
+        optical axis, ``q_phi`` a torque about the camera COM.
         """
         u = camera.optical_axis                      # û = (cosφ, sinφ)
         u_perp = np.array([-u[1], u[0]])             # û⊥
 
-        if not ray.hit:
+        if not pivot or not ray.hit:
             return self._free_step(camera, u, u_perp, q_a, q_d, q_phi, dt)
 
         t = ray.tangent                              # surface tangent (unit)

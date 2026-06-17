@@ -30,16 +30,17 @@ not display the window.
 
 ## Controls
 
-All teleop acts in the **surface-pivot frame** of the coupled pendulum plant:
+Teleop meaning depends on whether orientation is engaged — **surface-pivot frame** when
+ON (pendulum), **camera frame** when OFF (free body, rotation about the COM):
 
-| key        | action |
-|------------|--------|
-| `W`/`S`    | standoff −/+ (move toward / away from the surface — changes `d`) |
-| `A`/`D`    | slide the pivot along the surface tangent (−/+ `t`) |
-| `Q`/`E`    | swing: nudge the orientation reference `Δ` when orientation is ON, else apply a manual swing torque |
-| `o`        | toggle **orientation** (pure swing torque about the surface target) |
-| `f`        | toggle **autofocus** drive (to the known true peak distance) |
-| `space`    | reset camera + plant |
+| key      | orientation ON (pendulum) | orientation OFF (free body) |
+|----------|---------------------------|-----------------------------|
+| `W`/`S`  | standoff −/+ (toward / away, changes `d`) | forward / backward along the optical axis |
+| `A`/`D`  | slide the pivot along the surface tangent | left / right (camera frame) |
+| `Q`/`E`  | nudge the reference `Δ` (pivot the view about the target) | rotate the camera about its COM |
+| `o`      | toggle **orientation** control | |
+| `f`      | toggle **autofocus** drive (to the known true peak) | |
+| `space`  | reset camera + plant | |
 
 Sliders (left): orientation tuning — `zeta`, `orient v_max` (speed: raises the torque
 budget `c·d·v_max`), `theta_max`, `integral_alpha` (PID) — plus autofocus `v_max`,
