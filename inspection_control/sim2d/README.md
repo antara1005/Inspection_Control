@@ -9,9 +9,13 @@ The control math mirrors the real nodes so insights port straight back:
 
 | sandbox file        | mirrors node                  | law |
 |---------------------|-------------------------------|-----|
-| `dynamics.py`       | `admittance_control_node.py`  | virtual mass + Stokes drag (`m·v̇+c·v=F`, `I·ω̇+c_ang·ω=τ`) |
-| `controllers.py`    | `orientation_control_node.py` | theta-error torque about the surface point (parallel-axis pivot), converted to an equivalent camera wrench via Newton-Euler |
-| `controllers.py`    | `autofocus_node.py`           | PD drive of the focal distance to a known true peak |
+| `dynamics.py`       | `admittance_control_node.py`  | coupled **pendulum** plant about the surface pivot — generalized coords `(slide a, standoff d, swing φ)`, `I_A=I_B+m·d²` |
+| `controllers.py`    | `orientation_control_node.py` | pole-placement PD **torque on the swing** `φ` about the surface point (no Newton-Euler feedforward) |
+| `controllers.py`    | `autofocus_node.py`           | PD **force on the standoff** `d` toward a known true peak |
+
+The coupled-dynamics rewrite (why the old point-mass + Newton-Euler feedforward went
+unstable, and the new model) is documented in
+[`docs/coupled-pendulum-dynamics.md`](docs/coupled-pendulum-dynamics.md).
 
 ## Run
 
@@ -26,12 +30,14 @@ not display the window.
 
 ## Controls
 
+All teleop acts in the **surface-pivot frame** of the coupled pendulum plant:
+
 | key        | action |
 |------------|--------|
-| `W`/`S`    | teleop force forward/backward (along the optical axis) |
-| `A`/`D`    | teleop force left/right (camera frame) |
-| `Q`/`E`    | teleop torque (rotate CCW/CW) |
-| `o`        | toggle **orientation** alignment torque (rotation only) |
+| `W`/`S`    | standoff −/+ (move toward / away from the surface — changes `d`) |
+| `A`/`D`    | slide the pivot along the surface tangent (−/+ `t`) |
+| `Q`/`E`    | swing: nudge the orientation reference `Δ` when orientation is ON, else apply a manual swing torque |
+| `o`        | toggle **orientation** (pure swing torque about the surface target) |
 | `f`        | toggle **autofocus** drive (to the known true peak distance) |
 | `space`    | reset camera + plant |
 
@@ -40,22 +46,26 @@ noise** std — `dist noise σ` (m) and `norm noise σ°` (degrees, rotates the 
 normal). Noise is injected into the measurement, so the controllers *and* the drawn
 ray/normal reflect the noisy values.
 Radio buttons (left): surface shape. The HUD (top-left of the plot) shows focal
-distance, focus value, orientation error, and autofocus mode/target.
+distance, focus value, orientation swing error + `Δ`, and autofocus state/target.
 
-### Orientation = pivot about the surface point
-The theta-error torque is applied **about the surface contact point**, not the camera
-center. Using the parallel-axis pivot inertia `I_A = I_B + m·d²` and the pivot drag
-`b = 6πμR·d²`, a pole-placement PD sets the pivot torque to realize
-`I_A·θ̈ + (b+k₂)·θ̇ + k₁·θ = 0`; a Newton-Euler step converts it to the equivalent
-camera force + torque fed to the admittance plant. The net camera force is purely
-**lateral** (the camera swings about the contact point) — orientation never pushes
-along the optical axis, so focal distance stays owned by autofocus and teleop.
+### Coupled pendulum dynamics
+The plant models the camera as a **pendulum bob** swinging about the surface contact
+point (the pivot) at standoff `d`, in generalized coordinates `(a, d, φ)` = tangential
+slide / standoff / swing. Each controller owns one coordinate, so they no longer fight
+through a feedforward:
 
-Following the reference method, **only orientation is controlled** — there is no
-position/standoff term. With a free base this leaves lateral position as an undamped
-mode, so engaging orientation from a large offset makes the camera glide/roll along
-the surface as it re-aims; hold position with teleop (or keep initial misalignment
-small). See <https://macs-lab.github.io/robotic-inspection-orientation-control-2026/>.
+- **orientation** applies a pure pole-placement PD **torque on the swing** `φ` to track
+  `φ_ref = angle(−n) + Δ` (`Δ` = `Q/E` reference offset → pivot the view about the target);
+- **autofocus** applies a PD **force on the standoff** `d`;
+- **teleop** translates in the surface frame and, by construction, does **not** swing the
+  camera (the slide↔swing coupling is removed).
+
+The swing inertia is the parallel-axis `I_A = I_B + m·d²` and the swing drag is the
+reference's `b = 6πμR·d²`. Following the reference method, **only orientation is
+controlled** (no position/standoff term), so with a free base the pivot can slide along
+the surface — drive it with teleop. See
+<https://macs-lab.github.io/robotic-inspection-orientation-control-2026/> and
+[`docs/coupled-pendulum-dynamics.md`](docs/coupled-pendulum-dynamics.md).
 
 ### Typical autofocus session
 1. Engage `o` so orientation swings the camera onto the surface normal.
@@ -88,11 +98,12 @@ class Parabola(Surface):
 
 ```
 run.py → viz.SimApp → world.World.step(dt):
-    1. camera.cast_ray(surface)          # sense: distance + normal  (RayHit)
-    2. orientation.compute(...)          # → force, torque
-       autofocus.compute(...)            # → force, torque
-    3. plant.step(camera, ΣF, Στ, dt)    # integrate virtual mass → new pose
+    1. camera.cast_ray(surface) + noise         # sense: distance + normal  (RayHit)
+    2. orientation.compute(...) → (Q_a,Q_d,Q_phi)   # swing torque
+       autofocus.compute(...)   → (Q_a,Q_d,Q_phi)   # standoff force
+    3. plant.step(camera, ray, ΣQ_a, ΣQ_d, ΣQ_phi, dt)   # integrate pendulum → new pose
 ```
 
-`World.step` sums the controller wrenches with the manual teleop wrench exactly as the
-admittance node sums `/teleop`, `/orientation_controller`, and `/autofocus` topics.
+`World.step` sums the controllers' **generalized efforts** with the manual teleop efforts
+(tangential / standoff / swing), then the `PendulumPlant` integrates the coupled dynamics
+and re-projects the pivot onto the surface via the next raycast (route b).

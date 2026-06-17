@@ -4,12 +4,13 @@ A ``FuncAnimation`` advances :meth:`World.step` at a fixed rate and redraws the
 surface, camera, optical-axis ray, surface normal, and a text HUD. Keyboard nudges the
 camera (manual teleop) and toggles controllers; sliders tune gains live.
 
-Controls
+Controls (all in the surface-pivot frame of the coupled pendulum plant)
 --------
-  W / S      teleop force forward / backward (along the optical axis)
-  A / D      teleop force left / right (camera frame)
-  Q / E      teleop torque (rotate CCW / CW)
-  o          toggle orientation control
+  W / S      standoff −/+ (move camera toward / away from the surface, changes d)
+  A / D      slide the pivot along the surface tangent (−/+ t)
+  Q / E      swing: nudge the orientation reference Δ when orientation is ON,
+             else apply a manual swing torque about the pivot
+  o          toggle orientation control (pure swing torque about the target)
   f          toggle autofocus drive (to the known true peak distance)
   space      reset camera + plant
   (sliders)  zeta, autofocus v_max, mass, viscosity, sensor-noise std
@@ -28,8 +29,9 @@ from .world import World
 
 BOUNDS = (-5.0, 5.0, -4.0, 4.0)   # xmin, xmax, ymin, ymax
 DT = 0.02                          # s, 50 Hz tick
-TELEOP_FORCE = 8.0                 # N applied per key press
-TELEOP_TORQUE = 3.0                # N·m per key press
+TELEOP_FORCE = 8.0                 # generalized force per key press (slide / standoff)
+TELEOP_TORQUE = 3.0                # manual swing torque per key press
+TELEOP_DELTA = np.radians(3.0)     # reference-offset nudge per key press (rad)
 TELEOP_DECAY = 0.55                # per-frame decay so held keys fade on release
 
 # Keys we bind for control. matplotlib's default keymap claims several of these
@@ -141,21 +143,21 @@ class SimApp:
     def _on_key(self, event):
         k = (event.key or "").lower()
         w = self.world
-        # Teleop in the camera frame: forward = optical axis, right = axis rotated -90°.
-        forward = w.camera.optical_axis
-        right = np.array([forward[1], -forward[0]])
-        if k == "w":
-            w.teleop_force += TELEOP_FORCE * forward
-        elif k == "s":
-            w.teleop_force -= TELEOP_FORCE * forward
-        elif k == "d":
-            w.teleop_force += TELEOP_FORCE * right
-        elif k == "a":
-            w.teleop_force -= TELEOP_FORCE * right
-        elif k == "q":
-            w.teleop_torque += TELEOP_TORQUE
-        elif k == "e":
-            w.teleop_torque -= TELEOP_TORQUE
+        # Teleop in the surface-pivot frame (generalized efforts).
+        if k == "w":                       # toward the surface -> decrease d
+            w.teleop_standoff -= TELEOP_FORCE
+        elif k == "s":                     # away from the surface -> increase d
+            w.teleop_standoff += TELEOP_FORCE
+        elif k == "d":                     # slide pivot along +t
+            w.teleop_tangential += TELEOP_FORCE
+        elif k == "a":                     # slide pivot along -t
+            w.teleop_tangential -= TELEOP_FORCE
+        elif k in ("q", "e"):              # swing
+            sign = 1.0 if k == "q" else -1.0
+            if w.orientation.enabled:      # pivot about the target via the reference Δ
+                w.orientation.delta += sign * TELEOP_DELTA
+            else:                          # manual swing torque about the pivot
+                w.teleop_swing += sign * TELEOP_TORQUE
         elif k == "o":
             w.orientation.enabled = not w.orientation.enabled
         elif k == "f":
@@ -169,8 +171,10 @@ class SimApp:
         ray = w.step(DT)
 
         # Manual teleop fades after release (matplotlib has no reliable key-up).
-        w.teleop_force *= TELEOP_DECAY
-        w.teleop_torque *= TELEOP_DECAY
+        # The orientation reference Δ is persistent, so it is not decayed.
+        w.teleop_tangential *= TELEOP_DECAY
+        w.teleop_standoff *= TELEOP_DECAY
+        w.teleop_swing *= TELEOP_DECAY
 
         cam = w.camera
         self.cam_dot.set_data([cam.pos[0]], [cam.pos[1]])
@@ -198,11 +202,12 @@ class SimApp:
         af = w.autofocus
         d = f"{ray.distance:.3f} m" if ray.hit else "  (no hit)"
         ang = np.degrees(w.orientation.angle_error)
+        delta = np.degrees(w.orientation.delta)
         return (
             f"distance : {d}\n"
             f"focus    : {af.focus_value:5.3f}  (true peak {af.d_focus:.2f} m)\n"
             f"orient   : {'ON ' if w.orientation.enabled else 'off'}  "
-            f"err {ang:+6.1f} deg\n"
+            f"err {ang:+6.1f} deg  Δ {delta:+5.1f} deg\n"
             f"autofocus: {'ON ' if af.enabled else 'off'}  target {af.d_focus:.3f} m\n"
             f"shape    : {w.shape_name}"
         )

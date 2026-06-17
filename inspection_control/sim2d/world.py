@@ -18,7 +18,7 @@ import numpy as np
 
 from .camera import Camera2D, RayHit
 from .controllers import AutofocusController, OrientationController
-from .dynamics import AdmittancePlant
+from .dynamics import PendulumPlant
 from .shapes import make_shape
 
 
@@ -27,13 +27,15 @@ class World:
         self.surface = make_shape(shape_name, **(shape_kwargs or {}))
         self.shape_name = shape_name
         self.camera = Camera2D()
-        self.plant = AdmittancePlant()
+        self.plant = PendulumPlant()
         self.orientation = OrientationController()
         self.autofocus = AutofocusController()
 
-        # Manual teleop wrench (set by keyboard), summed like /teleop/wrench_cmds.
-        self.teleop_force = np.zeros(2, dtype=float)
-        self.teleop_torque = 0.0
+        # Manual teleop generalized efforts (set by keyboard) in the surface-pivot
+        # coordinates: tangential slide, standoff, swing torque.
+        self.teleop_tangential = 0.0
+        self.teleop_standoff = 0.0
+        self.teleop_swing = 0.0
 
         # White sensor noise injected into the measurement (controllers + viz see
         # the noisy values). std in metres / radians; 0 disables.
@@ -50,8 +52,9 @@ class World:
     def reset(self):
         self.camera = Camera2D()
         self.plant.reset()
-        self.teleop_force[:] = 0.0
-        self.teleop_torque = 0.0
+        self.teleop_tangential = 0.0
+        self.teleop_standoff = 0.0
+        self.teleop_swing = 0.0
         self.autofocus.enabled = False
 
     def _apply_noise(self, ray: RayHit) -> RayHit:
@@ -82,15 +85,18 @@ class World:
         ray = self._apply_noise(self.camera.cast_ray(self.surface))
         self.last_hit = ray
 
-        # 2. Controllers -> wrenches (summed, as in the admittance node).
-        f_total = np.array(self.teleop_force, dtype=float)
-        tau_total = float(self.teleop_torque)
+        # 2. Controllers -> generalized efforts (Q_a slide, Q_d standoff, Q_phi swing),
+        #    summed with the manual teleop efforts.
+        q_a = self.teleop_tangential
+        q_d = self.teleop_standoff
+        q_phi = self.teleop_swing
 
-        f_o, tau_o = self.orientation.compute(self.camera, self.plant, ray, dt)
-        f_a, tau_a = self.autofocus.compute(self.camera, self.plant, ray, dt)
-        f_total = f_total + f_o + f_a
-        tau_total += tau_o + tau_a
+        oa, od, ophi = self.orientation.compute(self.camera, self.plant, ray, dt)
+        aa, ad, aphi = self.autofocus.compute(self.camera, self.plant, ray, dt)
+        q_a += oa + aa
+        q_d += od + ad
+        q_phi += ophi + aphi
 
-        # 3. Integrate the virtual mass and update the pose.
-        self.plant.step(self.camera, f_total, tau_total, dt)
+        # 3. Integrate the coupled pendulum and update the pose.
+        self.plant.step(self.camera, ray, q_a, q_d, q_phi, dt)
         return ray

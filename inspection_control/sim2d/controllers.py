@@ -1,8 +1,8 @@
-"""Ported control laws: orientation alignment and peak-hold autofocus.
+"""Ported control laws: orientation alignment and known-peak autofocus.
 
-Both mirror the real ROS nodes and output forces/torques that are summed into the
-:class:`~sim2d.dynamics.AdmittancePlant` — exactly as the nodes publish ``WrenchStamped``
-into the admittance node.
+Both mirror the real ROS nodes and output **generalized efforts** ``(Q_a, Q_d, Q_phi)``
+on the coupled :class:`~sim2d.dynamics.PendulumPlant` coordinates (tangential slide,
+standoff, swing) — orientation owns the swing torque, autofocus the standoff force.
 
 * :class:`OrientationController` — applies the theta-error torque about the surface
   point (parallel-axis pivot plant) and converts it to an equivalent camera wrench via
@@ -20,13 +20,21 @@ import numpy as np
 
 
 def pole_placement_pd(m: float, c: float, effort_max: float, max_err: float,
-                      zeta: float):
+                      zeta: float, clamp_kd: bool = True):
     """Real-pole PD gains for the 1-DOF plant  ``m·q̈ + c·q̇ = u``.
 
     ``omega_n`` is sized by the effort/speed budget (``effort_max = c·v_max``) and the
     error scale ``max_err`` — identical to ``autofocus_node._pd_gains`` and the
     orientation node. Returns ``(Kp, Kd)`` for ``u = Kp·err + Kd·err_rate`` with poles
     placed at ``-ζωₙ ± ωₙ√(ζ²−1)`` (non-oscillatory for ``ζ ≥ 1``).
+
+    ``Kd = −m(p1+p2) − c`` goes **negative** when the plant's natural damping ``c``
+    already exceeds the target ``2ζωₙ·m`` (a heavily over-damped, drag-dominated
+    regime — true here because ``c·d²`` is large). A negative ``Kd`` is anti-damping:
+    it cancels real drag and is fragile under the slide/swing coupling, so by default
+    we **clamp it to ≥ 0** — the controller then leans on the natural damping instead
+    of fighting it (the closed loop stays over-damped and stable). Set
+    ``clamp_kd=False`` for the exact (unclamped) placement.
     """
     m = max(m, 1e-9)
     omega_n = math.sqrt(max(effort_max, 1e-12) / (m * max(max_err, 1e-6)))
@@ -36,6 +44,8 @@ def pole_placement_pd(m: float, c: float, effort_max: float, max_err: float,
     p2 = -zeta * omega_n - omega_n * root
     kp = m * (p1 * p2)
     kd = -m * (p1 + p2) - c
+    if clamp_kd:
+        kd = max(kd, 0.0)
     return kp, kd
 
 
@@ -71,20 +81,16 @@ class _RateEstimator:
 # Orientation
 # --------------------------------------------------------------------------- #
 class OrientationController:
-    """Aligns the optical axis to the surface normal by applying the theta-error
-    torque **about the surface point** (a pivot at distance ``d``), then converting
-    it — via Newton-Euler — into the equivalent force + torque at the camera that is
-    fed to the admittance plant.
+    """Swing the optical axis onto the surface normal by applying a **pure torque on
+    the swing coordinate** of the coupled pendulum plant — a genuine torque about the
+    surface pivot, no Newton-Euler feedforward.
 
-    The pivot plant is the parallel-axis reduction used by
-    ``orientation_control_node.py``::
+    The pivot plant (``PendulumPlant``) gives the parallel-axis dynamics
+    ``I_A·φ̈ + (c·d² + c_ang)·φ̇ = τ_θ`` with ``I_A = I_B + m·d²``; a pole-placement PD
+    sets ``τ_θ`` to track ``φ_ref = angle(−n) + delta``. ``delta`` is a reference swing
+    offset (teleop rotation) that lets you pivot the camera about the target.
 
-        I_A = I_B + m·d²              (inertia about the surface point)
-        I_A·θ̈ + (c·d²)·θ̇ = τ_θ      (c·d² = camera linear drag as a pivot moment)
-
-    A pole-placement PD sets ``τ_θ``; Newton-Euler then back-solves the camera wrench
-    so that, once the admittance node re-adds drag, the camera+plant swing rigidly
-    about the contact point.
+    ``compute`` returns generalized efforts ``(Q_a, Q_d, Q_phi) = (0, 0, τ_θ)``.
     """
 
     def __init__(self, zeta: float = 1.0, v_max: float = 0.1,
@@ -93,42 +99,30 @@ class OrientationController:
         self.zeta = zeta
         self.v_max = v_max            # linear speed budget (m/s) at the camera
         self.theta_max = theta_max    # angular error scale (rad)
+        self.delta = 0.0              # reference swing offset about the target (rad)
         self.angle_error = 0.0        # telemetry for the HUD
 
     def compute(self, camera, plant, ray, dt):
-        """Return the equivalent ``(force_xy, torque)`` at the camera."""
+        """Return generalized efforts ``(Q_a, Q_d, Q_phi)``."""
         if not self.enabled or not ray.hit:
             self.angle_error = 0.0
-            return np.zeros(2), 0.0
+            return 0.0, 0.0, 0.0
 
-        e = signed_angle(camera.optical_axis, -ray.normal)  # theta_des - theta
+        # Error to the (offset) reference axis: angle(−n) + delta − phi.
+        e = signed_angle(camera.optical_axis, -ray.normal) + self.delta
+        e = math.atan2(math.sin(e), math.cos(e))          # wrap to (−π, π]
         self.angle_error = e
 
-        # Lever arm from the surface contact (pivot A) to the camera (centroid B).
-        r = camera.pos - ray.point
-        d = float(np.hypot(r[0], r[1]))
-
-        # Plant about the pivot: parallel-axis inertia; the camera's linear drag
-        # appears as a moment about A (= -c·d²·ω for pure pivoting).
+        d = float(ray.distance)
         inertia_A = plant.inertia + plant.mass * d * d
-        force_drag_B = -plant.linear_drag * plant.lin_vel
-        moment_drag_A = r[0] * force_drag_B[1] - r[1] * force_drag_B[0]
-
-        # Pole-placement PD torque about the pivot (gains referenced to I_A, c·d²).
+        # Swing drag about the pivot is c·d² (relative-velocity) plus the camera's own
+        # angular drag; place the closed-loop poles against that.
         tau_max = plant.linear_drag * d * self.v_max
-        kp, kd = pole_placement_pd(inertia_A, plant.linear_drag * d * d,
+        kp, kd = pole_placement_pd(inertia_A,
+                                   plant.linear_drag * d * d + plant.angular_drag,
                                    tau_max, self.theta_max, self.zeta)
-        tau_theta = float(np.clip(kp * e + kd * (-plant.ang_vel),
-                                  -tau_max, tau_max))
-
-        # Newton-Euler: angular accel about the pivot, then the equivalent camera
-        # wrench. force_B/tau_B pre-subtract drag so the admittance plant, which
-        # re-adds it, reproduces the pivot motion (a_B = α × r).
-        alpha = (moment_drag_A + tau_theta) / inertia_A
-        a_B = alpha * np.array([-r[1], r[0]])          # (α ẑ) × r
-        force_B = plant.mass * a_B - force_drag_B
-        tau_B = plant.inertia * alpha + plant.angular_drag * plant.ang_vel
-        return force_B, tau_B
+        tau_theta = float(np.clip(kp * e + kd * (-plant.ang_vel), -tau_max, tau_max))
+        return 0.0, 0.0, tau_theta
 
 
 # --------------------------------------------------------------------------- #
@@ -165,24 +159,26 @@ class AutofocusController:
 
     # -- control tick ------------------------------------------------------ #
     def compute(self, camera, plant, ray, dt):
+        """Return generalized efforts ``(Q_a, Q_d, Q_phi)`` — a standoff force on ``d``."""
         if not ray.hit:
             self.focus_value = float("nan")
-            return np.zeros(2), 0.0
+            return 0.0, 0.0, 0.0
 
         d = ray.distance
         self.focus_value = self.focus_at(d)
 
         if not self.enabled:
             self._dist_rate.reset()
-            return np.zeros(2), 0.0
+            return 0.0, 0.0, 0.0
 
         err = d - self.d_focus
         if abs(err) <= self.tolerance:
-            return np.zeros(2), 0.0
+            return 0.0, 0.0, 0.0
 
         d_rate = self._dist_rate.update(d, dt)
         f_max = plant.linear_drag * self.v_max
         kp, kd = pole_placement_pd(plant.mass, plant.linear_drag,
                                    f_max, self.max_distance_error, self.zeta)
         u = float(np.clip(kp * err + kd * d_rate, -f_max, f_max))
-        return u * camera.optical_axis, 0.0
+        # Q_d is conjugate to d; +Q_d increases d, so drive d→d_focus with −u.
+        return 0.0, -u, 0.0
