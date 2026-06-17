@@ -1,11 +1,12 @@
-# Coupled Pendulum Dynamics for the 2D Inspection Sandbox
+# Coupled Pendulum Dynamics for the Inspection Sandbox
 
-**Status:** planned · **Scope:** `sim2d/` dynamics + controllers · **Route:** (b) locally-flat + re-project
+**Status:** implemented (2-D) · **Scope:** `sim2d/` dynamics + controllers · **Route:** (b) locally-flat + re-project
 
-This document records (1) the diagnosis of why the current orientation control goes
-unstable, and (2) the plan to replace the point-mass plant with a coupled
-pivot-referenced pendulum so orientation applies a *pure torque about the surface target
-point* and the dynamics handle the coupling/drag correctly.
+This document records (1) the diagnosis of why the original orientation control went
+unstable, (2) the coupled pivot-referenced pendulum that replaces the point-mass plant so
+orientation applies a *pure torque about the surface target point* with the coupling/drag
+handled by the dynamics (§§1–5, implemented in 2-D), and (3) the extension of the same
+approach to the **3-D** case (§6, equations of motion for the upcoming port).
 
 ---
 
@@ -215,3 +216,127 @@ plus `zeta`, `v_max`, `theta_max`, `integral_alpha`, are exposed as GUI sliders/
 Residual (acceptable): sliding *aggressively across a curved surface* makes the swing
 **lag** the fast-changing normal (bounded error, stays on the surface) — a bandwidth
 limit, not an instability; raise `v_max` to tighten it.
+
+---
+
+## 6. Extension to 3D
+
+The same recipe carries over: pivot-referenced generalized coordinates, parallel-axis
+swing inertia about the surface contact, **pivot-relative diagonal drag**, decoupled
+per-coordinate dynamics, and route-(b) re-projection of the pivot onto the surface each
+tick. What grows is the dimensionality — the surface is now a 2-manifold, the tangent
+"slide" is 2-D, and the swing is a full `SO(3)` rotation (pitch + yaw + roll).
+
+### 6.1 Configuration and frames
+
+At the contact `A` (a point on the surface, found by the raycast) the surface gives an
+outward unit normal `n̂` and a tangent plane spanned by orthonormal `(t̂₁, t̂₂)`. The
+camera (bob, mass `m`, body inertia tensor `I_B`) sits at `B = A − d·û`, where `û` is the
+optical axis and `d` the standoff. The **6 DOF** of the rigid camera split exactly as:
+
+| DOF | coordinate | controller |
+|-----|-----------|------------|
+| tangential slide (2) | `a = (a₁, a₂)` in the tangent plane | teleop |
+| standoff (1) | `d` along `û` | autofocus (teleop fwd/back) |
+| tilt / swing (2) | pitch + yaw of `û` vs `−n̂` | orientation |
+| roll (1) | `ψ` about `û` | orientation (roll) |
+
+Let `ω ∈ ℝ³` be the camera angular velocity. Decompose it into the **tilt** part
+(perpendicular to the axis) and the **roll** part (along the axis):
+
+```
+ω_∥ = (û·ω) û            ω_⊥ = ω − ω_∥ = (I₃ − û û^T) ω
+```
+
+### 6.2 Parallel-axis swing inertia (tensor)
+
+The inertia about the pivot `A` (parallel-axis theorem for tensors, with `r = B−A = −d·û`):
+
+```
+I_A(d) = I_B + m( |r|² I₃ − r r^T ) = I_B + m·d²·(I₃ − û û^T)
+```
+
+The projector `(I₃ − û û^T)` adds `m·d²` to the two **tilt** axes (perpendicular to `û`)
+and **nothing** to the **roll** axis (it passes through both `B` and `A`). This is the
+3-D form of `I_A = I_B + m·d²`: tilt ⇒ `I_A⊥ = I_B⊥ + m·d²`, roll ⇒ `I_roll = û·I_B·û`.
+
+### 6.3 Pivot-relative drag (tensor)
+
+The bob, at radius `d`, rotating at `ω` moves at `v = ω × r`; its Stokes drag `−c·v`
+produces a pivot torque `r × (−c·v) = −c·d²·(I₃ − û û^T)·ω`. Adding the camera's own
+angular drag `C_ang` gives the diagonal pivot-relative drag tensor
+
+```
+B_drag(d) = c·d²·(I₃ − û û^T) + C_ang
+```
+
+i.e. tilt drag `c·d² + c_ang`, roll drag `c_ang` — the tensor version of the 2-D
+`b = c·d² + c_ang` (and again **relative to the pivot**, never the bob's absolute
+velocity, so a tangential slide injects no swing torque).
+
+### 6.4 Equations of motion (decoupled)
+
+**Translation — pivot slide (tangent plane) and standoff:**
+
+```
+slide :  m·ä   = Q_a − c·ȧ                      a, Q_a ∈ tangent plane (2-D)
+standoff: m·d̈  = Q_d − c·ḋ + m·d·|ω_⊥|²          |ω_⊥|² = |ω|² − (û·ω)²   (centrifugal)
+```
+
+**Rotation about the pivot** — Euler's equation with the configuration-dependent `I_A`:
+
+```
+I_A·ω̇ + ω × (I_A·ω) + İ_A·ω = τ − B_drag·ω
+İ_A = 2·m·d·ḋ·(I₃ − û û^T) + m·d²·d/dt(I₃ − û û^T)
+```
+
+- `İ_A·ω` carries the `2·m·d·ḋ` **Coriolis** term — the 3-D form of the 2-D `−2·m·d·ḋ·φ̇`
+  (spin-up reaction when autofocus changes `d` mid-rotation).
+- `ω × (I_A·ω)` is the **gyroscopic** coupling between roll and tilt — genuinely 3-D
+  (it vanishes in 2-D, where `ω` is a scalar).
+
+**Decoupled control form** (what the controllers see — three independent SISO loops, as
+in `orientation_control_node.py`):
+
+```
+pitch :  I_A⊥·θ̈_p = τ_p − (c·d² + c_ang)·θ̇_p − 2·m·d·ḋ·θ̇_p
+yaw   :  I_A⊥·θ̈_y = τ_y − (c·d² + c_ang)·θ̇_y − 2·m·d·ḋ·θ̇_y
+roll  :  I_roll·ψ̈ = τ_ψ − c_ang·ψ̇
+```
+
+Pitch and yaw are two identical copies of the 2-D swing equation (§2.2); roll has no
+`d`-dependence. Dropping `ω × (I_A·ω)` here is the same decoupling approximation made in
+2-D — restore it if roll⇄tilt gyroscopic coupling matters.
+
+### 6.5 Control
+
+The swing error is a **rotation vector** `e_rot` (axis·angle) that rotates the current
+optical-axis frame onto the reference `û_ref = R(Δ)·(−n̂)` (`Δ` = teleop pitch/yaw
+reference offset, the 3-D analogue of the 2-D `Δ`), plus a **roll** error that keeps the
+camera "up" (e.g. its `x̂` level — the node's `roll_error`). Project `e_rot` onto the
+camera tilt axes for `(e_pitch, e_yaw)` and onto `û` for the roll error.
+
+Per-axis gains are **unchanged** from 2-D pole-placement: pitch/yaw use
+`pole_placement_*(I_A⊥, c·d² + c_ang, τ_max = c·d·v_max, θ_max, ζ)` with the same PD/PID
+(integral pole `p3 = integral_alpha·p2`); roll uses its own (lighter) PD on
+`(I_roll, c_ang)`. The torques `τ = (τ_p, τ_y, τ_ψ)` map back to a body wrench exactly as
+2-D's `Q_phi`.
+
+When orientation is **off**, the plant is a free 6-DOF rigid body in camera coordinates
+(translate along the camera axes, rotate about the COM) — the 3-D version of §"camera
+frame when off".
+
+### 6.6 Route-(b) loop in 3D
+
+Each tick: raycast → `A, n̂, (t̂₁,t̂₂), d`; build `I_A(d)`, `B_drag(d)`; evaluate the
+decoupled accelerations; integrate `(ȧ, ḋ, ω)`; update camera pose
+(`SE(3)`: translate + `exp` of the body rotation); the next raycast re-projects the pivot
+onto the true surface. The "up"/roll reference replaces gravity as the roll datum.
+
+### 6.7 Sanity: 2-D is the planar slice
+
+Set `yaw = roll = 0`, restrict the tangent plane to a single line `t̂₁ = t`, and the
+tensors collapse: `(I₃ − û û^T) → 1`, `I_A⊥ → I_B + m·d²`, `B_drag → c·d² + c_ang`,
+`|ω_⊥|² → φ̇²`, `ω × (I_A·ω) → 0`. The pitch equation becomes the 2-D swing EOM and the
+slide/standoff equations match §2.2 — the implemented 2-D model is exactly this
+restriction, which is the recommended thing to unit-test first when porting.
