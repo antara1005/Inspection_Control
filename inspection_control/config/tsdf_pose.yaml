@@ -20,6 +20,7 @@ tsdf_pose:
     depth_max_integration:      0.50      # m – TSDF truncates beyond this
 
     # -- Registration cadence --
+    registration_enabled:       false
     register_every_n_frames:    30        # ICP refinement period (frames)
     min_integrations_before_register: 10  # need enough fused surface first
 

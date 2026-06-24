@@ -111,6 +111,7 @@ class TSDFPoseNode(Node):
             ("depth_max_integration",       0.50),     # m – truncate depth before integrating
 
             # Registration cadence
+            ("registration_enabled",        True),     # master switch for pose registration
             ("register_every_n_frames",     30),
             ("min_integrations_before_register", 10),
 
@@ -147,10 +148,10 @@ class TSDFPoseNode(Node):
             ("viewpoint_generation_node",   "viewpoint_generation"),
 
             # Topics
-            ("pose_topic",                  "tsdf_pose/pose"),
-            ("fused_cloud_topic",           "tsdf_pose/fused_cloud"),
+            ("pose_topic",                  "~/pose"),
+            ("fused_cloud_topic",           "~/fused_cloud"),
             ("surface_cloud_topic",         "/perception/surface_cloud"),
-            ("synthetic_depth_topic",       "tsdf_pose/depth/synthetic"),
+            ("synthetic_depth_topic",       "~/depth/synthetic"),
         ])
 
         # Convert to attributes
@@ -172,6 +173,7 @@ class TSDFPoseNode(Node):
         self.depth_max       = float(gp("depth_max").value)
         self.depth_max_int   = float(gp("depth_max_integration").value)
 
+        self.registration_enabled = bool(gp("registration_enabled").value)
         self.register_every  = int(gp("register_every_n_frames").value)
         self.min_int_before_reg = int(gp("min_integrations_before_register").value)
         self.surface_publish_every = int(gp("surface_publish_every_n_frames").value)
@@ -259,8 +261,12 @@ class TSDFPoseNode(Node):
         self.depth_pub = self.create_publisher(Image,          synth_topic,                 10)
         self.depth_compressed_pub = self.create_publisher(
             CompressedImage, synth_topic + "/compressedDepth", 10)
+        # CameraInfo must sit alongside its image (ROS convention: same parent
+        # namespace, named "camera_info") so subscribers pair them automatically.
+        # Derive it from synth_topic so it tracks any override of that parameter.
+        info_topic = synth_topic.rsplit("/", 1)[0] + "/camera_info"
         self.camera_info_pub = self.create_publisher(
-            CameraInfo, "tsdf_pose/depth/camera_info", 10)
+            CameraInfo, info_topic, 10)
 
         # -- Subscribers ----------------------------------------------------
         self._depth_cb_group = ReentrantCallbackGroup()
@@ -275,8 +281,8 @@ class TSDFPoseNode(Node):
             callback_group=self._depth_cb_group)
 
         # -- Services -------------------------------------------------------
-        self.create_service(Trigger, "tsdf_pose/reset", self._on_reset)
-        self.create_service(Trigger, "tsdf_pose/register_now", self._on_register_now)
+        self.create_service(Trigger, "~/reset", self._on_reset)
+        self.create_service(Trigger, "~/register_now", self._on_register_now)
 
         # -- Fetch model paths from viewpoint_generation node ---------------
         self._param_client = self.create_client(
@@ -323,6 +329,8 @@ class TSDFPoseNode(Node):
             # --- live scalars ------------------------------------------
             if n == "publish_tf":
                 pending["publish_tf"] = bool(v)
+            elif n == "registration_enabled":
+                pending["registration_enabled"] = bool(v)
             elif n == "integrate_every_n_frames":
                 if int(v) < 1:
                     return reject("integrate_every_n_frames must be >= 1")
@@ -634,7 +642,8 @@ class TSDFPoseNode(Node):
                                         throttle_duration_sec=2.0)
 
         # Registration (non-blocking guard) — requires the CAD reference cloud.
-        if (self.reference_ready and
+        if (self.registration_enabled and
+                self.reference_ready and
                 self.integration_count >= self.min_int_before_reg and
                 self.integration_count % max(1, self.register_every) == 0):
             with self.reg_lock:
@@ -665,6 +674,10 @@ class TSDFPoseNode(Node):
         return response
 
     def _on_register_now(self, _request, response):
+        if not self.registration_enabled:
+            response.success = False
+            response.message = "Registration is disabled (registration_enabled=False)."
+            return response
         if self.integration_count < self.min_int_before_reg:
             response.success = False
             response.message = (
