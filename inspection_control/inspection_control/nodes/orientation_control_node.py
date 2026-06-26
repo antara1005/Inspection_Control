@@ -2299,6 +2299,9 @@ class OrientationControlNode(Node):
                 self.standoff_m = float(p.value)
             elif p.name == 'standoff_mode':
                 self.standoff_mode = str(p.value).lower()
+            elif p.name == 'surface_source':
+                self.surface_source = str(p.value).lower()
+                self.get_logger().info(f'Updated surface_source to {self.surface_source}')
             elif p.name == 'ema_enable':
                 self.ema_enable = bool(p.value)
             elif p.name == 'ema_tau':
