@@ -30,7 +30,7 @@ orientation_controller:
     # Surface source for normal estimation.
     #   depth -> legacy single live depth frame (deproject + plane fit)
     #   cloud -> fused surface cloud with normals on surface_cloud_topic
-    surface_source: cloud
+    surface_source: depth
     surface_cloud_topic: /perception/surface_cloud
     surface_max_angle_deg: 30.0  # angular outlier rejection for fused normals
     surface_min_points: 10       # min patch points for a valid measurement;
