@@ -1,0 +1,73 @@
+# Orientation controller config for the Tier 3 coupled-pendulum variant.
+# Identical to orientation_controller.yaml, re-keyed to the coupled-pendulum node
+# name so params load when launched as `orientation_controller_coupled_pendulum`.
+orientation_controller_coupled_pendulum:
+  ros__parameters:
+    # depth_topic: /particle_filter/depth/synthetic/compressedDepth
+    depth_topic: /camera/d405_camera/depth/image_rect_raw/compressedDepth
+    camera_info_topic: /camera/d405_camera/depth/camera_info #intrinsics info
+    bounding_box_topic: /viewpoint_generation/bounding_box_marker #bounding box topic
+    #depth map filtering range
+    dmap_filter_min: 0.07
+    dmap_filter_max: 0.50
+
+    viz_enable: true
+    publish_pointcloud: true
+    pcd_downsampling_stride: 4
+    #frame_ids
+    target_frame: object_frame #frame of the target object
+    main_camera_frame: eoat_camera_link #frame of the eoat camera
+    #cropped parameters in eoat camera frame
+    crop_radius: 0.01
+    crop_z_min: 0.05
+    crop_z_max: 0.40
+
+    standoff_m: 0.10 # standoff_value for fixed standoff mode
+    standoff_mode: euclidean
+    ema_enable: False
+    ema_tau: 0.1
+
+    normal_estimation_method: RANSAC #options: PCA, RANSAC
+    visualize_normal_estimation: False
+
+    # Surface source for normal estimation.
+    #   depth -> legacy single live depth frame (deproject + plane fit)
+    #   cloud -> fused surface cloud with normals on surface_cloud_topic
+    surface_source: depth
+    surface_cloud_topic: /perception/surface_cloud
+    surface_max_angle_deg: 30.0  # angular outlier rejection for fused normals
+    surface_min_points: 10       # min patch points for a valid measurement;
+                                 # lower if a small crop_radius starves the patch
+
+    no_target_timeout: 0.25
+    publish_zero_when_lost: True
+    orientation_control_enabled: False
+    save_data: False
+    object: ''
+    data_path: '/data/OrientationControlData'
+    sphere_mass: 2.5 # mass of the object in kg for force control (kg)
+    sphere_radius: 0.65  # Radius of the virtual sphere for admittance control (meters)
+    fluid_viscosity: 1.0  # Viscosity coefficient for damping (Pa·s)
+
+    d_min: 0.15 # Minimum focal distance (meters)
+    d_max: 0.30 # Maximum focal distance (meters)
+    v_max: 0.10 # Maximum linear velocity (meters/second)
+    theta_max_deg: 90.0 # Maximum angular displacement (degrees)
+
+    controller_type: PD # Options: PID, PD
+
+    Kp: 31.0
+    Ki: 37.7
+    Kd: 6.2
+
+    ie_clamp: 5.0
+
+    kalman_enabled: true
+    kalman_R: 1e-01     # Measurement noise variance (rad²)
+    kalman_Q_angle: 4e-03     # Process noise for angle (rad²)
+    kalman_Q_dangle: 1.245061e-01     # Process noise for dangle ((rad/s)²)
+
+    zeta: 1.0
+    integral_alpha: 50.0
+    kalman_model: KKF # 'PLANT' or 'CA'
+    kalman_Q_ddangle: 1.0 # CA-only process noise for acceleration state

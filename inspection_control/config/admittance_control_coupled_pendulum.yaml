@@ -1,0 +1,26 @@
+# Admittance (coupled-pendulum plant) config for the Tier 3 variant.
+# Re-keyed to the coupled-pendulum node name, and pointed at the coupled-pendulum
+# orientation node's wrench + pivot topics.
+admittance_control_coupled_pendulum:
+  ros__parameters:
+    # Publishing rate (Hz)
+    publish_rate: 10.0
+
+    sphere_mass: 2.5 # mass of the object in kg for force control (kg)
+    sphere_radius: 0.65  # Radius of the virtual sphere for admittance control (meters)
+    fluid_viscosity: 1.0  # Viscosity coefficient for damping (Pa·s)
+
+    # Frame ID for the twist messages (must match the orientation node's
+    # main_camera_frame, since pivot r is published in that frame).
+    frame_id: "eoat_camera_link"
+
+    # Topic names
+    teleop_wrench_topic: "/teleop/wrench_cmds"
+    # Tier 3: subscribe to the coupled-pendulum orientation node (pure torque wrench).
+    orientation_wrench_topic: "/orientation_controller_coupled_pendulum/wrench_cmds"
+    autofocus_wrench_topic: "/autofocus/wrench_cmds"
+    servo_twist_topic: "/servo_node/delta_twist_cmds"
+
+    # Tier 3 coupled pendulum: pivot lever arm r (= camera - A) + staleness timeout.
+    pivot_topic: "/orientation_controller_coupled_pendulum/pivot_r"
+    pivot_timeout: 0.2
