@@ -41,45 +41,47 @@ class Camera2D:
 
     # -- raycasting --------------------------------------------------------- #
     def cast_ray(self, surface, t_max: float = 20.0, step: float = 0.02,
-                 bisect_iters: int = 40) -> RayHit:
+                 bisect_iters: int = 16) -> RayHit:
         """March ``surface.f`` along the optical axis; bisect the first sign flip.
 
-        ``step`` is the coarse march resolution; ``bisect_iters`` refines the root to
-        ~``step / 2**iters``. Returns a miss if the surface is not crossed within
-        ``t_max`` (e.g. the camera faces away from the object).
+        All sample points are evaluated in a single vectorised ``surface.f`` call
+        (every registered shape accepts numpy arrays), replacing the original Python
+        while-loop.  ``bisect_iters=16`` gives sub-micrometre accuracy, so 40 was
+        already overkill.  Returns a miss if the surface is not crossed within
+        ``t_max``.
         """
         p = self.pos
         d = self.optical_axis
 
-        f0 = float(surface.f(p[0], p[1]))
-        t_prev = 0.0
-        f_prev = f0
-        t = step
-        while t <= t_max:
-            q = p + t * d
-            ft = float(surface.f(q[0], q[1]))
-            if f_prev == 0.0:
-                return self._make_hit(surface, p + t_prev * d, t_prev, d)
-            if np.sign(ft) != np.sign(f_prev):
-                # Bracket [t_prev, t] contains a crossing -> bisect.
-                lo, hi = t_prev, t
-                flo = f_prev
-                for _ in range(bisect_iters):
-                    mid = 0.5 * (lo + hi)
-                    fm = float(surface.f(*(p + mid * d)))
-                    if fm == 0.0:
-                        lo = hi = mid
-                        break
-                    if np.sign(fm) != np.sign(flo):
-                        hi = mid
-                    else:
-                        lo, flo = mid, fm
-                t_hit = 0.5 * (lo + hi)
-                return self._make_hit(surface, p + t_hit * d, t_hit, d)
-            t_prev, f_prev = t, ft
-            t += step
+        # Batch all march samples: shape (N, 2) -> f values shape (N,).
+        ts = np.arange(0.0, t_max + step, step)   # includes t=0 (camera position)
+        qs = p + np.outer(ts, d)
+        fs = np.asarray(surface.f(qs[:, 0], qs[:, 1]), dtype=float)
 
-        return RayHit(hit=False, distance=float("inf"))
+        # Find first index where the sign flips (zero treated as positive so we
+        # don't stall when the camera sits exactly on the surface).
+        signs = np.sign(fs)
+        signs[signs == 0.0] = 1.0
+        crossings = np.where(np.diff(signs) != 0.0)[0]
+        if crossings.size == 0:
+            return RayHit(hit=False, distance=float("inf"))
+
+        i = int(crossings[0])
+        lo, hi = float(ts[i]), float(ts[i + 1])
+        flo = float(fs[i])
+        for _ in range(bisect_iters):
+            mid = 0.5 * (lo + hi)
+            fm = float(surface.f(*(p + mid * d)))
+            if fm == 0.0:
+                lo = hi = mid
+                break
+            if np.sign(fm) != np.sign(flo):
+                hi = mid
+            else:
+                lo, flo = mid, fm
+
+        t_hit = 0.5 * (lo + hi)
+        return self._make_hit(surface, p + t_hit * d, t_hit, d)
 
     @staticmethod
     def _make_hit(surface, point, t_hit, d) -> RayHit:

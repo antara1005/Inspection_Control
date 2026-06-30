@@ -36,6 +36,18 @@ TELEOP_DECAY = 0.55                # per-frame decay so held keys fade on releas
 # (s=save, f=fullscreen, r=home, q=quit, o=zoom, ...); strip them so our handler
 # is the sole responder.
 CONTROL_KEYS = {"w", "a", "s", "d", "q", "e", "o", "f", " "}
+_ARROW_LEN = 0.55    # world-unit shaft length
+_HEAD_SIZE = 0.14    # arrowhead chevron size
+
+
+def _set_arrow(shaft, head, base, direction):
+    """Update shaft + chevron-head Line2D artists for a world-space arrow."""
+    tip = base + _ARROW_LEN * direction
+    perp = np.array([-direction[1], direction[0]])
+    h1 = tip - _HEAD_SIZE * direction + 0.45 * _HEAD_SIZE * perp
+    h2 = tip - _HEAD_SIZE * direction - 0.45 * _HEAD_SIZE * perp
+    shaft.set_data([base[0], tip[0]], [base[1], tip[1]])
+    head.set_data([h1[0], tip[0], h2[0]], [h1[1], tip[1], h2[1]])
 
 
 def _release_default_keymaps():
@@ -65,10 +77,16 @@ class SimApp:
         (self.ray_line,) = self.ax.plot([], [], "--", color="tab:orange", lw=1.2,
                                         label="ray")
         (self.hit_dot,) = self.ax.plot([], [], "x", color="tab:red", ms=9, mew=2)
-        self.heading_q = self.ax.quiver([0], [0], [0], [0], color="tab:blue",
-                                        scale=12, width=0.006, zorder=5)
-        self.normal_q = self.ax.quiver([0], [0], [0], [0], color="tab:green",
-                                       scale=12, width=0.006, zorder=5)
+        # Line2D arrows: shaft + chevron head.  Quivers don't blit cleanly; two
+        # plain Line2D objects per arrow are blit-safe and faster to update.
+        (self.heading_shaft,) = self.ax.plot([], [], "-", color="tab:blue",
+                                             lw=2.0, zorder=5)
+        (self.heading_head,) = self.ax.plot([], [], "-", color="tab:blue",
+                                            lw=2.0, zorder=5)
+        (self.normal_shaft,) = self.ax.plot([], [], "-", color="tab:green",
+                                            lw=2.0, zorder=5)
+        (self.normal_head,) = self.ax.plot([], [], "-", color="tab:green",
+                                           lw=2.0, zorder=5)
         self.hud = self.ax.text(0.02, 0.98, "", transform=self.ax.transAxes,
                                 va="top", ha="left", family="monospace", fontsize=9,
                                 bbox=dict(boxstyle="round", fc="white", alpha=0.8))
@@ -80,7 +98,7 @@ class SimApp:
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
         self.anim = FuncAnimation(self.fig, self._update, interval=int(DT * 1000),
-                                  blit=False, cache_frame_data=False)
+                                  blit=True, cache_frame_data=False)
 
     # -- widgets ------------------------------------------------------------ #
     def _build_widgets(self):
@@ -173,25 +191,28 @@ class SimApp:
         w.teleop_torque *= TELEOP_DECAY
 
         cam = w.camera
+        zhat = cam.optical_axis          # computed once, reused below
         self.cam_dot.set_data([cam.pos[0]], [cam.pos[1]])
-        zhat = cam.optical_axis
-        self.heading_q.set_offsets([cam.pos])
-        self.heading_q.set_UVC(zhat[0], zhat[1])
+        _set_arrow(self.heading_shaft, self.heading_head, cam.pos, zhat)
 
         if ray.hit:
             self.ray_line.set_data([cam.pos[0], ray.point[0]],
                                    [cam.pos[1], ray.point[1]])
             self.hit_dot.set_data([ray.point[0]], [ray.point[1]])
-            self.normal_q.set_offsets([ray.point])
-            self.normal_q.set_UVC(ray.normal[0], ray.normal[1])
+            _set_arrow(self.normal_shaft, self.normal_head,
+                       ray.point, ray.normal)
         else:
             far = cam.pos + 20.0 * zhat
             self.ray_line.set_data([cam.pos[0], far[0]], [cam.pos[1], far[1]])
             self.hit_dot.set_data([], [])
-            self.normal_q.set_UVC(0, 0)
+            self.normal_shaft.set_data([], [])
+            self.normal_head.set_data([], [])
 
         self.hud.set_text(self._hud_text(ray))
-        return ()
+        return (self.cam_dot, self.ray_line, self.hit_dot,
+                self.heading_shaft, self.heading_head,
+                self.normal_shaft, self.normal_head,
+                self.hud)
 
     def _hud_text(self, ray) -> str:
         w = self.world
