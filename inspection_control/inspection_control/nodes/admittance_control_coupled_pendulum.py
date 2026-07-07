@@ -13,7 +13,7 @@ from geometry_msgs.msg import WrenchStamped, TwistStamped, AccelStamped, PointSt
 
 class AdmittanceControlCoupledPendulumNode(Node):
     def __init__(self):
-        super().__init__('admittance_control_coupled_pendulum')
+        super().__init__('admittance_control')
 
         self.declare_parameters(
             namespace='',
@@ -25,7 +25,7 @@ class AdmittanceControlCoupledPendulumNode(Node):
                 ('frame_id', 'eoat_camera_link'),
                 ('teleop_wrench_topic', '/teleop/wrench_cmds'),
                 # Tier 3: subscribe to the coupled-pendulum orientation node (pure torque wrench).
-                ('orientation_wrench_topic', '/orientation_controller_coupled_pendulum/wrench_cmds'),
+                ('orientation_wrench_topic', '/orientation_controller/wrench_cmds'),
                 ('autofocus_wrench_topic', '/autofocus/wrench_cmds'),
                 ('servo_twist_topic', '/servo_node/delta_twist_cmds'),
 
@@ -33,7 +33,7 @@ class AdmittanceControlCoupledPendulumNode(Node):
                 ('accel_topic', '/admittance/accel_cmds'),
 
                 # Tier 3 coupled pendulum: pivot lever arm r (= camera - A) + staleness timeout.
-                ('pivot_topic', '/orientation_controller_coupled_pendulum/pivot_r'),
+                ('pivot_topic', '/orientation_controller/pivot_r'),
                 ('pivot_timeout', 0.2),
 
                 ('max_linear_speed', 0.0),
@@ -221,7 +221,7 @@ class AdmittanceControlCoupledPendulumNode(Node):
 
             a_a    = (Q_a - c * v_a) / max(m, 1e-9)
             d_ddot = (Q_d - c * ddot + m * d * float(w_tilt @ w_tilt)) / max(m, 1e-9)
-            a_tilt = (tau_tilt - (c * d * d + c_ang) * w_tilt
+            a_tilt = (tau_tilt - (c * d * d) * w_tilt
                       - 2.0 * m * d * ddot * w_tilt) / max(I_A, 1e-9)
             a_roll = (tau_roll - c_ang * w_roll) / max(I_B, 1e-9)
 

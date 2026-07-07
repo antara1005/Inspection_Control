@@ -1,7 +1,7 @@
 # Admittance (coupled-pendulum plant) config for the Tier 3 variant.
 # Re-keyed to the coupled-pendulum node name, and pointed at the coupled-pendulum
 # orientation node's wrench + pivot topics.
-admittance_control_coupled_pendulum:
+admittance_control:
   ros__parameters:
     # Publishing rate (Hz)
     publish_rate: 10.0
@@ -17,10 +17,10 @@ admittance_control_coupled_pendulum:
     # Topic names
     teleop_wrench_topic: "/teleop/wrench_cmds"
     # Tier 3: subscribe to the coupled-pendulum orientation node (pure torque wrench).
-    orientation_wrench_topic: "/orientation_controller_coupled_pendulum/wrench_cmds"
+    orientation_wrench_topic: "/orientation_controller/wrench_cmds"
     autofocus_wrench_topic: "/autofocus/wrench_cmds"
     servo_twist_topic: "/servo_node/delta_twist_cmds"
 
     # Tier 3 coupled pendulum: pivot lever arm r (= camera - A) + staleness timeout.
-    pivot_topic: "/orientation_controller_coupled_pendulum/pivot_r"
+    pivot_topic: "/orientation_controller/pivot_r"
     pivot_timeout: 0.2

@@ -688,7 +688,7 @@ def _roll_error(x_current_world) -> float:
 
 class OrientationControlCoupledPendulumNode(Node):
     def __init__(self):
-        super().__init__('orientation_controller_coupled_pendulum')
+        super().__init__('orientation_controller')
 
         sub_cb_group = ReentrantCallbackGroup()
         timer_cb_group = MutuallyExclusiveCallbackGroup()
@@ -1966,7 +1966,8 @@ class OrientationControlCoupledPendulumNode(Node):
 
             p_1 = -self.zeta * omega_n + omega_n * math.sqrt(self.zeta ** 2 - 1)
             p_2 = -self.zeta * omega_n - omega_n * math.sqrt(self.zeta ** 2 - 1)
-            p_3 = self.integral_alpha * p_2
+            #p_3 = self.integral_alpha * p_2
+            p_3 = 2.0 * p_2
 
             if self.controller_type == 'PD':
                 self.Kp = inertia_A * (p_1 * p_2)
@@ -1974,7 +1975,7 @@ class OrientationControlCoupledPendulumNode(Node):
                 self.Ki = 0.0
             elif self.controller_type == 'PID':
                 self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
-                self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+                self.Ki = 0.05*(-inertia_A * (p_1 * p_2 * p_3))
                # self.Ki = 0.0  # TEMP: disable I for now to see if it helps with stability
                 self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
             else:
@@ -1997,20 +1998,46 @@ class OrientationControlCoupledPendulumNode(Node):
                 tau_yaw = tau_yaw_raw
                 is_saturated = False
 
-            if self.anti_windup_enabled and self.Ki > 1e-9 and dt_ctrl > 0.0:
-                if is_saturated:
-                    if (tau_pitch_raw > 0 and self.pitch_err < 0) or (tau_pitch_raw < 0 and self.pitch_err > 0):
-                        self.int_pitch += self.pitch_err * dt_ctrl
-                    if (tau_yaw_raw > 0 and self.yaw_err < 0) or (tau_yaw_raw < 0 and self.yaw_err > 0):
-                        self.int_yaw += self.yaw_err * dt_ctrl
-                else:
-                    self.int_pitch += self.pitch_err * dt_ctrl
-                    self.int_yaw += self.yaw_err * dt_ctrl
-            elif dt_ctrl > 0.0:
-                self.int_pitch += self.pitch_err * dt_ctrl
-                self.int_yaw += self.yaw_err * dt_ctrl
+            # if self.anti_windup_enabled and self.Ki > 1e-9 and dt_ctrl > 0.0:
+            #     if is_saturated:
+            #         if (tau_pitch_raw > 0 and self.pitch_err < 0) or (tau_pitch_raw < 0 and self.pitch_err > 0):
+            #             self.int_pitch += self.pitch_err * dt_ctrl
+            #         if (tau_yaw_raw > 0 and self.yaw_err < 0) or (tau_yaw_raw < 0 and self.yaw_err > 0):
+            #             self.int_yaw += self.yaw_err * dt_ctrl
+            #     else:
+            #         self.int_pitch += self.pitch_err * dt_ctrl
+            #         self.int_yaw += self.yaw_err * dt_ctrl
+            # elif dt_ctrl > 0.0:
+            #     self.int_pitch += self.pitch_err * dt_ctrl
+            #     self.int_yaw += self.yaw_err * dt_ctrl
+            # --- Improved integral handling: conditional + leaky integrator ---
+            err_i_zone = math.radians(3.0)      # integrate only near target
+            err_zero_zone = math.radians(0.5)   # clear integral very close to target
+            leak = 0.90                        # decay old memory
 
-            int_lim = float(self.ie_clamp) * (math.pi / 180)
+            if self.Ki > 1e-9 and dt_ctrl > 0.0:
+
+            # Pitch
+              if abs(self.pitch_err) < err_zero_zone and abs(self.dpitch) < math.radians(2.0):
+                self.int_pitch = 0.0
+              elif (not is_saturated) and abs(self.pitch_err) < err_i_zone:
+                self.int_pitch += self.pitch_err * dt_ctrl
+              else:
+                self.int_pitch *= leak
+
+            # Yaw
+              if abs(self.yaw_err) < err_zero_zone and abs(self.dyaw) < math.radians(2.0):
+                self.int_yaw = 0.0
+              elif (not is_saturated) and abs(self.yaw_err) < err_i_zone:
+                self.int_yaw += self.yaw_err * dt_ctrl
+              else:
+                self.int_yaw *= leak
+            else:
+              self.int_pitch = 0.0
+              self.int_yaw = 0.0
+
+            #int_lim = float(self.ie_clamp) * (math.pi / 180)
+            int_lim = math.radians(1.0)
             self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
             self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
 

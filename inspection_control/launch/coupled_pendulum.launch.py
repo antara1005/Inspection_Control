@@ -97,7 +97,7 @@ def generate_launch_description():
     orientation_control_node = Node(
         package='inspection_control',
         executable='orientation_control_coupled_pendulum',
-        name='orientation_controller_coupled_pendulum',
+        name='orientation_controller',
         parameters=[orientation_config, moveit_config.to_dict()],
         output='screen',
         emulate_tty=True
@@ -105,7 +105,7 @@ def generate_launch_description():
     admittance_control_node = Node(
         package='inspection_control',
         executable='admittance_control_coupled_pendulum',
-        name='admittance_control_coupled_pendulum',
+        name='admittance_control',
         parameters=[admittance_config],
         output='screen',
         emulate_tty=True

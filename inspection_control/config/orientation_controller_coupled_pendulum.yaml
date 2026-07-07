@@ -1,7 +1,7 @@
 # Orientation controller config for the Tier 3 coupled-pendulum variant.
 # Identical to orientation_controller.yaml, re-keyed to the coupled-pendulum node
 # name so params load when launched as `orientation_controller_coupled_pendulum`.
-orientation_controller_coupled_pendulum:
+orientation_controller:
   ros__parameters:
     # depth_topic: /particle_filter/depth/synthetic/compressedDepth
     depth_topic: /camera/d405_camera/depth/image_rect_raw/compressedDepth
@@ -33,7 +33,7 @@ orientation_controller_coupled_pendulum:
     # Surface source for normal estimation.
     #   depth -> legacy single live depth frame (deproject + plane fit)
     #   cloud -> fused surface cloud with normals on surface_cloud_topic
-    surface_source: depth
+    surface_source: cloud
     surface_cloud_topic: /perception/surface_cloud
     surface_max_angle_deg: 30.0  # angular outlier rejection for fused normals
     surface_min_points: 10       # min patch points for a valid measurement;
