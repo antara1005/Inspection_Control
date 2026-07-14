@@ -19,6 +19,14 @@ teleop:
     yaw_axis: 3         # Camera yaw along yaxis
     enable_button: -1       # Safety button to enable/disable control (-1 fr no safety button)
 
+    # Buttons that call orientation_control_node's Trigger services
+    # (teleop_node owns Joy parsing for the whole cell, orientation_control_node
+    # no longer subscribes to /joy directly).
+    orientation_control_enable_button: 0   # toggles orientation control on/off
+    visualize_normal_button: 9             # toggles normal-estimation visualization
+    save_data_button: 8                    # toggles orientation-control data logging
+    orientation_control_node_name: orientation_controller
+
     invert_x: true    # Invert X-axis (left/right)
     invert_y: true   # Invert Y-axis (up/down)
     invert_z: false   # Invert Z-axis (push/pull)

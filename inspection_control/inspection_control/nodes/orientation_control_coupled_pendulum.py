@@ -20,8 +20,8 @@ from geometry_msgs.msg import WrenchStamped, TwistStamped
 from sensor_msgs import msg
 from sensor_msgs.msg import JointState
 
-from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import SetParametersResult
+from std_srvs.srv import Trigger
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import Header, Float64, String
 from cv_bridge import CvBridge
@@ -699,8 +699,6 @@ class OrientationControlCoupledPendulumNode(Node):
                 ('depth_topic', '/camera/d405_camera/depth/image_rect_raw/compressed'),
                 ('camera_info_topic', '/camera/d405_camera/depth/camera_info'),
                 ('bounding_box_topic', '/viewpoint_generation/bounding_box_marker'),
-                ('joy_topic', 'joy'),
-                ('enable_button', 0),
                 ('dmap_filter_min', 0.07),
                 ('dmap_filter_max', 0.50),
                 ('viz_enable', True),
@@ -781,8 +779,6 @@ class OrientationControlCoupledPendulumNode(Node):
         self.depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         self.bounding_box_topic = self.get_parameter('bounding_box_topic').get_parameter_value().string_value
-        joy_topic = self.get_parameter('joy_topic').get_parameter_value().string_value
-        self.enable_button = int(self.get_parameter('enable_button').value)
         self.dmap_filter_min = float(self.get_parameter('dmap_filter_min').value)
         self.dmap_filter_max = float(self.get_parameter('dmap_filter_max').value)
         self.viz_enable = bool(self.get_parameter('viz_enable').value)
@@ -963,8 +959,13 @@ class OrientationControlCoupledPendulumNode(Node):
             PointCloud2, self.surface_cloud_topic, self._on_surface_cloud,
             surface_qos, callback_group=sub_cb_group)
 
-        self.last_joy_msg = None
-        self.joy_sub = self.create_subscription(Joy, joy_topic, self.joy_callback, qos)
+        # Toggle actions are driven by teleop_node (or any other joy-parsing
+        # node) over these services, rather than this node subscribing to
+        # raw Joy messages itself. Keeps button-index/array-bounds handling
+        # in one place instead of duplicated across every joy consumer.
+        self.create_service(Trigger, '~/toggle_orientation_control', self._on_toggle_orientation_control)
+        self.create_service(Trigger, '~/toggle_normal_estimation_viz', self._on_toggle_normal_estimation_viz)
+        self.create_service(Trigger, '~/toggle_save_data', self._on_toggle_save_data)
         self.depth_msg = None
 
         self._timer_cb_group = timer_cb_group
@@ -1126,31 +1127,47 @@ class OrientationControlCoupledPendulumNode(Node):
             self._startup_timer.cancel()
             self._process_timer = self.create_timer(0.1, self.process_controller, callback_group=self._timer_cb_group)
 
-    def joy_callback(self, msg):
-        if not self.last_joy_msg:
-            self.last_joy_msg = msg
-            return
-
-        if not self.last_joy_msg.buttons[self.enable_button]:
-            if msg.buttons[self.enable_button] and not self.orientation_control_enabled:
-                self.enable_orientation_control()
-            elif msg.buttons[self.enable_button] and self.orientation_control_enabled:
+    def _on_toggle_orientation_control(self, request, response):
+        try:
+            if self.orientation_control_enabled:
                 self.disable_orientation_control()
+            else:
+                self.enable_orientation_control()
+            response.success = True
+            response.message = f'orientation_control_enabled -> {self.orientation_control_enabled}'
+        except Exception as e:
+            self.get_logger().error(f'toggle_orientation_control failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
 
-
-        if not self.last_joy_msg.buttons[9]:
-            if msg.buttons[9] and not self.visualize_normal_estimation:
-                self.enable_normal_estimation_viz()
-            elif msg.buttons[9] and self.visualize_normal_estimation:
+    def _on_toggle_normal_estimation_viz(self, request, response):
+        try:
+            if self.visualize_normal_estimation:
                 self.disable_normal_estimation_viz()
+            else:
+                self.enable_normal_estimation_viz()
+            response.success = True
+            response.message = f'visualize_normal_estimation -> {self.visualize_normal_estimation}'
+        except Exception as e:
+            self.get_logger().error(f'toggle_normal_estimation_viz failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
 
-        if not self.last_joy_msg.buttons[8]:
-            if msg.buttons[8] and not self.save_data:
-                self.enable_save_data()
-            elif msg.buttons[8] and self.save_data:
+    def _on_toggle_save_data(self, request, response):
+        try:
+            if self.save_data:
                 self.disable_save_data()
-
-        self.last_joy_msg = msg
+            else:
+                self.enable_save_data()
+            response.success = True
+            response.message = f'save_data -> {self.save_data}'
+        except Exception as e:
+            self.get_logger().error(f'toggle_save_data failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
 
 
     def _on_robot_description(self, msg: String):

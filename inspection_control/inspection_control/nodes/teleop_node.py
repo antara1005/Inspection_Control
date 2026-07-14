@@ -9,6 +9,7 @@ from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import Header
+from std_srvs.srv import Trigger
 from rclpy.time import Time
 import math
 
@@ -48,7 +49,16 @@ class TeleopNode(Node):
                 ('frame_id', 'base_link'),  # Frame ID for TwistStamped
                 ('joy_topic', 'joy'),  # Topic for incoming Joy messages
                 # Topic for outgoing TwistStamped messages
-                ('twist_topic', '/teleop/wrench_cmds')
+                ('twist_topic', '/teleop/wrench_cmds'),
+                # Buttons that trigger orientation_control_node actions via
+                # its Trigger services (this node owns all Joy parsing so
+                # button/axis bounds only need to be validated in one place).
+                ('orientation_control_enable_button', 0),
+                ('visualize_normal_button', 9),
+                ('save_data_button', 8),
+                # Node name of the orientation controller; used to build the
+                # Trigger service names (e.g. /<name>/toggle_orientation_control).
+                ('orientation_control_node_name', 'orientation_controller'),
             ]
         )
 
@@ -99,6 +109,31 @@ class TeleopNode(Node):
             'joy_topic').get_parameter_value().string_value
         twist_topic = self.get_parameter(
             'twist_topic').get_parameter_value().string_value
+        self.orientation_control_enable_button = self.get_parameter(
+            'orientation_control_enable_button').get_parameter_value().integer_value
+        self.visualize_normal_button = self.get_parameter(
+            'visualize_normal_button').get_parameter_value().integer_value
+        self.save_data_button = self.get_parameter(
+            'save_data_button').get_parameter_value().integer_value
+        orientation_control_node_name = self.get_parameter(
+            'orientation_control_node_name').get_parameter_value().string_value
+
+        # Every axis/button index this node reads from a Joy message. Indices
+        # of -1 mean "unused" (matches the existing enable_button/z_axis
+        # convention below) and are excluded from the bounds check.
+        self._joy_button_indices = [i for i in (
+            self.enable_button, self.roll_axis_positive, self.roll_axis_negative,
+            self.orientation_control_enable_button, self.visualize_normal_button,
+            self.save_data_button,
+        ) if i >= 0]
+        axis_indices = [self.x_axis, self.y_axis, self.pitch_axis, self.yaw_axis]
+        if self.z_axis >= 0:
+            axis_indices.append(self.z_axis)
+        else:
+            axis_indices.extend([self.z_axis_push, self.z_axis_pull])
+        self._joy_axis_indices = [i for i in axis_indices if i >= 0]
+        self._max_button_idx = max(self._joy_button_indices, default=-1)
+        self._max_axis_idx = max(self._joy_axis_indices, default=-1)
 
         # QoS profile for reliable communication
         qos_profile = QoSProfile(
@@ -121,6 +156,16 @@ class TeleopNode(Node):
             qos_profile
         )
 
+        # Trigger service clients for orientation_control_node's button-driven
+        # actions. Non-blocking: if the node isn't up yet the call is skipped
+        # with a warning rather than stalling the joy callback.
+        self.toggle_orientation_control_client = self.create_client(
+            Trigger, f'/{orientation_control_node_name}/toggle_orientation_control')
+        self.toggle_normal_estimation_viz_client = self.create_client(
+            Trigger, f'/{orientation_control_node_name}/toggle_normal_estimation_viz')
+        self.toggle_save_data_client = self.create_client(
+            Trigger, f'/{orientation_control_node_name}/toggle_save_data')
+
         # Internal state
         self.last_joy_msg = None
         self.current_wrench = WrenchStamped()
@@ -138,21 +183,80 @@ class TeleopNode(Node):
         # ---------------- Parameter update callback ----------------
         self.add_on_set_parameters_callback(self._on_param_update)
 
+    def _zero_wrench(self):
+        self.current_wrench.wrench.force.x = 0.0
+        self.current_wrench.wrench.force.y = 0.0
+        self.current_wrench.wrench.force.z = 0.0
+        self.current_wrench.wrench.torque.x = 0.0
+        self.current_wrench.wrench.torque.y = 0.0
+        self.current_wrench.wrench.torque.z = 0.0
+
+    def _validate_joy_msg(self, msg: Joy) -> bool:
+        """Confirm this Joy message has enough buttons/axes for the indices
+        configured via parameters, so a joystick with fewer buttons/axes than
+        expected (or a malformed message) can't cause an IndexError."""
+        if len(msg.buttons) <= self._max_button_idx or len(msg.axes) <= self._max_axis_idx:
+            self.get_logger().error(
+                f'Joy message has {len(msg.buttons)} buttons / {len(msg.axes)} axes, '
+                f'but configured *_button/*_axis parameters need at least '
+                f'{self._max_button_idx + 1} buttons and {self._max_axis_idx + 1} axes. '
+                'Check the joystick model against this node\'s parameters. '
+                'Ignoring this message and stopping output for safety.',
+                throttle_duration_sec=5.0)
+            return False
+        return True
+
+    @staticmethod
+    def _rising_edge(msg: Joy, last_msg, idx: int) -> bool:
+        if idx < 0 or last_msg is None:
+            return False
+        if idx >= len(msg.buttons) or idx >= len(last_msg.buttons):
+            return False
+        return bool(msg.buttons[idx]) and not bool(last_msg.buttons[idx])
+
+    def _call_trigger(self, client, action_name: str):
+        if not client.service_is_ready():
+            self.get_logger().warn(
+                f'{action_name} service not available (orientation control node not up?); '
+                'ignoring button press.', throttle_duration_sec=5.0)
+            return
+        future = client.call_async(Trigger.Request())
+        future.add_done_callback(
+            lambda f: self._on_trigger_response(f, action_name))
+
+    def _on_trigger_response(self, future, action_name: str):
+        try:
+            result = future.result()
+            if not result.success:
+                self.get_logger().warn(f'{action_name} failed: {result.message}')
+        except Exception as e:
+            self.get_logger().error(f'{action_name} service call raised: {e}')
+
     def joy_callback(self, msg):
         """
         Process incoming Joy messages and update wrench command.
         """
+        if not self._validate_joy_msg(msg):
+            # Fail safe: stop the robot rather than keep publishing a stale
+            # command, and don't adopt this message as the edge-detection
+            # baseline.
+            self._zero_wrench()
+            return
+
+        prev_msg = self.last_joy_msg
         self.last_joy_msg = msg
+
+        if self._rising_edge(msg, prev_msg, self.orientation_control_enable_button):
+            self._call_trigger(self.toggle_orientation_control_client, 'toggle_orientation_control')
+        if self._rising_edge(msg, prev_msg, self.visualize_normal_button):
+            self._call_trigger(self.toggle_normal_estimation_viz_client, 'toggle_normal_estimation_viz')
+        if self._rising_edge(msg, prev_msg, self.save_data_button):
+            self._call_trigger(self.toggle_save_data_client, 'toggle_save_data')
 
         # Check if enable button is pressed (safety feature) or if button is not configured
         if not msg.buttons[self.enable_button] and self.enable_button >= 0:
             # Enable button not pressed - stop the robot
-            self.current_wrench.wrench.force.x = 0.0
-            self.current_wrench.wrench.force.y = 0.0
-            self.current_wrench.wrench.force.z = 0.0
-            self.current_wrench.wrench.torque.x = 0.0
-            self.current_wrench.wrench.torque.y = 0.0
-            self.current_wrench.wrench.torque.z = 0.0
+            self._zero_wrench()
             return
 
         # Get raw axis values
