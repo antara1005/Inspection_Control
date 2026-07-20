@@ -5,10 +5,17 @@ TSDF-based pose estimation node.
 Fuses incoming depth frames from the RealSense D405 into an Open3D
 VoxelBlockGrid TSDF expressed in a fixed `fusion_frame` (default
 `object_frame`), extracts a fused point cloud every N frames, and
-registers it against the reference CAD point cloud (FPFH + RANSAC for
-initialization, point-to-plane ICP for refinement). Publishes the
-resulting 6-DOF object pose in the configured `world_frame` and a
-synthetic depth image rendered from the registered mesh.
+registers it against a reference point cloud sampled from the CAD mesh
+(FPFH + RANSAC for initialization, point-to-plane ICP for refinement).
+Publishes the resulting 6-DOF object pose in `fusion_frame` and broadcasts
+the `fusion_frame`->`model_frame` TF (the authoritative placement consumed
+by viewpoint_generation and the GUI), plus a synthetic depth image rendered
+from the registered mesh.
+
+The reference cloud is sampled from the same CAD mesh used for the
+synthetic-depth render; the node only tracks `model.mesh.*` from the
+viewpoint_generation node and no longer depends on a separately-sampled
+whole-part point cloud.
 """
 
 import struct
@@ -126,6 +133,9 @@ class TSDFPoseNode(Node):
             ("crop_min",                    [-0.5, -0.5, 0.01]),
             ("crop_max",                    [0.5,  0.5,  1.0]),
 
+            # Reference cloud sampled from the CAD mesh (Poisson-disk)
+            ("reference_sample_points",     50000),    # points sampled from the mesh surface
+
             # Registration: downsampling
             ("fused_voxel_size",            0.003),    # m
             ("reference_voxel_size",        0.003),    # m
@@ -184,6 +194,8 @@ class TSDFPoseNode(Node):
         self.crop_min = np.asarray(gp("crop_min").value, dtype=np.float64)
         self.crop_max = np.asarray(gp("crop_max").value, dtype=np.float64)
 
+        self.reference_sample_points = int(gp("reference_sample_points").value)
+
         self.fused_voxel     = float(gp("fused_voxel_size").value)
         self.ref_voxel       = float(gp("reference_voxel_size").value)
 
@@ -207,7 +219,7 @@ class TSDFPoseNode(Node):
         self.ray_scene = None        # o3d.t.geometry.RaycastingScene for synth depth
         self.ref_cloud = None        # o3d.geometry.PointCloud (downsampled, with normals)
         self.ref_fpfh = None         # FPFH feature for global registration
-        self._ref_pcd_raw = None     # full-res reference cloud (for live rebuild)
+        self._ref_pcd_raw = None     # reference cloud sampled from the mesh (for live rebuild)
 
         self.device = o3d.core.Device(self.device_str)
         self.vbg = None              # o3d.t.geometry.VoxelBlockGrid
@@ -219,7 +231,7 @@ class TSDFPoseNode(Node):
 
         # Independent readiness flags (decoupled from CAD availability):
         #   tsdf_ready      -> VBG exists; integration + surface publishing allowed
-        #   reference_ready -> CAD point cloud loaded; registration / ICP allowed
+        #   reference_ready -> reference cloud sampled from the mesh; registration / ICP allowed
         #   mesh_ready      -> CAD mesh loaded; synthetic-depth render allowed
         self.tsdf_ready = False
         self.reference_ready = False
@@ -289,8 +301,6 @@ class TSDFPoseNode(Node):
             GetParameters, f"/{self.vg_node_name}/get_parameters")
         self._current_mesh_file  = None
         self._current_mesh_units = None
-        self._current_pc_file    = None
-        self._current_pc_units   = None
 
         self.get_logger().info(
             "Polling viewpoint_generation for model parameters every 5 s …")
@@ -318,6 +328,7 @@ class TSDFPoseNode(Node):
         """
         pending = {}             # attr name -> new value (applied only if all valid)
         rebuild_reference = False
+        resample_reference = False
         rebuild_tsdf = False
 
         def reject(reason):
@@ -390,6 +401,13 @@ class TSDFPoseNode(Node):
             elif n == "model_frame":
                 pending["model_frame"] = str(v)
 
+            # --- reference-cloud resample (from the mesh) --------------
+            elif n == "reference_sample_points":
+                if int(v) < 1:
+                    return reject("reference_sample_points must be >= 1")
+                pending["reference_sample_points"] = int(v)
+                resample_reference = True
+
             # --- reference-cloud rebuild -------------------------------
             elif n == "reference_voxel_size":
                 if float(v) <= 0:
@@ -443,7 +461,15 @@ class TSDFPoseNode(Node):
             elif not self.publish_tf:
                 self.tf_broadcaster = None
 
-        if rebuild_reference:
+        # Re-sampling supersedes a plain rebuild (it rebuilds internally).
+        if resample_reference and self.mesh is not None:
+            try:
+                self._sample_reference_from_mesh()
+                self.get_logger().info(
+                    "Reference cloud re-sampled from mesh after parameter update.")
+            except Exception as e:
+                return reject(f"Reference resample failed: {e}")
+        elif rebuild_reference:
             try:
                 self._build_reference()
                 self.get_logger().info("Reference cloud rebuilt from parameter update.")
@@ -474,10 +500,7 @@ class TSDFPoseNode(Node):
                 throttle_duration_sec=10.0)
             return
         request = GetParameters.Request()
-        request.names = [
-            "model.mesh.file", "model.mesh.units",
-            "model.point_cloud.file", "model.point_cloud.units",
-        ]
+        request.names = ["model.mesh.file", "model.mesh.units"]
         future = self._param_client.call_async(request)
         future.add_done_callback(self._on_model_params)
 
@@ -491,25 +514,24 @@ class TSDFPoseNode(Node):
         values = result.values
         mesh_file  = values[0].string_value
         mesh_units = values[1].string_value
-        pc_file    = values[2].string_value
-        pc_units   = values[3].string_value
 
         # Reset accumulated fusion ONLY when the object identity changes, i.e. a
-        # previously-loaded non-empty path switches to a *different* non-empty path.
+        # previously-loaded non-empty mesh switches to a *different* non-empty mesh.
         # The empty->set transition (we fused CAD-free, then CAD is provided for the
         # same object) must keep the fused surface and merely enable the CAD-dependent
         # capabilities (registration / synthetic depth).
         def _identity_change(old, new):
             return bool(old) and bool(new) and old != new
 
-        reset_needed = (_identity_change(self._current_mesh_file, mesh_file) or
-                        _identity_change(self._current_pc_file, pc_file))
+        reset_needed = _identity_change(self._current_mesh_file, mesh_file)
 
-        # --- CAD mesh -> enables synthetic-depth render (mesh_ready) ---
+        # --- CAD mesh -> synthetic-depth render (mesh_ready) AND the reference
+        # cloud used for registration/ICP (reference_ready), sampled from the mesh ---
         if mesh_file and (mesh_file != self._current_mesh_file or
                           mesh_units != self._current_mesh_units):
             try:
                 self.mesh_ready = False
+                self.reference_ready = False
                 self._load_mesh(mesh_file, mesh_units)
                 self._current_mesh_file  = mesh_file
                 self._current_mesh_units = mesh_units
@@ -517,21 +539,9 @@ class TSDFPoseNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to load mesh: {e}")
 
-        # --- CAD reference cloud -> enables registration / ICP (reference_ready) ---
-        if pc_file and (pc_file != self._current_pc_file or
-                        pc_units != self._current_pc_units):
-            try:
-                self.reference_ready = False
-                self._load_reference(pc_file, pc_units)
-                self._current_pc_file  = pc_file
-                self._current_pc_units = pc_units
-                self.get_logger().info(f"Reference cloud loaded: {pc_file} ({pc_units})")
-            except Exception as e:
-                self.get_logger().error(f"Failed to load reference cloud: {e}")
-
-        if not mesh_file and not pc_file:
+        if not mesh_file:
             self.get_logger().info(
-                "No CAD model set in viewpoint_generation; fusing CAD-free "
+                "No CAD mesh set in viewpoint_generation; fusing CAD-free "
                 "(registration and synthetic depth disabled).",
                 throttle_duration_sec=30.0)
 
@@ -542,7 +552,9 @@ class TSDFPoseNode(Node):
                 "Object identity changed; cleared accumulated TSDF fusion.")
 
     def _load_mesh(self, mesh_path, mesh_units):
-        """Load the CAD mesh for raycast / synthetic depth (sets mesh_ready)."""
+        """Load the CAD mesh for raycast / synthetic depth (sets mesh_ready) and
+        sample a reference point cloud from it for registration (sets
+        reference_ready)."""
         mesh = o3d.io.read_triangle_mesh(mesh_path)
         if mesh.is_empty():
             raise RuntimeError(f"Failed to load mesh from {mesh_path}")
@@ -555,17 +567,31 @@ class TSDFPoseNode(Node):
         self.ray_scene.add_triangles(mesh_t)
         self.mesh_ready = True
 
-    def _load_reference(self, pc_path, pc_units):
-        """Load the CAD reference point cloud for registration (sets reference_ready)."""
-        pcd = o3d.io.read_point_cloud(pc_path)
+        # Sample the reference cloud straight from this mesh: the viewpoint
+        # generation node no longer emits a separately-sampled whole-part cloud.
+        self._sample_reference_from_mesh()
+
+    def _sample_reference_from_mesh(self):
+        """Sample a reference point cloud from the currently loaded mesh and
+        (re)build the downsampled reference + FPFH (sets reference_ready).
+
+        Uses Poisson-disk sampling for even surface coverage, matching how the
+        whole-part reference cloud was previously generated upstream.
+        """
+        if self.mesh is None:
+            return
+        n = max(1, int(self.reference_sample_points))
+        pcd = self.mesh.sample_points_poisson_disk(
+            number_of_points=n, init_factor=5, use_triangle_normal=True)
         if pcd.is_empty():
-            raise RuntimeError(f"Failed to load point cloud from {pc_path}")
-        pcd.scale(unit_scale(pc_units), center=(0, 0, 0))
-        # Keep the full-resolution cloud so the reference can be rebuilt on the
-        # fly when ref_voxel / feature-radius parameters change.
+            raise RuntimeError("Sampling reference cloud from mesh produced no points")
+        # Keep the sampled cloud so the reference can be rebuilt on the fly when
+        # ref_voxel / feature-radius parameters change (see _build_reference).
         self._ref_pcd_raw = pcd
         self._build_reference()
         self.reference_ready = True
+        self.get_logger().info(
+            f"Reference cloud sampled from mesh: {len(pcd.points)} points")
 
     def _build_reference(self):
         """(Re)build the downsampled reference cloud + FPFH from the raw cloud.
@@ -961,43 +987,28 @@ class TSDFPoseNode(Node):
         self.surface_pub.publish(msg)
 
     def _publish_pose(self, T_model_in_fusion: np.ndarray, stamp):
-        """Publish T_model_in_world by composing with TF (world <- fusion)."""
-        # Default to publishing in fusion_frame if world TF is missing
-        out_frame = self.world_frame
-        T_to_publish = T_model_in_fusion
-
-        if self.world_frame and self.world_frame != self.fusion_frame:
-            try:
-                tf_fusion_in_world = self.tf_buffer.lookup_transform(
-                    self.world_frame, self.fusion_frame,
-                    rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=0.05))
-                T_fusion_in_world = msg_to_matrix(tf_fusion_in_world)
-                T_to_publish = T_fusion_in_world @ T_model_in_fusion
-            except (tf2_ros.LookupException,
-                    tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                self.get_logger().warn(
-                    f"TF ({self.world_frame} <- {self.fusion_frame}) failed; "
-                    f"publishing pose in {self.fusion_frame}: {e}",
-                    throttle_duration_sec=5.0)
-                out_frame = self.fusion_frame
-
+        """Publish the model placement as fusion_frame (object_frame) <- model
+        frame: a PoseStamped in fusion_frame plus the fusion_frame->model_frame
+        TF. This is the authoritative placement consumers use (viewpoint
+        generation's planning scene / occlusion, and the GUI) to position the
+        origin-frame mesh and viewpoints. Expressing it in fusion_frame
+        (registered directly, no world composition) keeps the placement correct
+        as the turntable moves."""
         ps = PoseStamped()
         ps.header.stamp = stamp
-        ps.header.frame_id = out_frame
-        ps.pose = matrix_to_pose(T_to_publish)
+        ps.header.frame_id = self.fusion_frame
+        ps.pose = matrix_to_pose(T_model_in_fusion)
         self.pose_pub.publish(ps)
 
         if self.publish_tf and self.tf_broadcaster is not None:
             ts = TransformStamped()
             ts.header.stamp = stamp
-            ts.header.frame_id = out_frame
+            ts.header.frame_id = self.fusion_frame
             ts.child_frame_id = self.model_frame
-            ts.transform.translation.x = float(T_to_publish[0, 3])
-            ts.transform.translation.y = float(T_to_publish[1, 3])
-            ts.transform.translation.z = float(T_to_publish[2, 3])
-            q = Rotation.from_matrix(T_to_publish[:3, :3]).as_quat()
+            ts.transform.translation.x = float(T_model_in_fusion[0, 3])
+            ts.transform.translation.y = float(T_model_in_fusion[1, 3])
+            ts.transform.translation.z = float(T_model_in_fusion[2, 3])
+            q = Rotation.from_matrix(T_model_in_fusion[:3, :3]).as_quat()
             ts.transform.rotation.x = float(q[0])
             ts.transform.rotation.y = float(q[1])
             ts.transform.rotation.z = float(q[2])

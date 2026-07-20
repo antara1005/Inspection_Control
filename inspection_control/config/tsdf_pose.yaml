@@ -29,8 +29,11 @@ tsdf_pose:
 
     # -- Fused-cloud crop (axis-aligned box in fusion_frame, metres) --
     crop_enabled:               true
-    crop_min:                   [-0.5, -0.5, 0.01]   # x, y, z lower bound
+    crop_min:                   [-0.5, -0.5, 0.00]   # x, y, z lower bound
     crop_max:                   [0.5,  0.5,  1.0]    # x, y, z upper bound
+
+    # -- Reference cloud sampled from the CAD mesh --
+    reference_sample_points:    50000     # Poisson-disk points sampled from the mesh surface
 
     # -- Registration: downsampling --
     fused_voxel_size:           0.003     # m – downsample fused cloud
