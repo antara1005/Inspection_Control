@@ -32,6 +32,15 @@ tsdf_pose:
     crop_min:                   [-0.5, -0.5, 0.00]   # x, y, z lower bound
     crop_max:                   [0.5,  0.5,  1.0]    # x, y, z upper bound
 
+    # -- Turntable-plane removal (RANSAC in fusion_frame) --
+    remove_turntable:           true
+    plane_distance_mult:        2.0     # RANSAC inlier dist = mult * voxel_size
+    plane_ransac_iterations:    200
+    plane_min_verticality:      0.9     # |n_z| after normalising; reject tilted planes
+    plane_min_inliers:          200     # min inliers to accept a plane as the table
+    plane_margin:               0.002   # m – also drop points within this margin above it
+    plane_refit_every:          5       # re-run RANSAC every N extractions (cache between)
+
     # -- Reference cloud sampled from the CAD mesh --
     reference_sample_points:    50000     # Poisson-disk points sampled from the mesh surface
 
@@ -60,3 +69,4 @@ tsdf_pose:
     pose_topic:             "tsdf_pose/pose"
     fused_cloud_topic:      "tsdf_pose/fused_cloud"
     synthetic_depth_topic:  "tsdf_pose/depth/synthetic"
+    model_marker_topic:     "tsdf_pose/model_marker"

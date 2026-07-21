@@ -33,7 +33,8 @@ from rcl_interfaces.srv import GetParameters
 from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
-from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped, TransformStamped
+from visualization_msgs.msg import Marker
 from std_srvs.srv import Trigger
 
 import tf2_ros
@@ -133,6 +134,17 @@ class TSDFPoseNode(Node):
             ("crop_min",                    [-0.5, -0.5, 0.01]),
             ("crop_max",                    [0.5,  0.5,  1.0]),
 
+            # Turntable-plane removal (RANSAC in fusion_frame). The turntable top
+            # is a static, ~horizontal plane in fusion_frame, so the fitted plane
+            # is cached and only re-fit every `plane_refit_every` extractions.
+            ("remove_turntable",            True),
+            ("plane_distance_mult",         2.0),    # RANSAC inlier dist = mult * voxel_size
+            ("plane_ransac_iterations",     200),
+            ("plane_min_verticality",       0.9),    # |n_z| after normalising; reject tilted planes
+            ("plane_min_inliers",           200),    # min inliers to accept a plane as the table
+            ("plane_margin",                0.002),  # m – also drop points within this margin above it
+            ("plane_refit_every",           5),      # re-run RANSAC every N extractions (cache between)
+
             # Reference cloud sampled from the CAD mesh (Poisson-disk)
             ("reference_sample_points",     50000),    # points sampled from the mesh surface
 
@@ -162,6 +174,7 @@ class TSDFPoseNode(Node):
             ("fused_cloud_topic",           "~/fused_cloud"),
             ("surface_cloud_topic",         "/perception/surface_cloud"),
             ("synthetic_depth_topic",       "~/depth/synthetic"),
+            ("model_marker_topic",          "~/model_marker"),
         ])
 
         # Convert to attributes
@@ -194,6 +207,14 @@ class TSDFPoseNode(Node):
         self.crop_min = np.asarray(gp("crop_min").value, dtype=np.float64)
         self.crop_max = np.asarray(gp("crop_max").value, dtype=np.float64)
 
+        self.remove_turntable = bool(gp("remove_turntable").value)
+        self.plane_dist_mult = float(gp("plane_distance_mult").value)
+        self.plane_ransac_iters = int(gp("plane_ransac_iterations").value)
+        self.plane_min_verticality = float(gp("plane_min_verticality").value)
+        self.plane_min_inliers = int(gp("plane_min_inliers").value)
+        self.plane_margin = float(gp("plane_margin").value)
+        self.plane_refit_every = int(gp("plane_refit_every").value)
+
         self.reference_sample_points = int(gp("reference_sample_points").value)
 
         self.fused_voxel     = float(gp("fused_voxel_size").value)
@@ -216,6 +237,7 @@ class TSDFPoseNode(Node):
         self.intrinsics = None       # dict with fx, fy, cx, cy, width, height
         self.camera_frame = None
         self.mesh = None             # o3d.geometry.TriangleMesh (metres, model frame)
+        self._model_marker = None    # cached TRIANGLE_LIST marker (geometry built once)
         self.ray_scene = None        # o3d.t.geometry.RaycastingScene for synth depth
         self.ref_cloud = None        # o3d.geometry.PointCloud (downsampled, with normals)
         self.ref_fpfh = None         # FPFH feature for global registration
@@ -228,6 +250,12 @@ class TSDFPoseNode(Node):
         self.have_global_init = False
         self.T_model_in_fusion = None   # latest pose estimate (4x4)
         self.last_pose_stamp = None
+
+        # Cached turntable plane [a,b,c,d] (normal normalised, pointing +z toward
+        # the object). The plane is static in fusion_frame, so it is only re-fit
+        # every plane_refit_every extractions; None forces a fit on next use.
+        self._cached_plane = None
+        self._plane_fit_counter = 0
 
         # Independent readiness flags (decoupled from CAD availability):
         #   tsdf_ready      -> VBG exists; integration + surface publishing allowed
@@ -270,6 +298,17 @@ class TSDFPoseNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.surface_pub = self.create_publisher(PointCloud2, surface_topic, surface_qos)
+        # Model mesh as a latched marker (geometry published once; animated by the
+        # model_frame TF). TRANSIENT_LOCAL so it renders as soon as the TF appears
+        # and for any late-joining viewer (e.g. Foxglove).
+        marker_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        marker_topic = gp("model_marker_topic").value
+        self.model_marker_pub = self.create_publisher(Marker, marker_topic, marker_qos)
         self.depth_pub = self.create_publisher(Image,          synth_topic,                 10)
         self.depth_compressed_pub = self.create_publisher(
             CompressedImage, synth_topic + "/compressedDepth", 10)
@@ -376,6 +415,28 @@ class TSDFPoseNode(Node):
                 if len(v) != 3:
                     return reject("crop_max must have 3 elements")
                 pending["crop_max"] = np.asarray(v, dtype=np.float64)
+            elif n == "remove_turntable":
+                pending["remove_turntable"] = bool(v)
+            elif n == "plane_distance_mult":
+                if float(v) <= 0:
+                    return reject("plane_distance_mult must be > 0")
+                pending["plane_dist_mult"] = float(v)
+            elif n == "plane_ransac_iterations":
+                if int(v) < 1:
+                    return reject("plane_ransac_iterations must be >= 1")
+                pending["plane_ransac_iters"] = int(v)
+            elif n == "plane_min_verticality":
+                pending["plane_min_verticality"] = float(v)
+            elif n == "plane_min_inliers":
+                if int(v) < 0:
+                    return reject("plane_min_inliers must be >= 0")
+                pending["plane_min_inliers"] = int(v)
+            elif n == "plane_margin":
+                pending["plane_margin"] = float(v)
+            elif n == "plane_refit_every":
+                if int(v) < 1:
+                    return reject("plane_refit_every must be >= 1")
+                pending["plane_refit_every"] = int(v)
             elif n == "fused_voxel_size":
                 if float(v) <= 0:
                     return reject("fused_voxel_size must be > 0")
@@ -453,6 +514,13 @@ class TSDFPoseNode(Node):
         # Recompute derived values.
         if "voxel_size" in pending or "sdf_trunc_mult" in pending:
             self.sdf_trunc = self.sdf_trunc_mult * self.voxel_size
+
+        # Plane-fit tuning (or voxel_size, which scales the inlier distance)
+        # changed -> drop the cached plane so it re-fits on the next extraction.
+        if any(k in pending for k in
+               ("plane_dist_mult", "plane_ransac_iters", "plane_min_verticality",
+                "plane_min_inliers", "voxel_size")):
+            self._cached_plane = None
 
         # toggle TF broadcaster on/off if publish_tf changed
         if "publish_tf" in pending:
@@ -566,6 +634,10 @@ class TSDFPoseNode(Node):
         self.ray_scene = o3d.t.geometry.RaycastingScene()
         self.ray_scene.add_triangles(mesh_t)
         self.mesh_ready = True
+
+        # Publish the mesh geometry once (latched) so Foxglove can overlay it on
+        # the fused surface; the model_frame TF moves it on each registration.
+        self._publish_model_marker()
 
         # Sample the reference cloud straight from this mesh: the viewpoint
         # generation node no longer emits a separately-sampled whole-part cloud.
@@ -793,6 +865,7 @@ class TSDFPoseNode(Node):
             return None
         pcd_down = pcd_legacy.voxel_down_sample(self.fused_voxel)
         pcd_down = self._crop_fused_cloud(pcd_down)
+        pcd_down = self._remove_turntable_plane(pcd_down)
         pcd_down.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
                 radius=self.fused_voxel * self.normal_r_mult, max_nn=30))
@@ -803,6 +876,57 @@ class TSDFPoseNode(Node):
             return cloud
         cloud_bbox = o3d.geometry.AxisAlignedBoundingBox(self.crop_min, self.crop_max)
         return cloud.crop(bounding_box=cloud_bbox)
+
+    def _remove_turntable_plane(self, cloud: o3d.geometry.PointCloud):
+        """Remove the turntable top from the fused cloud.
+
+        The turntable surface is a static, ~horizontal plane in fusion_frame, so
+        RANSAC is only run every `plane_refit_every` extractions and the plane is
+        cached in between — the steady-state per-extraction cost is a single
+        vectorised half-space test. Every point below the plane, and every point
+        within `plane_margin` above it, is dropped, so the object base is trimmed
+        cleanly off the table. The fitted plane is only accepted when its normal
+        is near-vertical and it has enough inliers, so a large flat face of the
+        object is never mistaken for the table.
+        """
+        if not self.remove_turntable or len(cloud.points) < 3:
+            return cloud
+
+        need_fit = (self._cached_plane is None or
+                    self._plane_fit_counter % max(1, self.plane_refit_every) == 0)
+        self._plane_fit_counter += 1
+
+        if need_fit:
+            plane, inliers = cloud.segment_plane(
+                distance_threshold=self.plane_dist_mult * self.voxel_size,
+                ransac_n=3,
+                num_iterations=max(1, self.plane_ransac_iters))
+            coeffs = np.asarray(plane, dtype=np.float64)
+            n_norm = np.linalg.norm(coeffs[:3])
+            if n_norm < 1e-9:
+                return cloud
+            # Normalise, then orient the normal to point up (+z), i.e. toward the
+            # object sitting on the table.
+            coeffs = coeffs / n_norm
+            if coeffs[2] < 0.0:
+                coeffs = -coeffs
+            # Guard: reject tilted planes (object faces) and weak fits. Drop the
+            # stale cache so the next extraction re-fits from scratch.
+            if (abs(coeffs[2]) < self.plane_min_verticality or
+                    len(inliers) < self.plane_min_inliers):
+                self._cached_plane = None
+                return cloud
+            self._cached_plane = coeffs
+
+        if self._cached_plane is None:
+            return cloud
+
+        pts = np.asarray(cloud.points, dtype=np.float64)
+        # Signed height above the plane (normal points up). Keep only points
+        # clearly above it; anything below, or within the margin, is the table.
+        signed = pts @ self._cached_plane[:3] + self._cached_plane[3]
+        keep = np.nonzero(signed > self.plane_margin)[0]
+        return cloud.select_by_index(keep)
 
     def _run_registration(self, stamp, force_global: bool = False) -> bool:
         fused = self._extract_fused_cloud()
@@ -1014,6 +1138,59 @@ class TSDFPoseNode(Node):
             ts.transform.rotation.z = float(q[2])
             ts.transform.rotation.w = float(q[3])
             self.tf_broadcaster.sendTransform(ts)
+
+        # Re-publish the cached mesh marker stamped to match the model_frame TF
+        # just broadcast. Renderers transform a marker using the TF at its header
+        # stamp, so restamping is what makes the mesh track each pose update
+        # instead of staying frozen at its first placement. Geometry is reused
+        # from the cache (built once), so this only re-sends, never rebuilds.
+        if self._model_marker is not None:
+            self._model_marker.header.stamp = stamp
+            self.model_marker_pub.publish(self._model_marker)
+
+    def _publish_model_marker(self):
+        """Build (once) and publish the CAD mesh as a latched TRIANGLE_LIST marker
+        in model_frame.
+
+        The geometry is expensive to assemble, so it is built once and cached in
+        self._model_marker. _publish_pose then re-publishes that cached marker
+        with each new pose's stamp: a renderer transforms a marker using the TF at
+        its header stamp, so a single stale-stamped publish would freeze the mesh
+        at its first placement while model_frame keeps moving. Latched
+        (TRANSIENT_LOCAL) so it renders as soon as model_frame appears and for any
+        late-joining viewer.
+        """
+        if self.mesh is None:
+            return
+        verts = np.asarray(self.mesh.vertices, dtype=np.float64)
+        tris = np.asarray(self.mesh.triangles)
+        if len(tris) == 0:
+            return
+        # One marker point per triangle vertex (TRIANGLE_LIST expects 3N points).
+        tri_verts = verts[tris.reshape(-1)]
+
+        marker = Marker()
+        marker.header.frame_id = self.model_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "model_mesh"
+        marker.id = 0
+        marker.type = Marker.TRIANGLE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 1.0
+        marker.scale.y = 1.0
+        marker.scale.z = 1.0
+        # Semi-transparent so the fused surface stays visible underneath.
+        marker.color.r = 0.1
+        marker.color.g = 0.6
+        marker.color.b = 1.0
+        marker.color.a = 0.5
+        marker.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                         for p in tri_verts]
+        self._model_marker = marker
+        self.model_marker_pub.publish(marker)
+        self.get_logger().info(
+            f"Published model marker: {len(tris)} triangles in '{self.model_frame}'.")
 
     # -----------------------------------------------------------------------
     # Synthetic depth render (for visualisation / sanity check)

@@ -38,6 +38,13 @@ class TeleopNode(Node):
                 ('roll_axis_negative', 7),  # Roll Camera
                 ('pitch_axis', 4),  # Pitch Camera About X-Axis
                 ('yaw_axis', 5),   # Yaw Camera About Y-Axis
+                # Fine-mode XY nudge on the D-pad (digital hat axes). Added on
+                # top of the analog-stick force with its own small scale.
+                # D-pad R (axis=-1)->+x, L (+1)->-x; Up (+1)->-y, Down (-1)->+y.
+                # Set an axis to -1 to disable that fine direction.
+                ('fine_x_axis', 6),
+                ('fine_y_axis', 7),
+                ('fine_force_scale', 0.1),
                 ('invert_x', False),  # Invert X-axis for left/right movement
                 ('invert_y', False),  # Invert Y-axis for up/down movement
                 ('invert_z', False),  # Invert Z-axis for push/pull movement
@@ -56,9 +63,17 @@ class TeleopNode(Node):
                 ('orientation_control_enable_button', 0),
                 ('visualize_normal_button', 9),
                 ('save_data_button', 8),
-                # Node name of the orientation controller; used to build the
-                # Trigger service names (e.g. /<name>/toggle_orientation_control).
+                # Autofocus button actions, driven over the autofocus node's
+                # Trigger services (this node owns all Joy parsing).
+                ('autofocus_record_button', 2),   # toggle peak recording
+                ('autofocus_drive_button', 3),    # toggle PD drive-to-peak
+                # "All stop" button (B): disables orientation + autofocus
+                # controllers unconditionally.
+                ('disable_controllers_button', 1),
+                # Node names used to build the Trigger service names
+                # (e.g. /<name>/toggle_orientation_control).
                 ('orientation_control_node_name', 'orientation_controller'),
+                ('autofocus_node_name', 'autofocus'),
             ]
         )
 
@@ -87,6 +102,12 @@ class TeleopNode(Node):
             'pitch_axis').get_parameter_value().integer_value
         self.yaw_axis = self.get_parameter(
             'yaw_axis').get_parameter_value().integer_value
+        self.fine_x_axis = self.get_parameter(
+            'fine_x_axis').get_parameter_value().integer_value
+        self.fine_y_axis = self.get_parameter(
+            'fine_y_axis').get_parameter_value().integer_value
+        self.fine_force_scale = self.get_parameter(
+            'fine_force_scale').get_parameter_value().double_value
         self.invert_x = self.get_parameter(
             'invert_x').get_parameter_value().bool_value
         self.invert_y = self.get_parameter(
@@ -115,8 +136,16 @@ class TeleopNode(Node):
             'visualize_normal_button').get_parameter_value().integer_value
         self.save_data_button = self.get_parameter(
             'save_data_button').get_parameter_value().integer_value
+        self.autofocus_record_button = self.get_parameter(
+            'autofocus_record_button').get_parameter_value().integer_value
+        self.autofocus_drive_button = self.get_parameter(
+            'autofocus_drive_button').get_parameter_value().integer_value
+        self.disable_controllers_button = self.get_parameter(
+            'disable_controllers_button').get_parameter_value().integer_value
         orientation_control_node_name = self.get_parameter(
             'orientation_control_node_name').get_parameter_value().string_value
+        autofocus_node_name = self.get_parameter(
+            'autofocus_node_name').get_parameter_value().string_value
 
         # Every axis/button index this node reads from a Joy message. Indices
         # of -1 mean "unused" (matches the existing enable_button/z_axis
@@ -124,9 +153,11 @@ class TeleopNode(Node):
         self._joy_button_indices = [i for i in (
             self.enable_button, self.roll_axis_positive, self.roll_axis_negative,
             self.orientation_control_enable_button, self.visualize_normal_button,
-            self.save_data_button,
+            self.save_data_button, self.autofocus_record_button,
+            self.autofocus_drive_button, self.disable_controllers_button,
         ) if i >= 0]
-        axis_indices = [self.x_axis, self.y_axis, self.pitch_axis, self.yaw_axis]
+        axis_indices = [self.x_axis, self.y_axis, self.pitch_axis, self.yaw_axis,
+                        self.fine_x_axis, self.fine_y_axis]
         if self.z_axis >= 0:
             axis_indices.append(self.z_axis)
         else:
@@ -165,6 +196,18 @@ class TeleopNode(Node):
             Trigger, f'/{orientation_control_node_name}/toggle_normal_estimation_viz')
         self.toggle_save_data_client = self.create_client(
             Trigger, f'/{orientation_control_node_name}/toggle_save_data')
+
+        # Autofocus Trigger clients (same non-blocking pattern as above).
+        self.toggle_autofocus_recording_client = self.create_client(
+            Trigger, f'/{autofocus_node_name}/toggle_recording')
+        self.toggle_autofocus_driving_client = self.create_client(
+            Trigger, f'/{autofocus_node_name}/toggle_driving')
+
+        # "All stop" clients: disable both controllers unconditionally.
+        self.disable_orientation_control_client = self.create_client(
+            Trigger, f'/{orientation_control_node_name}/disable_orientation_control')
+        self.disable_autofocus_client = self.create_client(
+            Trigger, f'/{autofocus_node_name}/disable_autofocus')
 
         # Internal state
         self.last_joy_msg = None
@@ -252,6 +295,14 @@ class TeleopNode(Node):
             self._call_trigger(self.toggle_normal_estimation_viz_client, 'toggle_normal_estimation_viz')
         if self._rising_edge(msg, prev_msg, self.save_data_button):
             self._call_trigger(self.toggle_save_data_client, 'toggle_save_data')
+        if self._rising_edge(msg, prev_msg, self.autofocus_record_button):
+            self._call_trigger(self.toggle_autofocus_recording_client, 'toggle_recording')
+        if self._rising_edge(msg, prev_msg, self.autofocus_drive_button):
+            self._call_trigger(self.toggle_autofocus_driving_client, 'toggle_driving')
+        # "All stop" (B button): disable both controllers at once.
+        if self._rising_edge(msg, prev_msg, self.disable_controllers_button):
+            self._call_trigger(self.disable_orientation_control_client, 'disable_orientation_control')
+            self._call_trigger(self.disable_autofocus_client, 'disable_autofocus')
 
         # Check if enable button is pressed (safety feature) or if button is not configured
         if not msg.buttons[self.enable_button] and self.enable_button >= 0:
@@ -302,6 +353,14 @@ class TeleopNode(Node):
         fx = fx_filtered * self.force_scale
         fy = fy_filtered * self.force_scale
         fz = fz_filtered * self.force_scale
+
+        # Fine-mode XY nudge from the D-pad (digital hat axes), added on top of
+        # the analog-stick force. Axes are -1/0/+1 so no deadzone is applied.
+        # D-pad R (axis=-1)->+x, L (+1)->-x; Up (+1)->-y, Down (-1)->+y.
+        if self.fine_x_axis >= 0:
+            fx += -msg.axes[self.fine_x_axis] * self.fine_force_scale
+        if self.fine_y_axis >= 0:
+            fy += -msg.axes[self.fine_y_axis] * self.fine_force_scale
         # fz_push = (1.0 - fz_raw_push) / 2.0 *  self.force_scale
         # fz_pull = (1.0 - fz_raw_pull) / 2.0 *  self.force_scale
         # tr_positive = tr_raw_positive * self.torque_scale
@@ -357,6 +416,8 @@ class TeleopNode(Node):
                 self.force_scale = p.value
             elif p.name == 'torque_scale' and p.type_ == p.Type.DOUBLE:
                 self.torque_scale = p.value
+            elif p.name == 'fine_force_scale' and p.type_ == p.Type.DOUBLE:
+                self.fine_force_scale = p.value
                 
         result = SetParametersResult()
         result.successful = True

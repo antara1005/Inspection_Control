@@ -7,7 +7,8 @@ teleop:
     # Scaling factors
     force_scale: 0.60      # Max linear velocity (m/s)
     torque_scale: 0.40     # Max angular velocity (rad/s)
-    
+    fine_force_scale: 0.1  # D-pad fine XY nudge magnitude
+
     x_axis: 0         # Camera pan left/right (Stick X)
     y_axis: 1         # Camera pan up/down (Stick Z)
     z_axis: -1
@@ -17,6 +18,8 @@ teleop:
     roll_axis_negative: 4       # Camera roll along negative Z-axis
     pitch_axis: 4       # Camera pitch along x-axis
     yaw_axis: 3         # Camera yaw along yaxis
+    fine_x_axis: 6      # D-pad L/R: right (-1) -> +x, left (+1) -> -x
+    fine_y_axis: 7      # D-pad U/D: up (+1) -> -y, down (-1) -> +y
     enable_button: -1       # Safety button to enable/disable control (-1 fr no safety button)
 
     # Buttons that call orientation_control_node's Trigger services
@@ -26,6 +29,13 @@ teleop:
     visualize_normal_button: 9             # toggles normal-estimation visualization
     save_data_button: 8                    # toggles orientation-control data logging
     orientation_control_node_name: orientation_controller
+
+    # Buttons that call the autofocus node's Trigger services.
+    autofocus_record_button: 2             # (X) toggles peak recording
+    autofocus_drive_button: 3              # (Y) toggles PD drive-to-peak
+    autofocus_node_name: autofocus
+    # "All stop" (B): disables orientation + autofocus controllers at once.
+    disable_controllers_button: 1
 
     invert_x: true    # Invert X-axis (left/right)
     invert_y: true   # Invert Y-axis (up/down)

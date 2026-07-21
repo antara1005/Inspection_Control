@@ -16,9 +16,9 @@ autofocus:
     # -- Active control (peak-hold PD) --
     frame_id: eoat_camera_link
     wrench_topic: /autofocus/wrench_cmds
-    joy_topic: joy
-    record_button: 2          # toggle peak recording (sweep the robot manually)
-    drive_button: 3           # toggle PD drive-to-peak
+    # Recording/driving are toggled by teleop_node over this node's Trigger
+    # services (~/toggle_recording, ~/toggle_driving, ~/disable_autofocus);
+    # button indices live in the teleop config, not here.
     control_rate: 50.0        # Hz
     # Plant dynamics — MUST match admittance_control.yaml (m d'' + c d' = F).
     sphere_mass: 2.5

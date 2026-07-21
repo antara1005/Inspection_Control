@@ -728,6 +728,10 @@ class OrientationControlCoupledPendulumNode(Node):
                 ('visualize_normal_estimation', False),
                 ('no_target_timeout_s', 0.25),
                 ('orientation_control_enabled', False),
+                # Roll control keeps the camera's roll (zx plane vs world xy)
+                # constant during teleoperation. Independent of pitch/yaw so it
+                # can stay always-on; default True.
+                ('roll_control_enabled', True),
                 ('save_data', False),
                 ('data_path', '/tmp'),
                 ('object', ''),
@@ -863,6 +867,7 @@ class OrientationControlCoupledPendulumNode(Node):
         self._had_target_last_cycle = False
         self._last_target_time_s = None
         self.orientation_control_enabled = bool(self.get_parameter('orientation_control_enabled').value)
+        self.roll_control_enabled = bool(self.get_parameter('roll_control_enabled').value)
 
         # save data parameters
         self.save_data = bool(self.get_parameter('save_data').value)
@@ -964,6 +969,9 @@ class OrientationControlCoupledPendulumNode(Node):
         # raw Joy messages itself. Keeps button-index/array-bounds handling
         # in one place instead of duplicated across every joy consumer.
         self.create_service(Trigger, '~/toggle_orientation_control', self._on_toggle_orientation_control)
+        # Unconditional disable (idempotent) so a single "all stop" button can
+        # force the controller off regardless of its current state.
+        self.create_service(Trigger, '~/disable_orientation_control', self._on_disable_orientation_control)
         self.create_service(Trigger, '~/toggle_normal_estimation_viz', self._on_toggle_normal_estimation_viz)
         self.create_service(Trigger, '~/toggle_save_data', self._on_toggle_save_data)
         self.depth_msg = None
@@ -1137,6 +1145,17 @@ class OrientationControlCoupledPendulumNode(Node):
             response.message = f'orientation_control_enabled -> {self.orientation_control_enabled}'
         except Exception as e:
             self.get_logger().error(f'toggle_orientation_control failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
+
+    def _on_disable_orientation_control(self, request, response):
+        try:
+            self.disable_orientation_control()
+            response.success = True
+            response.message = f'orientation_control_enabled -> {self.orientation_control_enabled}'
+        except Exception as e:
+            self.get_logger().error(f'disable_orientation_control failed: {e}')
             response.success = False
             response.message = str(e)
         return response
@@ -2102,7 +2121,7 @@ class OrientationControlCoupledPendulumNode(Node):
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
         w.header.frame_id = self.main_camera_frame
-        w.wrench.torque.z = float(tau_roll) if self.orientation_control_enabled else 0.0
+        w.wrench.torque.z = float(tau_roll) if self.roll_control_enabled else 0.0
 
         if has_measurement:
             if self.orientation_control_enabled:
@@ -2381,6 +2400,10 @@ class OrientationControlCoupledPendulumNode(Node):
                     self.enable_orientation_control()
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
+
+            elif p.name == 'roll_control_enabled':
+                self.roll_control_enabled = bool(p.value)
+                self.get_logger().info(f'Updated roll_control_enabled to {self.roll_control_enabled}')
 
             elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
                 self.mass_B = float(p.value)

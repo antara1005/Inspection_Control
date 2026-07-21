@@ -1,8 +1,10 @@
 # Space Mouse Configuration for TeleopTwistStampedJoy
 admittance_control:
   ros__parameters:
-    # Publishing rate (Hz)
-    publish_rate: 10.0
+    # Publishing rate (Hz). Feeds Servo's 500 Hz loop; kept high so the twist
+    # command isn't a 10 Hz staircase that Servo's finite-difference velocity
+    # output turns into jitter on the forward_velocity_controller.
+    publish_rate: 250.0
     
     # Scaling factors
    # force_scale: 1.0      # Max linear velocity (m/s)

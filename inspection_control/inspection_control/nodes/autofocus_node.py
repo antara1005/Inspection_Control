@@ -37,8 +37,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rcl_interfaces.msg import SetParametersResult
 
 from cv_bridge import CvBridge
-from sensor_msgs.msg import CompressedImage, Joy
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float64
+from std_srvs.srv import Trigger
 from geometry_msgs.msg import WrenchStamped
 
 import inspection_control.focus_metrics as focus_metrics
@@ -68,9 +69,10 @@ class AutofocusNode(Node):
                 # --- Active control ---
                 ('frame_id', 'eoat_camera_link'),
                 ('wrench_topic', '/autofocus/wrench_cmds'),
-                ('joy_topic', 'joy'),
-                ('record_button', 2),       # toggle peak recording
-                ('drive_button', 3),        # toggle PD drive-to-peak
+                # Recording/driving are toggled by teleop_node over the Trigger
+                # services below (~/toggle_recording, ~/toggle_driving,
+                # ~/disable_autofocus), rather than this node parsing raw Joy.
+                # Keeps all button-index/array-bounds handling in teleop_node.
                 ('control_rate', 50.0),     # Hz, PD control loop
                 # Plant dynamics — must match the admittance node so the PD gains
                 # reflect the real virtual plant (m d'' + c d' = F).
@@ -108,9 +110,6 @@ class AutofocusNode(Node):
         # Active-control params
         self.frame_id = gp('frame_id').get_parameter_value().string_value
         self.wrench_topic = gp('wrench_topic').get_parameter_value().string_value
-        joy_topic = gp('joy_topic').get_parameter_value().string_value
-        self.record_button = int(gp('record_button').value)
-        self.drive_button = int(gp('drive_button').value)
         self.control_rate = float(gp('control_rate').value)
         self.sphere_mass = float(gp('sphere_mass').value)
         self.sphere_radius = float(gp('sphere_radius').value)
@@ -148,7 +147,6 @@ class AutofocusNode(Node):
         self.max_focus = float('-inf')
         self.target_distance = None         # focal distance at max focus (m)
         self._within_tol = False            # inside the hold deadband
-        self.last_joy = None
         # (focal_distance, focus_value) samples gathered during 'recording', used
         # to parabola-fit a refined target on record-stop.
         self._sweep = deque(maxlen=5000)
@@ -166,7 +164,13 @@ class AutofocusNode(Node):
             CompressedImage, self.image_topic, self._on_image, image_qos)
         self.create_subscription(
             Float64, self.distance_topic, self._on_distance, 10)
-        self.create_subscription(Joy, joy_topic, self._on_joy, 10)
+
+        # Button-driven actions are triggered by teleop_node over these Trigger
+        # services (mirrors orientation_controller's ~/toggle_* interface), so
+        # this node no longer subscribes to raw Joy.
+        self.create_service(Trigger, '~/toggle_recording', self._on_toggle_recording)
+        self.create_service(Trigger, '~/toggle_driving', self._on_toggle_driving)
+        self.create_service(Trigger, '~/disable_autofocus', self._on_disable_autofocus)
 
         self.focus_pub = None
         if self.publish_focus:
@@ -190,7 +194,6 @@ class AutofocusNode(Node):
             f"autofocus up — metric={self.focus_metric}, "
             f"image_topic={self.image_topic}, distance_topic={self.distance_topic}, "
             f"visualize={self.visualize}; control: wrench_topic={self.wrench_topic}, "
-            f"record_button={self.record_button}, drive_button={self.drive_button}, "
             f"m={self.sphere_mass}, c={self.linear_drag:.4f}")
 
     # ----------------------------------------------------------------------
@@ -258,19 +261,41 @@ class AutofocusNode(Node):
     # ----------------------------------------------------------------------
     # Active control
     # ----------------------------------------------------------------------
-    def _on_joy(self, msg: Joy):
-        # Rising-edge detection per button (toggle on press).
-        if self.last_joy is not None:
-            if self._pressed(msg, self.last_joy, self.record_button):
-                self._toggle_recording()
-            if self._pressed(msg, self.last_joy, self.drive_button):
-                self._toggle_driving()
-        self.last_joy = msg
+    def _on_toggle_recording(self, request, response):
+        try:
+            self._toggle_recording()
+            response.success = True
+            response.message = f'autofocus mode -> {self.mode}'
+        except Exception as e:
+            self.get_logger().error(f'toggle_recording failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
 
-    @staticmethod
-    def _pressed(msg, last, idx):
-        return (idx < len(msg.buttons) and idx < len(last.buttons)
-                and msg.buttons[idx] and not last.buttons[idx])
+    def _on_toggle_driving(self, request, response):
+        try:
+            self._toggle_driving()
+            response.success = True
+            response.message = f'autofocus mode -> {self.mode}'
+        except Exception as e:
+            self.get_logger().error(f'toggle_driving failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
+
+    def _on_disable_autofocus(self, request, response):
+        # Unconditional stop (idempotent): leave any recording/driving mode and
+        # zero the force so a single "all stop" button can force the controller
+        # off regardless of its current state.
+        try:
+            self._set_mode('idle')
+            response.success = True
+            response.message = 'autofocus disabled (mode -> idle)'
+        except Exception as e:
+            self.get_logger().error(f'disable_autofocus failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
 
     def _toggle_recording(self):
         if self.mode == 'recording':
