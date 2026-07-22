@@ -7,10 +7,12 @@ computes a frame-based focus value on each image using the selected metric.
 
 Two stages:
 
-* **Sensing/fusion**: computes the focus value per frame, publishes it, and
-  (optionally) an annotated debug image (a normal ROS image topic — view with
-  rqt_image_view / RViz / Foxglove). Time-series of focus value and distance are
-  viewed as Foxglove plots, so the debug image only shows the ROI + scalars.
+* **Sensing/fusion**: computes the focus value per frame, publishes it, and the
+  ROI box + scalar readouts as a foxglove_msgs/ImageAnnotations overlay
+  (composite on the raw feed in a Foxglove Image panel). The same overlay is
+  also available as a drawn debug image (``visualize``) for rqt_image_view /
+  RViz. Time-series of focus value and distance are viewed as Foxglove plots,
+  so the overlay only shows the ROI + current scalars.
 
 * **Active control**: a peak-hold autofocus. While *recording* (joy button) the
   node buffers the focus-vs-distance sweep; on record-stop it parabola-fits the
@@ -41,6 +43,8 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import WrenchStamped
+from foxglove_msgs.msg import (
+    ImageAnnotations, PointsAnnotation, TextAnnotation, Point2, Color)
 
 import inspection_control.focus_metrics as focus_metrics
 
@@ -64,6 +68,10 @@ class AutofocusNode(Node):
                 ('roi_y', 0.5),
                 # Debug image
                 ('visualize', False),       # publish annotated debug image
+                # foxglove_msgs/ImageAnnotations overlay of the ROI box + text.
+                # Cheap (vector, not raster): overlay it on the raw camera feed
+                # in a Foxglove Image panel instead of the drawn debug image.
+                ('publish_annotations', True),
                 ('publish_focus', True),
 
                 # --- Active control ---
@@ -105,6 +113,7 @@ class AutofocusNode(Node):
         self.roi_x = float(gp('roi_x').value)
         self.roi_y = float(gp('roi_y').value)
         self.visualize = bool(gp('visualize').value)
+        self.publish_annotations = bool(gp('publish_annotations').value)
         self.publish_focus = bool(gp('publish_focus').value)
 
         # Active-control params
@@ -182,6 +191,12 @@ class AutofocusNode(Node):
         self.debug_pub = self.create_publisher(
             CompressedImage, f'{self.get_name()}/debug_image/compressed', 1)
 
+        # foxglove_msgs/ImageAnnotations mirroring the debug-image overlay.
+        # In Foxglove: Image panel, base = image_topic, add this as an
+        # annotation topic (coords are pixels of that image).
+        self.annot_pub = self.create_publisher(
+            ImageAnnotations, f'{self.get_name()}/annotations', 1)
+
         # Force command into the admittance node (summed with teleop/orientation).
         self.wrench_pub = self.create_publisher(WrenchStamped, self.wrench_topic, 10)
 
@@ -248,6 +263,10 @@ class AutofocusNode(Node):
 
             if self.focus_pub is not None:
                 self.focus_pub.publish(Float64(data=focus_value))
+
+            if self.publish_annotations:
+                self.annot_pub.publish(
+                    self._build_annotations(roi_box, msg.header.stamp))
 
             if self.visualize:
                 canvas = self._render(frame, roi_box)
@@ -453,31 +472,95 @@ class AutofocusNode(Node):
     # Debug-image rendering (cv2 drawing only — no HighGUI)
     # ----------------------------------------------------------------------
     def _render(self, frame, roi_box):
-        """Return an annotated BGR copy of `frame` (ROI box + text readouts).
+        """Return an annotated BGR copy of `frame` (ROI box + readouts).
 
-        Time-series of focus value / distance live in Foxglove plots, so the
-        debug image only shows the ROI and current scalar values.
+        Mirrors `_build_annotations`: the ROI box is colored by control mode
+        (grey idle / red recording / green driving) and the metric/focus/
+        distance readouts are stacked just below it. Time-series live in
+        Foxglove plots, so only the current scalars are shown.
         """
         canvas = frame.copy()
 
         x0, y0, x1, y1 = roi_box
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), self._bgr(self._mode_color()), 2)
 
-        cur_dist = self._latest_distance
-
-        cv2.putText(canvas, f"metric: {self.focus_metric}", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(canvas, f"focus: {self._latest_focus:.1f}", (10, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
-        cv2.putText(canvas, f"distance: {self._fmt(cur_dist)}", (10, 72),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
-
-        mode_color = {'recording': (0, 0, 255), 'driving': (0, 255, 0)}.get(
-            self.mode, (200, 200, 200))
-        cv2.putText(canvas, f"mode: {self.mode}",
-                    (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
+        # Readouts stacked just below the box, left edge aligned to it.
+        y = y1 + 22
+        for text, color in self._readouts():
+            cv2.putText(canvas, text, (x0, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self._bgr(color), 2)
+            y += 24
 
         return canvas
+
+    @staticmethod
+    def _rgba(r, g, b, a=1.0):
+        """foxglove_msgs/Color from 0..1 RGBA components."""
+        return Color(r=float(r), g=float(g), b=float(b), a=float(a))
+
+    @staticmethod
+    def _bgr(color):
+        """foxglove_msgs/Color -> (B, G, R) 0..255 ints for cv2 drawing."""
+        return (int(color.b * 255), int(color.g * 255), int(color.r * 255))
+
+    def _mode_color(self):
+        """ROI-box color by control mode: grey idle, red recording, green driving."""
+        return {
+            'recording': self._rgba(1.0, 0.0, 0.0),
+            'driving':   self._rgba(0.0, 1.0, 0.0),
+        }.get(self.mode, self._rgba(0.7, 0.7, 0.7))
+
+    def _readouts(self):
+        """(text, foxglove_msgs/Color) readouts shared by _render + annotations."""
+        return [
+            (f"metric: {self.focus_metric}",     self._rgba(1.0, 1.0, 1.0)),
+            (f"focus: {self._latest_focus:.1f}", self._rgba(1.0, 0.843, 0.0)),
+            (f"distance: {self._fmt(self._latest_distance)}", self._rgba(0.0, 0.784, 1.0)),
+        ]
+
+    def _build_annotations(self, roi_box, stamp):
+        """foxglove_msgs/ImageAnnotations mirroring `_render`'s ROI box + text.
+
+        Vector overlay to composite on the raw camera feed in a Foxglove Image
+        panel (no re-encoded debug image needed). Pixel coordinates use the
+        top-left image origin; text `position` is the bottom-left of the glyphs
+        (like cv2.putText). The box color encodes the control mode; the
+        readouts sit just below the box.
+        """
+        ann = ImageAnnotations()
+        ann.timestamp = stamp
+
+        x0, y0, x1, y1 = roi_box
+        box = PointsAnnotation()
+        box.timestamp = stamp
+        box.type = PointsAnnotation.LINE_LOOP
+        box.points = [
+            Point2(x=float(x0), y=float(y0)),
+            Point2(x=float(x1), y=float(y0)),
+            Point2(x=float(x1), y=float(y1)),
+            Point2(x=float(x0), y=float(y1)),
+        ]
+        box.outline_color = self._mode_color()  # grey/red/green by mode
+        box.thickness = 2.0
+        ann.points.append(box)
+
+        # Readouts stacked just below the box, left edge aligned to it.
+        # First baseline = box bottom + margin + font size.
+        y = float(y1) + 6.0 + 16.0
+        for text, color in self._readouts():
+            t = TextAnnotation()
+            t.timestamp = stamp
+            t.position = Point2(x=float(x0), y=y)
+            t.text = text
+            t.font_size = 16.0
+            t.text_color = color
+            # Semi-transparent backing so text stays legible over the live feed
+            # (cv2 relied on a thick stroke instead); set a=0.0 to disable.
+            t.background_color = self._rgba(0.0, 0.0, 0.0, 0.5)
+            ann.texts.append(t)
+            y += 20.0
+
+        return ann
 
     # ----------------------------------------------------------------------
     # Parameter updates
@@ -496,6 +579,8 @@ class AutofocusNode(Node):
                 self.roi_y = float(p.value)
             elif p.name == 'visualize':
                 self.visualize = bool(p.value)
+            elif p.name == 'publish_annotations':
+                self.publish_annotations = bool(p.value)
             elif p.name == 'publish_focus':
                 self.publish_focus = bool(p.value)
             # Control tunables (live)
