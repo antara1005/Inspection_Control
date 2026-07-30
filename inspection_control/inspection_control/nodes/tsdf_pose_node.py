@@ -33,9 +33,11 @@ from rcl_interfaces.srv import GetParameters
 from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
-from geometry_msgs.msg import Point, Pose, PoseStamped, TransformStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
 from visualization_msgs.msg import Marker
+from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
 import tf2_ros
 from tf2_ros import TransformBroadcaster
@@ -89,6 +91,60 @@ def matrix_to_pose(T: np.ndarray) -> Pose:
     return p
 
 
+def quat_from_z_axis(normal: np.ndarray) -> Quaternion:
+    """Return a quaternion whose +Z axis aligns with `normal` (xyzw).
+
+    The remaining roll about Z is arbitrary; a stable reference axis is chosen so
+    the frame does not flip near singularities. Consumers that care about roll
+    should not rely on it.
+    """
+    z = np.asarray(normal, dtype=np.float64)
+    n = np.linalg.norm(z)
+    if n < 1e-9:
+        return Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+    z = z / n
+    # Pick a world axis least parallel to z to build an orthonormal basis.
+    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    x = np.cross(ref, z)
+    x /= (np.linalg.norm(x) + 1e-12)
+    y = np.cross(z, x)
+    R = np.column_stack((x, y, z))
+    q = Rotation.from_matrix(R).as_quat()  # xyzw
+    return Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
+
+
+class RateMeter:
+    """EMA estimate of an event's frequency (Hz), fed one timestamp per event.
+
+    Smooths the instantaneous 1/dt so a Foxglove plot of the cadence is readable
+    instead of spiky. `hz` returns 0.0 until two events have been seen, and decays
+    toward 0 if `tick` stops being called (queried lazily against `now`)."""
+
+    def __init__(self, tau: float = 1.0):
+        self.tau = float(tau)
+        self._last_t = None
+        self._hz = 0.0
+
+    def tick(self, now_s: float):
+        if self._last_t is not None:
+            dt = now_s - self._last_t
+            if dt > 1e-6:
+                inst = 1.0 / dt
+                alpha = 1.0 - np.exp(-dt / max(1e-3, self.tau))
+                self._hz += alpha * (inst - self._hz)
+        self._last_t = now_s
+
+    def hz(self, now_s: float) -> float:
+        # Decay the estimate toward 0 if events have stalled (dt since last tick
+        # already exceeds the current period).
+        if self._last_t is None:
+            return 0.0
+        stalled = now_s - self._last_t
+        if stalled > 0 and self._hz > 0 and stalled > (1.0 / max(1e-6, self._hz)):
+            return float(1.0 / stalled)
+        return float(self._hz)
+
+
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
@@ -96,6 +152,11 @@ def matrix_to_pose(T: np.ndarray) -> Pose:
 class TSDFPoseNode(Node):
     def __init__(self):
         super().__init__("tsdf_pose")
+
+        # Silence Open3D's C++ WARNING stream (e.g. EstimateRange "Could not generate
+        # full range map"), which the surface-normal raycast can emit at timer rate
+        # and which is not throttleable from Python. Errors are still raised and caught.
+        o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
         # -- Parameters -----------------------------------------------------
         self.declare_parameters("", [
@@ -175,6 +236,44 @@ class TSDFPoseNode(Node):
             ("surface_cloud_topic",         "/perception/surface_cloud"),
             ("synthetic_depth_topic",       "~/depth/synthetic"),
             ("model_marker_topic",          "~/model_marker"),
+
+            # ---- Macro-perspective surface-normal producer (opt-in) ----
+            # Casts the macro camera's optical axis against the TSDF volume
+            # (VoxelBlockGrid.ray_cast) or the registered CAD mesh (RaycastingScene)
+            # and publishes the surface point + normal as a frame in fusion_frame,
+            # plus the optical-axis focal distance and a synthetic macro depth map.
+            # No-ops (throttled log) until the macro CameraInfo + TF are available.
+            ("enable_surface_normal",         True),
+            ("surface_normal_rate_hz",        10.0),
+            ("macro_camera_frame",            "eoat_camera_link"),
+            ("macro_camera_info_topic",       "/pi_camera/camera_info"),
+            # Manual macro intrinsics — used when the camera publishes an
+            # uncalibrated CameraInfo (e.g. /pi_camera/camera_info reports width=0,
+            # height=0, k=all-zeros). Values <= 0 mean "unset"; cx/cy default to the
+            # image centre when left 0. Valid CameraInfo fields always take precedence.
+            ("macro_fx",                      0.0),
+            ("macro_fy",                      0.0),
+            ("macro_cx",                      0.0),
+            ("macro_cy",                      0.0),
+            ("macro_width",                   0),
+            ("macro_height",                  0),
+            # Distinct from the orientation controller's own 'surface_normal' TF so
+            # the two producers do not fight over one frame during the additive
+            # phase. Rename to 'surface_normal' once the controller stops emitting it.
+            ("surface_normal_frame",          "macro_surface_normal"),
+            ("surface_normal_topic",          "~/surface_normal"),
+            ("focal_distance_topic",          "~/focal_distance_m"),
+            ("synthetic_macro_depth_topic",   "~/depth/macro_synthetic"),
+            ("publish_synthetic_macro_depth", True),
+            ("surface_normal_source",         "auto"),   # auto | tsdf | cad
+            ("surface_normal_patch",          5),        # NxN centre window averaged
+            ("raycast_downscale",             4),        # render at intrinsics/downscale
+            ("raycast_depth_min",             0.05),     # m
+            ("raycast_depth_max",             0.60),     # m
+            ("raycast_range_map_down_factor", 4),        # avoid small-image range-map failure
+
+            # ---- Diagnostics (always on) ----
+            ("diagnostics_rate_hz",           2.0),
         ])
 
         # Convert to attributes
@@ -233,6 +332,27 @@ class TSDFPoseNode(Node):
 
         self.vg_node_name    = gp("viewpoint_generation_node").value
 
+        # Macro surface-normal producer config
+        self.enable_surface_normal = bool(gp("enable_surface_normal").value)
+        self.surface_normal_rate_hz = float(gp("surface_normal_rate_hz").value)
+        self.macro_camera_frame = gp("macro_camera_frame").value
+        self.macro_camera_info_topic = gp("macro_camera_info_topic").value
+        self.macro_fx = float(gp("macro_fx").value)
+        self.macro_fy = float(gp("macro_fy").value)
+        self.macro_cx = float(gp("macro_cx").value)
+        self.macro_cy = float(gp("macro_cy").value)
+        self.macro_width = int(gp("macro_width").value)
+        self.macro_height = int(gp("macro_height").value)
+        self.surface_normal_frame = gp("surface_normal_frame").value
+        self.publish_synthetic_macro_depth = bool(gp("publish_synthetic_macro_depth").value)
+        self.surface_normal_source = str(gp("surface_normal_source").value).lower()
+        self.surface_normal_patch = max(1, int(gp("surface_normal_patch").value))
+        self.raycast_downscale = max(1, int(gp("raycast_downscale").value))
+        self.raycast_depth_min = float(gp("raycast_depth_min").value)
+        self.raycast_depth_max = float(gp("raycast_depth_max").value)
+        self.raycast_range_map_down_factor = max(1, int(gp("raycast_range_map_down_factor").value))
+        self.diagnostics_rate_hz = float(gp("diagnostics_rate_hz").value)
+
         # -- State ----------------------------------------------------------
         self.intrinsics = None       # dict with fx, fy, cx, cy, width, height
         self.camera_frame = None
@@ -267,6 +387,26 @@ class TSDFPoseNode(Node):
         self.integ_lock = threading.Lock()
         self.reg_lock = threading.Lock()
         self.processing_reg = False
+
+        # Macro camera intrinsics for the surface-normal raycast (populated by the
+        # macro CameraInfo callback; the producer no-ops until this is set).
+        self._macro_optical_frame = self.macro_camera_frame
+        # Seed from manual overrides so an uncalibrated camera (CameraInfo with
+        # width=0/height=0/k=0, as /pi_camera/camera_info publishes) can still drive
+        # the producer. Stays None (producer no-ops) if neither overrides nor a valid
+        # CameraInfo are available.
+        self.macro_intrinsics = self._make_macro_intrinsics(0, 0, 0.0, 0.0, 0.0, 0.0)
+
+        # Diagnostics: EMA rate meters + last-registration quality, published for
+        # Foxglove both as a DiagnosticArray and as plain Float64 scalar topics.
+        self._rate_integration = RateMeter(tau=1.0)
+        self._rate_surface = RateMeter(tau=2.0)
+        self._rate_registration = RateMeter(tau=5.0)
+        self._rate_raycast = RateMeter(tau=1.0)
+        self._last_icp_fitness = 0.0
+        self._last_icp_rmse_mm = 0.0
+        self._surface_normal_valid = 0.0
+        self._surface_normal_source_active = "none"
 
         # -- TF -------------------------------------------------------------
         self.tf_buffer = tf2_ros.Buffer()
@@ -319,6 +459,30 @@ class TSDFPoseNode(Node):
         self.camera_info_pub = self.create_publisher(
             CameraInfo, info_topic, 10)
 
+        # -- Surface-normal producer publishers -----------------------------
+        # surface_normal is a control-rate frame in fusion_frame; consumers
+        # (orientation control, autofocus) compose their own TF against it and
+        # stay fresh between publishes. focal_distance_m mirrors the signal the
+        # autofocus node consumes today from the orientation controller.
+        self.surface_normal_pub = self.create_publisher(
+            PoseStamped, gp("surface_normal_topic").value, 10)
+        self.focal_distance_pub = self.create_publisher(
+            Float64, gp("focal_distance_topic").value, 10)
+        self.macro_depth_pub = self.create_publisher(
+            Image, gp("synthetic_macro_depth_topic").value, 10)
+
+        # -- Diagnostics publishers (Foxglove) ------------------------------
+        self.diag_pub = self.create_publisher(DiagnosticArray, "~/diagnostics", 10)
+        # Plain scalar mirrors for one-click plotting.
+        self._diag_scalar_pubs = {
+            name: self.create_publisher(Float64, f"~/diag/{name}", 10)
+            for name in (
+                "integration_hz", "surface_publish_hz", "registration_hz",
+                "raycast_hz", "icp_fitness", "icp_rmse_mm", "integration_count",
+                "surface_normal_valid",
+            )
+        }
+
         # -- Subscribers ----------------------------------------------------
         self._depth_cb_group = ReentrantCallbackGroup()
         self.create_subscription(
@@ -330,6 +494,11 @@ class TSDFPoseNode(Node):
             "/camera/d405_camera/depth/image_rect_raw/compressedDepth",
             self._depth_cb, qos,
             callback_group=self._depth_cb_group)
+
+        # Macro camera intrinsics for the surface-normal raycast. Separate camera
+        # from the D405 depth sensor; the producer stays idle until this arrives.
+        self.create_subscription(
+            CameraInfo, self.macro_camera_info_topic, self._macro_camera_info_cb, qos)
 
         # -- Services -------------------------------------------------------
         self.create_service(Trigger, "~/reset", self._on_reset)
@@ -347,6 +516,19 @@ class TSDFPoseNode(Node):
 
         # React to live parameter updates (e.g. `ros2 param set ...`).
         self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        # -- Diagnostics + surface-normal timers ----------------------------
+        # The surface-normal timer runs on its own reentrant callback group so a
+        # long registration (ICP/FPFH) on the depth thread cannot starve the
+        # control-rate raycast. It reads the VBG under integ_lock only for the
+        # brief cast, never the full extraction.
+        self._sn_cb_group = ReentrantCallbackGroup()
+        if self.diagnostics_rate_hz > 0:
+            self.create_timer(1.0 / self.diagnostics_rate_hz, self._publish_diagnostics)
+        if self.enable_surface_normal and self.surface_normal_rate_hz > 0:
+            self.create_timer(
+                1.0 / self.surface_normal_rate_hz, self._surface_normal_timer_cb,
+                callback_group=self._sn_cb_group)
 
         # Build the voxel grid up front so fusion can run before — or entirely
         # without — CAD. Only registration (ICP) and the CAD synthetic-depth render
@@ -850,6 +1032,7 @@ class TSDFPoseNode(Node):
             self.vbg.integrate(
                 frustum, depth_o3d, intrinsic, extrinsic, ds_for_o3d, self.depth_max_int)
         self.integration_count += 1
+        self._rate_integration.tick(self.get_clock().now().nanoseconds * 1e-9)
 
     # -----------------------------------------------------------------------
     # Registration
@@ -965,6 +1148,9 @@ class TSDFPoseNode(Node):
         self.T_model_in_fusion = np.array(icp_result.transformation)
         self.have_global_init = True
         self.last_pose_stamp = stamp
+        self._last_icp_fitness = float(icp_result.fitness)
+        self._last_icp_rmse_mm = float(icp_result.inlier_rmse * 1e3)
+        self._rate_registration.tick(self.get_clock().now().nanoseconds * 1e-9)
 
         self._publish_pose(self.T_model_in_fusion, stamp)
         self.get_logger().info(
@@ -1068,6 +1254,7 @@ class TSDFPoseNode(Node):
             return
         self._publish_surface_cloud_with_normals(fused, stamp)
         self._publish_cloud(fused, stamp)              # legacy xyz-only fused_cloud
+        self._rate_surface.tick(self.get_clock().now().nanoseconds * 1e-9)
 
     def _publish_surface_cloud_with_normals(self, pcd: o3d.geometry.PointCloud, stamp):
         """Publish a fused cloud carrying per-point normals on the surface contract
@@ -1253,6 +1440,406 @@ class TSDFPoseNode(Node):
             comp.data = config_header + png_buf.tobytes()
             self.depth_compressed_pub.publish(comp)
 
+    # -----------------------------------------------------------------------
+    # Macro-perspective surface-normal producer
+    # -----------------------------------------------------------------------
+
+    def _make_macro_intrinsics(self, width, height, fx, fy, cx, cy):
+        """Merge CameraInfo-provided intrinsics with the manual macro_* overrides and
+        validate. A provided value is used only when > 0, otherwise the override
+        fills in; cx/cy default to the image centre. Returns a complete intrinsics
+        dict, or None if fx/fy/width/height cannot be resolved to positive values
+        (so a degenerate CameraInfo — width=0, k=all-zeros — never reaches ray_cast)."""
+        w = int(width) if width and width > 0 else self.macro_width
+        h = int(height) if height and height > 0 else self.macro_height
+        fx = fx if fx and fx > 0 else self.macro_fx
+        fy = fy if fy and fy > 0 else self.macro_fy
+        cx = cx if cx and cx > 0 else self.macro_cx
+        cy = cy if cy and cy > 0 else self.macro_cy
+        if w <= 0 or h <= 0 or fx <= 0 or fy <= 0:
+            return None
+        if cx <= 0:
+            cx = w / 2.0
+        if cy <= 0:
+            cy = h / 2.0
+        return {"fx": float(fx), "fy": float(fy), "cx": float(cx), "cy": float(cy),
+                "width": int(w), "height": int(h)}
+
+    def _macro_camera_info_cb(self, msg: CameraInfo):
+        """Cache macro-camera intrinsics + optical frame for the surface-normal
+        raycast. The intrinsics are defined in msg.header.frame_id, so that frame
+        (not the configured link) is what the extrinsic TF must resolve to.
+
+        Guards against an uncalibrated CameraInfo (e.g. /pi_camera/camera_info emits
+        width=0, height=0, k=all-zeros): degenerate intrinsics are rejected here so
+        fx=0 never reaches ray_cast (which would render a zero-size frustum and crash
+        with 'invalid configuration argument'). Provide macro_fx/macro_fy/macro_width/
+        macro_height params to run against such a camera."""
+        K = msg.k
+        intr = self._make_macro_intrinsics(msg.width, msg.height, K[0], K[4], K[2], K[5])
+        if intr is None:
+            self.get_logger().warn(
+                f"Ignoring macro CameraInfo on '{self.macro_camera_info_topic}': no "
+                f"valid intrinsics (width={msg.width}, height={msg.height}, "
+                f"fx={K[0]:.1f}, fy={K[4]:.1f}). Set macro_fx/macro_fy/macro_width/"
+                f"macro_height params or publish a calibrated CameraInfo.",
+                throttle_duration_sec=10.0)
+            return
+        self.macro_intrinsics = intr
+        # Capture the optical frame even from an otherwise-empty CameraInfo (its
+        # frame_id is still valid, e.g. 'eoat_camera_link').
+        if msg.header.frame_id:
+            self._macro_optical_frame = msg.header.frame_id
+
+    def _macro_K_downscaled(self):
+        """Return (fx, fy, cx, cy, w, h) scaled down by raycast_downscale so the
+        per-tick render is cheap; the centre patch normal is unaffected."""
+        K = self.macro_intrinsics
+        s = self.raycast_downscale
+        w = max(1, int(K["width"]) // s)
+        h = max(1, int(K["height"]) // s)
+        return (K["fx"] / s, K["fy"] / s, K["cx"] / s, K["cy"] / s, w, h)
+
+    def _surface_normal_timer_cb(self):
+        """Fast-timer producer: cast the macro optical axis against the TSDF volume
+        or the registered CAD mesh, and publish the surface point + normal frame
+        (in fusion_frame), the optical-axis focal distance, and a synthetic macro
+        depth map. No-ops until macro intrinsics + TF are available."""
+        if not self.enable_surface_normal or not self.tsdf_ready:
+            return
+        if self.macro_intrinsics is None:
+            self.get_logger().info(
+                f"Surface-normal producer idle: waiting for macro CameraInfo on "
+                f"'{self.macro_camera_info_topic}'.", throttle_duration_sec=10.0)
+            return
+
+        try:
+            tf_cam_in_fusion = self.tf_buffer.lookup_transform(
+                self.fusion_frame, self._macro_optical_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.02))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(
+                f"Surface-normal TF ({self.fusion_frame} <- {self._macro_optical_frame}) "
+                f"failed: {e}", throttle_duration_sec=2.0)
+            self._surface_normal_valid = 0.0
+            return
+
+        T_cam_in_fusion = msg_to_matrix(tf_cam_in_fusion)
+        extrinsic_wc = np.linalg.inv(T_cam_in_fusion)  # world(fusion)->camera
+
+        try:
+            res = self._sample_surface_along(T_cam_in_fusion, extrinsic_wc)
+        except Exception as e:
+            self.get_logger().warn(f"Surface-normal raycast failed: {e}",
+                                   throttle_duration_sec=2.0)
+            self._surface_normal_valid = 0.0
+            return
+
+        if res is None:
+            self._surface_normal_valid = 0.0
+            return
+
+        stamp = self.get_clock().now().to_msg()
+        self._publish_surface_normal(res["point_fusion"], res["normal_fusion"], stamp)
+        self.focal_distance_pub.publish(Float64(data=float(res["focal_distance"])))
+        if self.publish_synthetic_macro_depth and res.get("depth_u16") is not None:
+            self._publish_macro_depth(res["depth_u16"], stamp)
+
+        self._surface_normal_valid = 1.0
+        self._surface_normal_source_active = res["source"]
+        self._rate_raycast.tick(self.get_clock().now().nanoseconds * 1e-9)
+
+    def _sample_surface_along(self, T_cam_in_fusion, extrinsic_wc):
+        """Cast the macro optical axis and return the surface sample as
+        {point_fusion, normal_fusion (oriented toward camera), focal_distance,
+        depth_u16, source} or None if nothing was hit.
+
+        Source selection: 'cad' uses the registered mesh; 'tsdf' uses the volume;
+        'auto' prefers CAD when a registered mesh exists and falls back to TSDF."""
+        src = self.surface_normal_source
+        cad_available = (self.mesh_ready and self.ray_scene is not None
+                         and self.T_model_in_fusion is not None)
+
+        if src == "cad" or (src == "auto" and cad_available):
+            out = self._cast_cad(T_cam_in_fusion, extrinsic_wc)
+            if out is not None or src == "cad":
+                return out
+            # auto: CAD registered but nothing hit along this axis -> try TSDF.
+
+        return self._ray_cast_tsdf(T_cam_in_fusion, extrinsic_wc)
+
+    def _extract_center_patch(self, values, valid, w, h):
+        """Average an (h,w,C) attribute over the valid pixels in the NxN centre
+        window. Returns (mean_vec, n_valid)."""
+        p = self.surface_normal_patch
+        r = p // 2
+        cyi, cxi = h // 2, w // 2
+        ys = slice(max(0, cyi - r), min(h, cyi + r + 1))
+        xs = slice(max(0, cxi - r), min(w, cxi + r + 1))
+        win = values[ys, xs].reshape(-1, values.shape[-1])
+        vmask = valid[ys, xs].reshape(-1)
+        if not np.any(vmask):
+            return None, 0
+        return win[vmask].mean(axis=0), int(vmask.sum())
+
+    def _orient_toward_camera(self, normal_fusion, point_fusion, T_cam_in_fusion):
+        n = np.asarray(normal_fusion, dtype=np.float64)
+        nn = np.linalg.norm(n)
+        if nn < 1e-9:
+            return np.array([0.0, 0.0, 1.0])
+        n = n / nn
+        cam_pos = T_cam_in_fusion[:3, 3]
+        if np.dot(n, cam_pos - np.asarray(point_fusion)) < 0.0:
+            n = -n
+        return n
+
+    def _blocks_in_view(self, active_keys, extrinsic_wc, fx, fy, cx, cy, w, h) -> bool:
+        """True if any active TSDF block projects INSIDE the macro image at a depth
+        within [raycast_depth_min, raycast_depth_max].
+
+        Guards `vbg.ray_cast` against a degenerate frustum: when no active block lands
+        in the image within range, Open3D's EstimateRange needs 0 fragments and can
+        launch a zero-dimension CUDA kernel ("invalid configuration argument"), while
+        spamming "Could not generate full range map". We must match Open3D's own test
+        closely, so project the 8 CORNERS of each block (not just the centre, and with
+        NO out-of-image margin) and require at least one corner strictly in-bounds.
+        On failure, log the block depth span vs. the configured range once every few
+        seconds so a standoff / depth-range misconfiguration is diagnosable."""
+        k = active_keys.cpu().numpy().astype(np.float64)
+        if k.shape[0] == 0:
+            return False
+        centres = (k + 0.5) * self.block_resolution * self.voxel_size   # fusion frame
+        half = 0.5 * self.block_resolution * self.voxel_size
+        offs = np.array([[sx, sy, sz]
+                         for sx in (-half, half) for sy in (-half, half)
+                         for sz in (-half, half)], dtype=np.float64)     # (8,3)
+        corners = (centres[:, None, :] + offs[None, :, :]).reshape(-1, 3)
+        R = extrinsic_wc[:3, :3]
+        t = extrinsic_wc[:3, 3]
+        pc = corners @ R.T + t                                          # -> camera frame
+        z = pc[:, 2]
+        zpos = z[z > 1e-6]
+        span = (float(zpos.min()), float(zpos.max())) if zpos.size else (0.0, 0.0)
+
+        in_view = False
+        front = (z > self.raycast_depth_min) & (z < self.raycast_depth_max)
+        if np.any(front):
+            u = fx * pc[front, 0] / z[front] + cx
+            v = fy * pc[front, 1] / z[front] + cy
+            in_view = bool(np.any((u >= 0) & (u < w) & (v >= 0) & (v < h)))
+
+        if not in_view:
+            self.get_logger().info(
+                f"Surface-normal: {k.shape[0]} active blocks, none in the macro "
+                f"frustum in range (block depth span {span[0]:.2f}-{span[1]:.2f} m vs "
+                f"raycast {self.raycast_depth_min:.2f}-{self.raycast_depth_max:.2f} m). "
+                f"Skipping cast — check macro TF and raycast_depth_max.",
+                throttle_duration_sec=5.0)
+        return in_view
+
+    def _ray_cast_tsdf(self, T_cam_in_fusion, extrinsic_wc):
+        fx, fy, cx, cy, w, h = self._macro_K_downscaled()
+        Kt = o3d.core.Tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], o3d.core.float64)
+        Et = o3d.core.Tensor(extrinsic_wc, o3d.core.float64)
+
+        with self.integ_lock:
+            # Only ACTIVE block coords — hashmap().key_tensor() is the full capacity
+            # buffer (block_count rows) incl. uninitialised slots; feeding those to
+            # ray_cast corrupts the range-map estimate and can crash on an empty view.
+            hm = self.vbg.hashmap()
+            if hm.size() == 0:
+                return None
+            active_keys = hm.key_tensor()[hm.active_buf_indices().to(o3d.core.int64)]
+            if not self._blocks_in_view(active_keys, extrinsic_wc, fx, fy, cx, cy, w, h):
+                return None
+            # depth_scale=1.0 -> depth/vertex returned in metres; vertex & normal
+            # are in the CAMERA frame (verified empirically).
+            res = self.vbg.ray_cast(
+                block_coords=active_keys, intrinsic=Kt, extrinsic=Et, width=w, height=h,
+                render_attributes=["depth", "vertex", "normal"],
+                depth_scale=1.0,
+                depth_min=self.raycast_depth_min, depth_max=self.raycast_depth_max,
+                weight_threshold=self.extract_weight_threshold,
+                range_map_down_factor=self.raycast_range_map_down_factor)
+
+        depth = res["depth"].cpu().numpy().reshape(h, w)
+        vert = res["vertex"].cpu().numpy().reshape(h, w, 3)   # camera frame
+        norm = res["normal"].cpu().numpy().reshape(h, w, 3)   # camera frame
+        valid = np.isfinite(depth) & (depth > self.raycast_depth_min)
+
+        p_cam, nvalid = self._extract_center_patch(vert, valid, w, h)
+        if p_cam is None:
+            return None
+        n_cam, _ = self._extract_center_patch(norm, valid, w, h)
+
+        R_cf = T_cam_in_fusion[:3, :3]
+        t_cf = T_cam_in_fusion[:3, 3]
+        p_fus = R_cf @ p_cam + t_cf
+        n_fus = self._orient_toward_camera(R_cf @ n_cam, p_fus, T_cam_in_fusion)
+        focal = float(np.linalg.norm(p_cam))
+
+        depth_u16 = (np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+                     * 1000.0).astype(np.uint16)
+        return {"point_fusion": p_fus, "normal_fusion": n_fus,
+                "focal_distance": focal, "depth_u16": depth_u16, "source": "tsdf"}
+
+    def _cast_cad(self, T_cam_in_fusion, extrinsic_wc):
+        fx, fy, cx, cy, w, h = self._macro_K_downscaled()
+        Kt = o3d.core.Tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], o3d.core.float64)
+        # Scene is in the model frame; extrinsic model->camera = (fusion->camera) @ (model->fusion).
+        ext_mc = extrinsic_wc @ self.T_model_in_fusion
+        Et = o3d.core.Tensor(ext_mc, o3d.core.float64)
+
+        rays = self.ray_scene.create_rays_pinhole(Kt, Et, w, h)
+        cast = self.ray_scene.cast_rays(rays)
+        t_hit = cast["t_hit"].numpy().reshape(h, w)
+        prim_n = cast["primitive_normals"].numpy().reshape(h, w, 3)   # model frame
+        rays_np = rays.numpy().reshape(h, w, 6)                       # origin+dir, model frame
+
+        valid = np.isfinite(t_hit)
+        if not np.any(valid):
+            return None
+
+        pts_model = rays_np[:, :, 0:3] + t_hit[:, :, None] * rays_np[:, :, 3:6]
+        p_model, _ = self._extract_center_patch(pts_model, valid, w, h)
+        if p_model is None:
+            return None
+        n_model, _ = self._extract_center_patch(prim_n, valid, w, h)
+
+        R_mf = self.T_model_in_fusion[:3, :3]
+        t_mf = self.T_model_in_fusion[:3, 3]
+        p_fus = R_mf @ p_model + t_mf
+        n_fus = self._orient_toward_camera(R_mf @ n_model, p_fus, T_cam_in_fusion)
+
+        # Focal distance = distance along the optical axis (create_rays_pinhole dirs
+        # are unit vectors, so t_hit is the Euclidean range).
+        t_center, _ = self._extract_center_patch(t_hit[:, :, None], valid, w, h)
+        focal = float(t_center[0]) if t_center is not None else float(np.linalg.norm(p_fus - T_cam_in_fusion[:3, 3]))
+
+        # Synthetic macro depth (camera-frame z-depth) from t_hit.
+        u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
+        dx = (u_grid - cx) / fx
+        dy = (v_grid - cy) / fy
+        cos_factor = 1.0 / np.sqrt(dx ** 2 + dy ** 2 + 1.0)
+        z_depth = np.where(valid, t_hit * cos_factor, 0.0)
+        depth_u16 = (np.nan_to_num(z_depth, nan=0.0, posinf=0.0, neginf=0.0)
+                     * 1000.0).astype(np.uint16)
+        return {"point_fusion": p_fus, "normal_fusion": n_fus,
+                "focal_distance": focal, "depth_u16": depth_u16, "source": "cad"}
+
+    def _world_up_in_fusion(self):
+        """World +Z (up) expressed in fusion_frame, for the surface-normal roll.
+        Falls back to fusion_frame +Z when the world TF is unavailable."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.fusion_frame, self.world_frame, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.02))
+            return msg_to_matrix(tf)[:3, 2]   # world +Z column, in fusion
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return np.array([0.0, 0.0, 1.0])
+
+    def _surface_frame_quat(self, outward_normal_fusion) -> Quaternion:
+        """Quaternion for the surface_normal convention shared with the orientation
+        controller: +Z points INTO the surface (opposite the outward normal), +Y
+        points down in world. `outward_normal_fusion` points away from the surface
+        (toward the camera); we negate it for +Z. Roll is set from the world up-axis
+        (via TF) so macro_surface_normal is a drop-in for the controller frame."""
+        z = -np.asarray(outward_normal_fusion, dtype=np.float64)   # into surface
+        nz = np.linalg.norm(z)
+        if nz < 1e-9:
+            return Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        z /= nz
+        up = self._world_up_in_fusion()
+        up = up / (np.linalg.norm(up) + 1e-12)
+        if abs(float(np.dot(z, up))) > 0.999:      # z ~parallel to up: pick any x ⟂ z
+            seed = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            x = seed - z * float(np.dot(seed, z))
+        else:
+            x = np.cross(z, up)                    # matches controller _quaternion_from_z
+        x /= (np.linalg.norm(x) + 1e-12)
+        y = np.cross(z, x)                         # -> world-down
+        R = np.column_stack((x, y, z))
+        q = Rotation.from_matrix(R).as_quat()      # xyzw
+        return Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
+
+    def _publish_surface_normal(self, point_fusion, normal_fusion, stamp):
+        ps = PoseStamped()
+        ps.header.stamp = stamp
+        ps.header.frame_id = self.fusion_frame
+        ps.pose.position.x = float(point_fusion[0])
+        ps.pose.position.y = float(point_fusion[1])
+        ps.pose.position.z = float(point_fusion[2])
+        ps.pose.orientation = self._surface_frame_quat(normal_fusion)
+        self.surface_normal_pub.publish(ps)
+
+        if self.publish_tf and self.tf_broadcaster is not None:
+            ts = TransformStamped()
+            ts.header.stamp = stamp
+            ts.header.frame_id = self.fusion_frame
+            ts.child_frame_id = self.surface_normal_frame
+            ts.transform.translation.x = ps.pose.position.x
+            ts.transform.translation.y = ps.pose.position.y
+            ts.transform.translation.z = ps.pose.position.z
+            ts.transform.rotation = ps.pose.orientation
+            self.tf_broadcaster.sendTransform(ts)
+
+    def _publish_macro_depth(self, depth_u16, stamp):
+        img = Image()
+        img.header.stamp = stamp
+        img.header.frame_id = self._macro_optical_frame
+        img.height, img.width = int(depth_u16.shape[0]), int(depth_u16.shape[1])
+        img.encoding = "16UC1"
+        img.is_bigendian = False
+        img.step = img.width * 2
+        img.data = depth_u16.tobytes()
+        self.macro_depth_pub.publish(img)
+
+    # -----------------------------------------------------------------------
+    # Diagnostics
+    # -----------------------------------------------------------------------
+
+    def _publish_diagnostics(self):
+        now = self.get_clock().now()
+        now_s = now.nanoseconds * 1e-9
+        stamp = now.to_msg()
+
+        scalars = {
+            "integration_hz": self._rate_integration.hz(now_s),
+            "surface_publish_hz": self._rate_surface.hz(now_s),
+            "registration_hz": self._rate_registration.hz(now_s),
+            "raycast_hz": self._rate_raycast.hz(now_s),
+            "icp_fitness": self._last_icp_fitness,
+            "icp_rmse_mm": self._last_icp_rmse_mm,
+            "integration_count": float(self.integration_count),
+            "surface_normal_valid": float(self._surface_normal_valid),
+        }
+        for name, value in scalars.items():
+            self._diag_scalar_pubs[name].publish(Float64(data=float(value)))
+
+        st = DiagnosticStatus()
+        st.name = "tsdf_pose"
+        st.hardware_id = "tsdf_pose_node"
+        st.level = DiagnosticStatus.OK if self.tsdf_ready else DiagnosticStatus.WARN
+        st.message = (
+            f"tsdf={self.tsdf_ready} ref={self.reference_ready} mesh={self.mesh_ready} "
+            f"sn_source={self._surface_normal_source_active} "
+            f"macro_info={'yes' if self.macro_intrinsics is not None else 'no'}")
+        st.values = [KeyValue(key=k, value=f"{v:.4f}") for k, v in scalars.items()]
+        st.values += [
+            KeyValue(key="tsdf_ready", value=str(self.tsdf_ready)),
+            KeyValue(key="reference_ready", value=str(self.reference_ready)),
+            KeyValue(key="mesh_ready", value=str(self.mesh_ready)),
+            KeyValue(key="have_global_init", value=str(self.have_global_init)),
+            KeyValue(key="surface_normal_source", value=self._surface_normal_source_active),
+        ]
+        arr = DiagnosticArray()
+        arr.header.stamp = stamp
+        arr.status = [st]
+        self.diag_pub.publish(arr)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1261,7 +1848,9 @@ class TSDFPoseNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TSDFPoseNode()
-    executor = MultiThreadedExecutor(num_threads=4)
+    # Extra threads so the control-rate surface-normal timer (own callback group)
+    # is not starved by depth integration + registration on the depth thread.
+    executor = MultiThreadedExecutor(num_threads=6)
     executor.add_node(node)
     try:
         executor.spin()

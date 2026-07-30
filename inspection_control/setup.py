@@ -37,6 +37,8 @@ setup(
             'turntable_joy_node = inspection_control.nodes.turntable_joy_node:main',
             'tsdf_pose_node = inspection_control.nodes.tsdf_pose_node:main',
             'servo_logger = inspection_control.nodes.servo_logger_node:main',
+            'latency_injection = inspection_control.nodes.latency_injection_node:main',
+            'latency_analysis = inspection_control.latency_analysis:main',
         ],
     },
 )

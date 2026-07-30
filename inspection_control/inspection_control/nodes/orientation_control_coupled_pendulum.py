@@ -718,6 +718,11 @@ class OrientationControlCoupledPendulumNode(Node):
                 # (fused surface cloud with normals on surface_cloud_topic).
                 ('surface_source', 'depth'),
                 ('surface_cloud_topic', '/perception/surface_cloud'),
+                # 'frame' source: consume the tsdf_pose producer's surface-normal TF
+                # directly (its +Z is the into-surface normal, matching this node's
+                # convention) instead of estimating from depth/cloud. EMA/Kalman stay
+                # here. Off by default; set surface_source:=frame to enable.
+                ('surface_normal_source_frame', 'macro_surface_normal'),
                 ('surface_max_angle_deg', 30.0),
                 # Min points in the optical-axis patch for a valid measurement.
                 # Lower this if a small crop_radius starves the patch.
@@ -796,6 +801,8 @@ class OrientationControlCoupledPendulumNode(Node):
         self.standoff_mode = str(self.get_parameter('standoff_mode').value).lower()
         self.surface_source = str(self.get_parameter('surface_source').value).lower()
         self.surface_cloud_topic = str(self.get_parameter('surface_cloud_topic').value)
+        self.surface_normal_source_frame = str(
+            self.get_parameter('surface_normal_source_frame').value)
         self.surface_max_angle_deg = float(self.get_parameter('surface_max_angle_deg').value)
         self.surface_min_points = int(self.get_parameter('surface_min_points').value)
         self.ema_enable = bool(self.get_parameter('ema_enable').value)
@@ -1632,10 +1639,52 @@ class OrientationControlCoupledPendulumNode(Node):
         if axis_pt is not None:
             self.distance_pub.publish(Float64(data=float(LA.norm(axis_pt))))
 
+    # ===========================
+    # Frame path (tsdf surface-normal TF -> measurement)
+    # ===========================
+    def _process_surface_normal_frame(self):
+        """Frame-mode measurement: consume the tsdf_pose producer's surface-normal TF
+        directly. Its origin is the surface point and its +Z is the into-surface
+        normal (same convention this node uses), both looked up in the camera frame
+        with CURRENT TF, then handed to the shared _emit_measurement (EMA/errors/goal
+        pose). Stale or missing TF is treated as no measurement."""
+        stamp = self.get_clock().now().to_msg()
+
+        try:
+            T = self.tf_buffer.lookup_transform(
+                self.main_camera_frame, self.surface_normal_source_frame,
+                Time(sec=0, nanosec=0), timeout=Duration(seconds=0.02))
+        except TransformException as e:
+            self.get_logger().warn(
+                f'No TF {self.main_camera_frame} <- {self.surface_normal_source_frame}: {e}',
+                throttle_duration_sec=2.0)
+            self._emit_no_measurement(stamp, None)
+            return
+
+        # Reject a stale frame (producer stopped publishing) so the controller does
+        # not keep driving on a frozen normal.
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        tf_s = float(T.header.stamp.sec) + 1e-9 * float(T.header.stamp.nanosec)
+        if tf_s > 0.0 and (now_s - tf_s) > self.no_target_timeout_s:
+            self.get_logger().warn(
+                f'Surface-normal frame is stale ({now_s - tf_s:.2f}s old); no measurement.',
+                throttle_duration_sec=2.0)
+            self._emit_no_measurement(stamp, None)
+            return
+
+        t = T.transform.translation
+        centroid = np.array([t.x, t.y, t.z], dtype=np.float32)   # surface point, camera frame
+        q = T.transform.rotation
+        R = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
+        normal = R[:, 2].astype(np.float32)                      # frame +Z = into-surface normal
+
+        self._emit_measurement(centroid, normal, stamp, None)
+
     def on_depth(self, msg: CompressedImage):
         self.depth_msg = msg
-        # In cloud mode the fused surface drives control; skip the live-depth path.
-        if self.surface_source == 'cloud':
+        # In cloud/frame mode the fused surface (or tsdf frame) drives control; skip
+        # the live-depth estimation path.
+        if self.surface_source in ('cloud', 'frame'):
             return
         self.process_depth(msg)
 
@@ -1805,6 +1854,8 @@ class OrientationControlCoupledPendulumNode(Node):
         # current even when the surface cloud is stale).
         if self.surface_source == 'cloud':
             self._process_surface_cloud()
+        elif self.surface_source == 'frame':
+            self._process_surface_normal_frame()
         with self._measurement_lock:
             has_measurement = self._latest_measurement['valid']
             if has_measurement:

@@ -70,3 +70,29 @@ tsdf_pose:
     fused_cloud_topic:      "tsdf_pose/fused_cloud"
     synthetic_depth_topic:  "tsdf_pose/depth/synthetic"
     model_marker_topic:     "tsdf_pose/model_marker"
+
+    # -- Macro-perspective surface-normal producer --
+    # Raycasts the macro (pi) camera's optical axis against the TSDF volume / CAD
+    # mesh and publishes tsdf_pose/surface_normal (+TF), tsdf_pose/focal_distance_m,
+    # and tsdf_pose/depth/macro_synthetic.
+    enable_surface_normal:      true
+    surface_normal_rate_hz:     10.0
+    macro_camera_frame:         "eoat_camera_link"
+    macro_camera_info_topic:    "/pi_camera/camera_info"
+    # IMPORTANT: /pi_camera/camera_info is UNCALIBRATED (publishes width=0, height=0,
+    # k=all-zeros), so the intrinsics MUST be supplied here or the producer no-ops.
+    # Fill these from the pi camera's real resolution + focal length in PIXELS:
+    #   fx = fy = width_px / (2 * tan(HFOV/2))   (square pixels: fx == fy)
+    #   cx, cy default to the image centre when left 0.
+    macro_fx:                   0.0     # <-- SET ME (pixels)
+    macro_fy:                   0.0     # <-- SET ME (pixels)
+    macro_cx:                   0.0     # 0 => width/2
+    macro_cy:                   0.0     # 0 => height/2
+    macro_width:                0       # <-- SET ME (px)
+    macro_height:               0       # <-- SET ME (px)
+    # Raycast render + range. If the throttled log reports the block depth span is
+    # beyond this range, raise raycast_depth_max to the macro standoff.
+    raycast_downscale:          4
+    raycast_depth_min:          0.05    # m
+    raycast_depth_max:          0.60    # m
+    publish_synthetic_macro_depth: true

@@ -3,7 +3,11 @@ autofocus:
     # -- Sensing --
     focus_metric: fswm                  # sobel | squared_gradient | fswm | sobel_laplacian
     image_topic: /pi_camera/image_raw/compressed
-    distance_topic: /orientation_controller/focal_distance_m
+    # Bridged to the tsdf_pose macro-perspective raycast (focal distance along the
+    # macro/pi optical axis). Requires the surface-normal producer to be active
+    # (valid macro intrinsics + geometry in view). Revert to
+    # /orientation_controller/focal_distance_m to use the depth/cloud estimate.
+    distance_topic: /tsdf_pose/focal_distance_m
     # Centered ROI: (roi_x, roi_y) fractional centre; width/height in pixels.
     roi_width: 100
     roi_height: 100
