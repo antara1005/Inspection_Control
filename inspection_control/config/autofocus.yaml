@@ -8,9 +8,11 @@ autofocus:
     # (valid macro intrinsics + geometry in view). Revert to
     # /orientation_controller/focal_distance_m to use the depth/cloud estimate.
     distance_topic: /tsdf_pose/focal_distance_m
-    # Centered ROI: (roi_x, roi_y) fractional centre; width/height in pixels.
-    roi_width: 100
-    roi_height: 100
+    # Centered square ROI, sized as a fraction of the frame so the sampled patch
+    # covers the same physical area at any streaming resolution: (roi_x, roi_y) is
+    # the fractional centre, roi_size the edge length as a fraction of image HEIGHT
+    # (both axes, so the box stays 1:1). 0.15 ~= the previous fixed 100 px at 720p.
+    roi_size: 0.15
     roi_x: 0.5
     roi_y: 0.5
     # -- Debug image --
@@ -35,8 +37,34 @@ autofocus:
     focus_axis_sign: 1.0      # flip to -1.0 if the robot drives AWAY from focus
     focus_tolerance_m: 0.001  # stop when within this of target
     deriv_tau: 0.05           # s, EMA time constant for d/dt(distance)
+    # Stale-data guard: hold zero force if the focal distance stops updating.
+    # tsdf_pose's macro raycast can stall to ~0 Hz (no TSDF block in the macro
+    # frustum), which freezes the distance; without this the PD drives on frozen
+    # data forever. Must exceed the producer period (0.5 s = 5 missed messages at
+    # surface_normal_rate_hz: 10.0).
+    distance_timeout_s: 0.5
     # Fine refinement: parabola-fit the recording sweep to refine the target.
     fit_enabled: true
     fit_peak_fraction: 0.5    # fit window: focus >= frac * max_focus
     fit_min_points: 5         # min window samples to attempt a fit
+
+    # -- Sweep logging (S1.5 depth-noise experiment) --
+    # One JSONL row per record cycle under /data (host: ./data), plus the raw
+    # (distance, focus) samples. The measurand is target_distance_m — the focal
+    # distance AT PEAK FOCUS; its spread across runs is the end-to-end depth-map
+    # error, to be compared against the depth of field.
+    # NOTE: drive PAST the peak so the fit brackets it; a sweep that stops at the
+    # peak is rejected with fit_status "not_bracketed".
+    log_sweeps: true
+    sweep_log_dir: /data/AutofocusData
+    sweep_log_file: sweeps.jsonl
+    log_raw_sweep: true
+    # Set per condition to bin rows during analysis:
+    #   ros2 param set /autofocus run_label steel_30cm
+    run_label: ""
+    d_star_m: 0.0                # calibrated nominal focus distance; 0 = unknown
+    # TSDF fusion frame: part-fixed, and the frame the depth is expressed in.
+    # NOTE: there is no "world" frame in this TF tree. "" disables the lookup.
+    pose_reference_frame: object_frame
+    tsdf_diagnostics_topic: /tsdf_pose/diagnostics   # "" disables the snapshot
     use_sim_time: false

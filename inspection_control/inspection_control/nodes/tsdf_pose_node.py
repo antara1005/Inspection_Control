@@ -16,6 +16,12 @@ The reference cloud is sampled from the same CAD mesh used for the
 synthetic-depth render; the node only tracks `model.mesh.*` from the
 viewpoint_generation node and no longer depends on a separately-sampled
 whole-part point cloud.
+
+A macro-perspective producer raycasts the macro camera's optical axis against
+the volume/mesh to publish the surface target frame, and mirrors that frame as
+a foxglove_msgs/ImageAnnotations XYZ = RGB axis triad on `~/annotations` — a
+vector overlay to composite on the macro camera feed in a Foxglove Image panel
+(same pattern as autofocus_node's ROI overlay).
 """
 
 import struct
@@ -38,6 +44,8 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from foxglove_msgs.msg import (
+    ImageAnnotations, PointsAnnotation, TextAnnotation, Point2, Color)
 
 import tf2_ros
 from tf2_ros import TransformBroadcaster
@@ -271,6 +279,15 @@ class TSDFPoseNode(Node):
             ("raycast_depth_min",             0.05),     # m
             ("raycast_depth_max",             0.60),     # m
             ("raycast_range_map_down_factor", 4),        # avoid small-image range-map failure
+            # foxglove_msgs/ImageAnnotations overlay of the surface target frame:
+            # an XYZ = RGB axis triad drawn at the centre of the macro image (where
+            # the optical-axis raycast samples the surface). Cheap vector overlay —
+            # composite it on the macro camera feed in a Foxglove Image panel.
+            ("publish_frame_annotations",     True),
+            ("frame_annotations_topic",       "~/annotations"),
+            ("annotation_axis_length_px",     60.0),   # triad arm length in image px
+            ("annotation_thickness",          3.0),
+            ("annotation_labels",             True),   # X/Y/Z letters at the tips
 
             # ---- Diagnostics (always on) ----
             ("diagnostics_rate_hz",           2.0),
@@ -351,6 +368,10 @@ class TSDFPoseNode(Node):
         self.raycast_depth_min = float(gp("raycast_depth_min").value)
         self.raycast_depth_max = float(gp("raycast_depth_max").value)
         self.raycast_range_map_down_factor = max(1, int(gp("raycast_range_map_down_factor").value))
+        self.publish_frame_annotations = bool(gp("publish_frame_annotations").value)
+        self.annotation_axis_length_px = float(gp("annotation_axis_length_px").value)
+        self.annotation_thickness = float(gp("annotation_thickness").value)
+        self.annotation_labels = bool(gp("annotation_labels").value)
         self.diagnostics_rate_hz = float(gp("diagnostics_rate_hz").value)
 
         # -- State ----------------------------------------------------------
@@ -470,6 +491,11 @@ class TSDFPoseNode(Node):
             Float64, gp("focal_distance_topic").value, 10)
         self.macro_depth_pub = self.create_publisher(
             Image, gp("synthetic_macro_depth_topic").value, 10)
+        # Surface-target-frame overlay for the macro camera feed. In Foxglove:
+        # Image panel, base = the macro image topic, add this as an annotation
+        # topic (coordinates are pixels of the full-resolution macro image).
+        self.annot_pub = self.create_publisher(
+            ImageAnnotations, gp("frame_annotations_topic").value, 1)
 
         # -- Diagnostics publishers (Foxglove) ------------------------------
         self.diag_pub = self.create_publisher(DiagnosticArray, "~/diagnostics", 10)
@@ -635,6 +661,17 @@ class TSDFPoseNode(Node):
                 pending["icp_max_iter"] = int(v)
             elif n == "icp_fitness_min":
                 pending["icp_fitness_min"] = float(v)
+
+            elif n == "publish_frame_annotations":
+                pending["publish_frame_annotations"] = bool(v)
+            elif n == "annotation_axis_length_px":
+                if float(v) <= 0:
+                    return reject("annotation_axis_length_px must be > 0")
+                pending["annotation_axis_length_px"] = float(v)
+            elif n == "annotation_thickness":
+                pending["annotation_thickness"] = float(v)
+            elif n == "annotation_labels":
+                pending["annotation_labels"] = bool(v)
 
             # --- frames ------------------------------------------------
             elif n == "fusion_frame":
@@ -1542,8 +1579,12 @@ class TSDFPoseNode(Node):
             return
 
         stamp = self.get_clock().now().to_msg()
-        self._publish_surface_normal(res["point_fusion"], res["normal_fusion"], stamp)
+        quat = self._surface_frame_quat(res["normal_fusion"])
+        self._publish_surface_normal(res["point_fusion"], quat, stamp)
         self.focal_distance_pub.publish(Float64(data=float(res["focal_distance"])))
+        if self.publish_frame_annotations:
+            self.annot_pub.publish(
+                self._build_frame_annotations(quat, T_cam_in_fusion, stamp))
         if self.publish_synthetic_macro_depth and res.get("depth_u16") is not None:
             self._publish_macro_depth(res["depth_u16"], stamp)
 
@@ -1765,14 +1806,14 @@ class TSDFPoseNode(Node):
         q = Rotation.from_matrix(R).as_quat()      # xyzw
         return Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
 
-    def _publish_surface_normal(self, point_fusion, normal_fusion, stamp):
+    def _publish_surface_normal(self, point_fusion, quat, stamp):
         ps = PoseStamped()
         ps.header.stamp = stamp
         ps.header.frame_id = self.fusion_frame
         ps.pose.position.x = float(point_fusion[0])
         ps.pose.position.y = float(point_fusion[1])
         ps.pose.position.z = float(point_fusion[2])
-        ps.pose.orientation = self._surface_frame_quat(normal_fusion)
+        ps.pose.orientation = quat
         self.surface_normal_pub.publish(ps)
 
         if self.publish_tf and self.tf_broadcaster is not None:
@@ -1785,6 +1826,112 @@ class TSDFPoseNode(Node):
             ts.transform.translation.z = ps.pose.position.z
             ts.transform.rotation = ps.pose.orientation
             self.tf_broadcaster.sendTransform(ts)
+
+    # -----------------------------------------------------------------------
+    # Surface-target-frame image annotations (Foxglove overlay)
+    # -----------------------------------------------------------------------
+
+    AXIS_COLORS = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.35, 1.0))  # X=R, Y=G, Z=B
+    AXIS_LABELS = ("X", "Y", "Z")
+
+    @staticmethod
+    def _rgba(r, g, b, a=1.0):
+        """foxglove_msgs/Color from 0..1 RGBA components."""
+        return Color(r=float(r), g=float(g), b=float(b), a=float(a))
+
+    def _build_frame_annotations(self, quat, T_cam_in_fusion, stamp):
+        """foxglove_msgs/ImageAnnotations: the surface target frame as an XYZ=RGB
+        axis triad drawn at the centre of the macro image.
+
+        The raycast samples the surface along the optical axis, so the frame origin
+        already projects to the image centre — the triad is pinned there and only
+        the axis *directions* are projected. Each unit axis is taken in the macro
+        camera frame and projected orthographically onto the image plane (x, y
+        components, scaled by the fx/fy aspect) to a fixed pixel length, so the triad
+        keeps a constant on-screen size at any standoff while still foreshortening as
+        an axis tilts toward/away from the camera. Axes pointing away from the camera
+        are drawn first so the nearer ones composite on top.
+
+        Coordinates are pixels of the FULL-resolution macro image (the intrinsics'
+        width/height), not the downscaled raycast render — overlay this on the macro
+        camera feed, not on ~/depth/macro_synthetic.
+        """
+        ann = ImageAnnotations()
+        ann.timestamp = stamp
+
+        K = self.macro_intrinsics
+        u0 = 0.5 * K["width"]
+        v0 = 0.5 * K["height"]
+        aspect = K["fy"] / K["fx"]      # non-square pixels: y scales differently
+        L = self.annotation_axis_length_px
+
+        # Surface axes expressed in the macro camera frame: R_cam<-surface, whose
+        # columns are the frame's X/Y/Z unit vectors seen by the camera.
+        R_fs = Rotation.from_quat(
+            [quat.x, quat.y, quat.z, quat.w]).as_matrix()   # fusion <- surface
+        R_cs = T_cam_in_fusion[:3, :3].T @ R_fs             # camera <- surface
+
+        # Origin dot at the sampled surface point (image centre).
+        dot = PointsAnnotation()
+        dot.timestamp = stamp
+        dot.type = PointsAnnotation.POINTS
+        dot.points = [Point2(x=float(u0), y=float(v0))]
+        dot.thickness = max(2.0, self.annotation_thickness)
+        dot.outline_color = self._rgba(1.0, 1.0, 1.0)
+        dot.fill_color = self._rgba(1.0, 1.0, 1.0)
+        ann.points.append(dot)
+
+        # Painter's order: +z in the camera frame points away from the camera, so
+        # sort descending to draw the far axes first.
+        order = sorted(range(3), key=lambda i: -float(R_cs[2, i]))
+        pad = 12.0                      # px between the tip and its label
+        for i in order:
+            d = R_cs[:, i]
+            du = L * float(d[0])
+            dv = L * float(d[1]) * aspect
+            u, v = u0 + du, v0 + dv
+            color = self._rgba(*self.AXIS_COLORS[i])
+
+            arm = PointsAnnotation()
+            arm.timestamp = stamp
+            arm.type = PointsAnnotation.LINE_STRIP
+            arm.points = [Point2(x=float(u0), y=float(v0)),
+                          Point2(x=float(u), y=float(v))]
+            arm.outline_color = color
+            arm.thickness = self.annotation_thickness
+            ann.points.append(arm)
+
+            # Tip dot: doubles as an arrowhead (PointsAnnotation has no arrow
+            # type) and keeps an axis visible when it points straight at/away
+            # from the camera — the head-on case, where the arm has ~no length.
+            tip = PointsAnnotation()
+            tip.timestamp = stamp
+            tip.type = PointsAnnotation.POINTS
+            tip.points = [Point2(x=float(u), y=float(v))]
+            tip.thickness = self.annotation_thickness + 2.0
+            tip.outline_color = color
+            tip.fill_color = color
+            ann.points.append(tip)
+
+            if self.annotation_labels:
+                # Label sits `pad` px past the tip along the arm; a head-on axis
+                # has no arm direction, so push it clear of the centre diagonally.
+                mag = (du * du + dv * dv) ** 0.5
+                if mag > 1.0:
+                    ou, ov = pad * du / mag, pad * dv / mag
+                else:
+                    ou, ov = 0.75 * pad, -0.75 * pad
+                t = TextAnnotation()
+                t.timestamp = stamp
+                t.position = Point2(x=float(u + ou), y=float(v + ov))
+                t.text = self.AXIS_LABELS[i]
+                t.font_size = 16.0
+                t.text_color = color
+                # Semi-transparent backing keeps the letter legible over the feed.
+                t.background_color = self._rgba(0.0, 0.0, 0.0, 0.5)
+                ann.texts.append(t)
+
+        return ann
 
     def _publish_macro_depth(self, depth_u16, stamp):
         img = Image()

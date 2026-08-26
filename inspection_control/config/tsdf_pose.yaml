@@ -96,3 +96,13 @@ tsdf_pose:
     raycast_depth_min:          0.05    # m
     raycast_depth_max:          0.60    # m
     publish_synthetic_macro_depth: true
+
+    # -- Surface-target-frame image annotations --
+    # foxglove_msgs/ImageAnnotations on tsdf_pose/annotations: the surface target
+    # frame as an XYZ = RGB axis triad at the centre of the macro image. Overlay it
+    # on the macro camera feed in a Foxglove Image panel (pixel coords are the
+    # full-resolution macro image, i.e. macro_width x macro_height).
+    publish_frame_annotations:  true
+    annotation_axis_length_px:  60.0
+    annotation_thickness:       3.0
+    annotation_labels:          true
