@@ -18,7 +18,8 @@ needed. Do NOT run this together with admittance_control.launch.py; both drive
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -50,6 +51,12 @@ def generate_launch_description():
         'turntable_config_file',
         default_value='turntable_joy.yaml',
         description='Turntable joy configuration file'
+    )
+    dual_arm = DeclareLaunchArgument(
+        'dual_arm',
+        default_value='false',
+        description='Add admittance control for the second (Zivid) arm, and let '
+                    'arm_switch_button hand the joystick between the arms.'
     )
     tsdf_config_file = DeclareLaunchArgument(
         'tsdf_config_file',
@@ -123,11 +130,41 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True
     )
+    # Second arm: admittance plant + the teleop target it listens on. Only
+    # admittance and teleop; the orientation/autofocus stack is for the main
+    # arm's macro camera.
+    is_dual = PythonExpression(["'", LaunchConfiguration('dual_arm'), "' == 'true'"])
+    zivid_admittance_control_node = Node(
+        package='inspection_control',
+        executable='admittance_control_coupled_pendulum',
+        name='admittance_control',
+        namespace='zivid',
+        parameters=[PathJoinSubstitution([
+            FindPackageShare('inspection_control'), 'config',
+            'admittance_control_zivid.yaml'])],
+        output='screen',
+        emulate_tty=True,
+        condition=IfCondition(is_dual)
+    )
     teleop_node = Node(
         package='inspection_control',
         executable='teleop',
         name='teleop',
-        parameters=[teleop_config],
+        parameters=[teleop_config, {
+            # Empty unless dual_arm: arm_switch_button then does nothing.
+            'secondary_twist_topic': PythonExpression([
+                "'/zivid/teleop/wrench_cmds' if ", is_dual, " else ''"]),
+            'secondary_frame_id': 'zivid_camera_optical_frame',
+            'secondary_servo_node': PythonExpression([
+                "'/zivid_servo_node' if ", is_dual, " else ''"]),
+            # The Zivid is mounted upside down relative to the main arm's
+            # camera, so x/y translation and rotation about x/y (pitch/yaw)
+            # are flipped for that arm.
+            'secondary_invert_x': True,
+            'secondary_invert_y': True,
+            'secondary_invert_pitch': True,
+            'secondary_invert_yaw': True,
+        }],
         output='screen',
         emulate_tty=True
     )
@@ -162,8 +199,10 @@ def generate_launch_description():
         controller_config_file,
         turntable_config_file,
         tsdf_config_file,
+        dual_arm,
         orientation_control_node,
         admittance_control_node,
+        zivid_admittance_control_node,
         joy_node,
         autofocus_node,
         teleop_node,

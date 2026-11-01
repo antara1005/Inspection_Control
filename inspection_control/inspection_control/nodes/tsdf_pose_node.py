@@ -1026,11 +1026,13 @@ class TSDFPoseNode(Node):
         if depth_raw is None:
             return
 
-        # TF: pose of camera expressed in fusion frame, then invert for extrinsic
+        # TF: pose of camera expressed in fusion frame at the frame's capture
+        # stamp (not latest — the arm/turntable may be moving), then invert for
+        # extrinsic. The timeout lets joint_states catch up to the image stamp.
         try:
             tf_cam_in_fusion = self.tf_buffer.lookup_transform(
                 self.fusion_frame, self.camera_frame,
-                rclpy.time.Time(),
+                rclpy.time.Time.from_msg(msg.header.stamp),
                 timeout=rclpy.duration.Duration(seconds=0.1))
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
@@ -1424,7 +1426,7 @@ class TSDFPoseNode(Node):
         try:
             tf_cam_in_fusion = self.tf_buffer.lookup_transform(
                 self.fusion_frame, self.camera_frame,
-                rclpy.time.Time(),
+                rclpy.time.Time.from_msg(msg.header.stamp),
                 timeout=rclpy.duration.Duration(seconds=0.01))
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
