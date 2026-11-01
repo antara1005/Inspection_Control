@@ -8,8 +8,9 @@ from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import WrenchStamped
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
+from moveit_msgs.srv import ServoCommandType
 from rclpy.time import Time
 import math
 
@@ -61,7 +62,8 @@ class TeleopNode(Node):
                 # its Trigger services (this node owns all Joy parsing so
                 # button/axis bounds only need to be validated in one place).
                 ('orientation_control_enable_button', 0),
-                ('visualize_normal_button', 9),
+                ('scanning_and_reconstruction_node_name', 'scanning_and_reconstruction'),
+                ('zivid_capture_button', 9),
                 ('save_data_button', 8),
                 # Autofocus button actions, driven over the autofocus node's
                 # Trigger services (this node owns all Joy parsing).
@@ -74,6 +76,26 @@ class TeleopNode(Node):
                 # (e.g. /<name>/toggle_orientation_control).
                 ('orientation_control_node_name', 'orientation_controller'),
                 ('autofocus_node_name', 'autofocus'),
+                # Second arm (dual-arm cell). With secondary_twist_topic set, a
+                # rising edge on arm_switch_button moves the wrench output between
+                # twist_topic/frame_id (main arm) and the secondary topic/frame.
+                # The arm not being driven gets a zero wrench every tick, so it
+                # coasts to a stop. Empty secondary_twist_topic = single arm.
+                ('arm_switch_button', -1),
+                ('secondary_twist_topic', ''),
+                ('secondary_frame_id', ''),
+                # Servo node of the second arm. Switching to that arm sets its
+                # command type to TWIST; the main arm's Servo is managed by
+                # task_planning_node.
+                ('secondary_servo_node', ''),
+                # Extra sign flips applied only while the second arm is driven
+                # (on top of invert_*), for a camera mounted rolled relative to
+                # the main arm's (e.g. the Zivid upside down): x/y translation
+                # and pitch/yaw (rotation about x/y).
+                ('secondary_invert_x', False),
+                ('secondary_invert_y', False),
+                ('secondary_invert_pitch', False),
+                ('secondary_invert_yaw', False),
             ]
         )
 
@@ -132,8 +154,10 @@ class TeleopNode(Node):
             'twist_topic').get_parameter_value().string_value
         self.orientation_control_enable_button = self.get_parameter(
             'orientation_control_enable_button').get_parameter_value().integer_value
-        self.visualize_normal_button = self.get_parameter(
-            'visualize_normal_button').get_parameter_value().integer_value
+        scanning_and_reconstruction_node_name = self.get_parameter(
+            'scanning_and_reconstruction_node_name').get_parameter_value().string_value
+        self.zivid_capture_button = self.get_parameter(
+            'zivid_capture_button').get_parameter_value().integer_value
         self.save_data_button = self.get_parameter(
             'save_data_button').get_parameter_value().integer_value
         self.autofocus_record_button = self.get_parameter(
@@ -146,15 +170,32 @@ class TeleopNode(Node):
             'orientation_control_node_name').get_parameter_value().string_value
         autofocus_node_name = self.get_parameter(
             'autofocus_node_name').get_parameter_value().string_value
+        self.arm_switch_button = self.get_parameter(
+            'arm_switch_button').get_parameter_value().integer_value
+        secondary_twist_topic = self.get_parameter(
+            'secondary_twist_topic').get_parameter_value().string_value
+        secondary_frame_id = self.get_parameter(
+            'secondary_frame_id').get_parameter_value().string_value
+        secondary_servo_node = self.get_parameter(
+            'secondary_servo_node').get_parameter_value().string_value
+        self.secondary_invert_x = self.get_parameter(
+            'secondary_invert_x').get_parameter_value().bool_value
+        self.secondary_invert_y = self.get_parameter(
+            'secondary_invert_y').get_parameter_value().bool_value
+        self.secondary_invert_pitch = self.get_parameter(
+            'secondary_invert_pitch').get_parameter_value().bool_value
+        self.secondary_invert_yaw = self.get_parameter(
+            'secondary_invert_yaw').get_parameter_value().bool_value
 
         # Every axis/button index this node reads from a Joy message. Indices
         # of -1 mean "unused" (matches the existing enable_button/z_axis
         # convention below) and are excluded from the bounds check.
         self._joy_button_indices = [i for i in (
             self.enable_button, self.roll_axis_positive, self.roll_axis_negative,
-            self.orientation_control_enable_button, self.visualize_normal_button,
+            self.orientation_control_enable_button, self.zivid_capture_button,
             self.save_data_button, self.autofocus_record_button,
             self.autofocus_drive_button, self.disable_controllers_button,
+            self.arm_switch_button,
         ) if i >= 0]
         axis_indices = [self.x_axis, self.y_axis, self.pitch_axis, self.yaw_axis,
                         self.fine_x_axis, self.fine_y_axis]
@@ -180,6 +221,26 @@ class TeleopNode(Node):
             qos_profile
         )
 
+        # Output targets, one per arm: (publisher, frame_id, label). Index 0 is
+        # the main arm; self.active_arm selects which one gets the joystick.
+        self.arms = [(self.wrench_pub, self.frame_id, twist_topic)]
+        if secondary_twist_topic:
+            self.arms.append((
+                self.create_publisher(WrenchStamped, secondary_twist_topic, qos_profile),
+                secondary_frame_id or self.frame_id,
+                secondary_twist_topic))
+        self.active_arm = 0
+        self.secondary_servo_client = self.create_client(
+            ServoCommandType, f'{secondary_servo_node}/switch_command_type'
+        ) if secondary_servo_node else None
+        # Latched, so late subscribers (GUI, rqt) see which arm is active.
+        self.active_arm_pub = self.create_publisher(
+            String, '~/active_arm',
+            QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1))
+        self.active_arm_pub.publish(String(data=twist_topic))
+        self._zero_msg = WrenchStamped()
+
         self.joy_sub = self.create_subscription(
             Joy,
             joy_topic,
@@ -192,8 +253,8 @@ class TeleopNode(Node):
         # with a warning rather than stalling the joy callback.
         self.toggle_orientation_control_client = self.create_client(
             Trigger, f'/{orientation_control_node_name}/toggle_orientation_control')
-        self.toggle_normal_estimation_viz_client = self.create_client(
-            Trigger, f'/{orientation_control_node_name}/toggle_normal_estimation_viz')
+        self.scanning_and_reconstruction_client = self.create_client(
+            Trigger, f'/{scanning_and_reconstruction_node_name}/zivid_capture')
         self.toggle_save_data_client = self.create_client(
             Trigger, f'/{orientation_control_node_name}/toggle_save_data')
 
@@ -291,8 +352,8 @@ class TeleopNode(Node):
 
         if self._rising_edge(msg, prev_msg, self.orientation_control_enable_button):
             self._call_trigger(self.toggle_orientation_control_client, 'toggle_orientation_control')
-        if self._rising_edge(msg, prev_msg, self.visualize_normal_button):
-            self._call_trigger(self.toggle_normal_estimation_viz_client, 'toggle_normal_estimation_viz')
+        if self._rising_edge(msg, prev_msg, self.zivid_capture_button):
+            self._call_trigger(self.scanning_and_reconstruction_client, 'zivid_capture')
         if self._rising_edge(msg, prev_msg, self.save_data_button):
             self._call_trigger(self.toggle_save_data_client, 'toggle_save_data')
         if self._rising_edge(msg, prev_msg, self.autofocus_record_button):
@@ -303,6 +364,8 @@ class TeleopNode(Node):
         if self._rising_edge(msg, prev_msg, self.disable_controllers_button):
             self._call_trigger(self.disable_orientation_control_client, 'disable_orientation_control')
             self._call_trigger(self.disable_autofocus_client, 'disable_autofocus')
+        if len(self.arms) > 1 and self._rising_edge(msg, prev_msg, self.arm_switch_button):
+            self._switch_arm()
 
         # Check if enable button is pressed (safety feature) or if button is not configured
         if not msg.buttons[self.enable_button] and self.enable_button >= 0:
@@ -361,6 +424,11 @@ class TeleopNode(Node):
             fx += -msg.axes[self.fine_x_axis] * self.fine_force_scale
         if self.fine_y_axis >= 0:
             fy += -msg.axes[self.fine_y_axis] * self.fine_force_scale
+        if self.active_arm == 1:
+            if self.secondary_invert_x:
+                fx = -fx
+            if self.secondary_invert_y:
+                fy = -fy
         # fz_push = (1.0 - fz_raw_push) / 2.0 *  self.force_scale
         # fz_pull = (1.0 - fz_raw_pull) / 2.0 *  self.force_scale
         # tr_positive = tr_raw_positive * self.torque_scale
@@ -368,6 +436,11 @@ class TeleopNode(Node):
         tr = tr_filtered * self.torque_scale
         tp = tp_filtered * self.torque_scale
         ty = ty_filtered * self.torque_scale
+        if self.active_arm == 1:
+            if self.secondary_invert_pitch:
+                tp = -tp
+            if self.secondary_invert_yaw:
+                ty = -ty
 
         # Update twist message
         self.current_wrench.wrench.force.x = fx
@@ -383,6 +456,39 @@ class TeleopNode(Node):
         self.current_wrench.header.stamp = msg.header.stamp
 
         # self.current_twist.twist.angular.z = wr if not self.invert_z else -wr
+
+    def _switch_arm(self):
+        """Hand the joystick to the other arm. The released arm gets a zero
+        wrench immediately (and every tick after), so it stops instead of
+        holding the last stick command."""
+        self._zero_wrench()
+        released_pub, released_frame, _ = self.arms[self.active_arm]
+        self._zero_msg.header.frame_id = released_frame
+        self._zero_msg.header.stamp = self.get_clock().now().to_msg()
+        released_pub.publish(self._zero_msg)
+
+        self.active_arm = (self.active_arm + 1) % len(self.arms)
+        _, frame_id, label = self.arms[self.active_arm]
+        self.current_wrench.header.frame_id = frame_id
+        self.active_arm_pub.publish(String(data=label))
+        self.get_logger().info(f'Joystick now drives {label} (frame {frame_id})')
+
+        if self.active_arm == 1 and self.secondary_servo_client is not None:
+            if not self.secondary_servo_client.service_is_ready():
+                self.get_logger().warn(
+                    'secondary Servo switch_command_type not available; '
+                    'its Servo may still be in JOINT_JOG and ignore twists.')
+                return
+            future = self.secondary_servo_client.call_async(
+                ServoCommandType.Request(command_type=ServoCommandType.Request.TWIST))
+            future.add_done_callback(self._on_servo_command_type)
+
+    def _on_servo_command_type(self, future):
+        try:
+            if not future.result().success:
+                self.get_logger().warn('secondary Servo refused TWIST command type')
+        except Exception as e:
+            self.get_logger().error(f'secondary Servo switch_command_type raised: {e}')
 
     def apply_deadzone(self, value):
         """
@@ -407,8 +513,15 @@ class TeleopNode(Node):
         # Update timestamp
        # self.current_wrench.header.stamp = self.get_clock().now().to_msg()
 
-        # Publish the message
-        self.wrench_pub.publish(self.current_wrench)
+        # Publish to the active arm; the others get a zero wrench so they stay
+        # stopped (an idle stick already produces this today).
+        for i, (pub, frame_id, _) in enumerate(self.arms):
+            if i == self.active_arm:
+                pub.publish(self.current_wrench)
+            else:
+                self._zero_msg.header.frame_id = frame_id
+                self._zero_msg.header.stamp = self.current_wrench.header.stamp
+                pub.publish(self._zero_msg)
 
     def _on_param_update(self, params):
         for p in params:

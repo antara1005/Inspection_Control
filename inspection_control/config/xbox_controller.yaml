@@ -26,9 +26,12 @@ teleop:
     # (teleop_node owns Joy parsing for the whole cell, orientation_control_node
     # no longer subscribes to /joy directly).
     orientation_control_enable_button: 0   # toggles orientation control on/off
-    visualize_normal_button: 9             # toggles normal-estimation visualization
     save_data_button: 8                    # toggles orientation-control data logging
     orientation_control_node_name: orientation_controller
+
+    # Scanning and reconstruction
+    scanning_and_reconstruction_node_name: scanning_and_reconstruction
+    zivid_capture_button: 9                # triggers Zivid capture
 
     # Buttons that call the autofocus node's Trigger services.
     autofocus_record_button: 2             # (X) toggles peak recording
@@ -36,6 +39,10 @@ teleop:
     autofocus_node_name: autofocus
     # "All stop" (B): disables orientation + autofocus controllers at once.
     disable_controllers_button: 1
+    # (Right stick click) Switch the joystick between the main arm and the Zivid
+    # arm. Only active with dual_arm:=true, where admittance_control.launch.py
+    # sets the secondary_* topic/frame/Servo parameters.
+    arm_switch_button: 10
 
     invert_x: true    # Invert X-axis (left/right)
     invert_y: true   # Invert Y-axis (up/down)
