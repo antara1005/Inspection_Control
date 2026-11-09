@@ -4,13 +4,17 @@ turntable_joy_node:
     jog_speed_deg_per_sec: 30.0
     publish_rate: 20.0
 
-    # Xbox controller button mapping
-    cw_button: 5      # RB - Right Bumper
-    ccw_button: 4     # LB - Left Bumper
+    # The jog buttons and the deadman are controller-specific: they are in
+    # the controller profile (xbox_controller.yaml, 8bitdo_pro2.yaml), which
+    # the launch file loads after this file.
+    # No joystick message for this long: stop jogging.
+    joy_timeout: 0.5
 
     # ROS topics
     joy_topic: "/joy"
-    joint_states_topic: "/joint_states"
+    # Where the jog target is seeded from: the turntable's own topic, which
+    # exists only once its ESP32 reports. /joint_states says 0.0 until then.
+    joint_states_topic: "/turntable/joint_states"
     command_topic: "/turntable_forward_position_controller/commands"
 
     # Controller manager

@@ -1,0 +1,97 @@
+# Controller profile: 8BitDo Pro 2, D-input mode (mode switch on the back:
+# D), over Bluetooth. Select it with controller_config_file:=8bitdo_pro2.yaml
+# (Inspection_System: controller:=8bitdo_pro2.yaml).
+#
+# Measured on the lab PC (kernel 7.0, hid-generic driver, joy_node with
+# SDL_JOYSTICK_HIDAPI=0) with ~/joy_probe, 2026-11-03. Its other modes (X, S,
+# A) and USB report a different layout: re-measure before using one.
+#
+#   joy_node layout (sticks and D-pad: left and up are positive; triggers rest
+#   at 1.0 and read -1.0 fully pulled):
+#     axes     0 left X    1 left Y    2 right X   3 right Y
+#              4 ZR        5 ZL        6 D-pad X   7 D-pad Y
+#     buttons  0 A (right face)   1 B (bottom)   2 right paddle   3 X (top)
+#              4 Y (left)         5 left paddle  6 L    7 R       8 ZL   9 ZR
+#              10 minus  11 plus  12 home  13 left stick  14 right stick
+#              (the Star button produces nothing over Bluetooth)
+#
+# Face buttons are assigned by position, so the controls match the Xbox
+# controller's (Xbox A = bottom = the Pro 2's B, and so on). Scaling,
+# inversions and deadzone are the same as xbox_controller.yaml.
+
+# The joystick node: only open this controller, even with others connected.
+joy:
+  ros__parameters:
+    device_name: "8BitDo Pro 2"
+    deadzone: 0.05
+
+teleop:
+  ros__parameters:
+    publish_rate: 10.0
+
+    # Scaling (a force on the admittance plant: full stick settles at about
+    # 0.05 m/s and 0.2 rad/s).
+    force_scale: 0.60
+    torque_scale: 0.40
+    fine_force_scale: 0.1  # D-pad fine XY nudge
+
+    x_axis: 0              # left stick X
+    y_axis: 1              # left stick Y
+    z_axis: -1
+    z_axis_push: 4         # ZR
+    z_axis_pull: 5         # ZL
+    # Roll: hold R (roll_modifier_button) and the right stick's horizontal
+    # axis rolls instead of yawing.
+    roll_axis_positive: -1
+    roll_axis_negative: -1
+    roll_modifier_button: 7  # R
+    pitch_axis: 3          # right stick Y
+    yaw_axis: 2            # right stick X (roll while R is held)
+    fine_x_axis: 6         # D-pad L/R
+    fine_y_axis: 7         # D-pad U/D
+
+    # Deadman: the arm only moves while L is held, under orientation control
+    # and autofocus too (teleop publishes it on deadman_topic, and admittance
+    # control applies no wrench without it). The button actions below work
+    # without it, so the all-stop button always does.
+    enable_button: 6       # L
+    joy_timeout: 0.5
+
+    orientation_control_enable_button: 1   # B (bottom face): toggle orientation control
+    disable_controllers_button: 0          # A (right face): all stop (orientation + autofocus off)
+    autofocus_record_button: 4             # Y (left face): toggle peak recording
+    autofocus_drive_button: 3              # X (top face): toggle PD drive-to-peak
+    save_data_button: 14                   # right stick click: toggle orientation-control data logging
+    zivid_capture_button: 11               # plus: Zivid capture
+    arm_switch_button: 12                  # home: switch arms (dual_arm)
+
+    orientation_control_node_name: orientation_controller
+    scanning_and_reconstruction_node_name: scanning_and_reconstruction
+    autofocus_node_name: autofocus
+
+    invert_x: true
+    invert_y: true
+    invert_z: false
+    invert_roll: false
+    invert_pitch: false
+    invert_yaw: true
+
+    deadzone: 0.05
+    frame_id: "eoat_camera_link"
+    twist_topic: "/teleop/wrench_cmds"
+    joy_topic: "/joy"
+
+# The turntable jogs on the back paddles, while L (the deadman) is held.
+turntable_joy_node:
+  ros__parameters:
+    ccw_button: 5      # left paddle
+    cw_button: 2       # right paddle
+    enable_button: 6   # L
+
+# Remote teleop: the gate and the Remote Teleop panel use this layout.
+remote_teleop_gate:
+  ros__parameters:
+    layout: "8bitdo_pro2"
+    deadman_button: 6  # L, as enable_button above
+    min_axes: 8
+    min_buttons: 15

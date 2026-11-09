@@ -1,0 +1,58 @@
+# focus_volume_node: the feature front end of the hybrid autofocus (AKAZE-acquire,
+# KLT-sustain, FB-gate-retire; see inspection_control/focus_volume.py and the
+# README, "Focus volume"). Started with the control subsystem (focus_volume:=false
+# leaves it out).
+focus_volume:
+  ros__parameters:
+    image_topic: /pi_camera/image_raw/compressed
+    # Paired with each frame while fresh, so each feature records the distance
+    # it was sharpest at (z_at_max). "" = no distance.
+    distance_topic: /tsdf_pose/focal_distance_m
+    distance_timeout_s: 0.5
+    # Off the real-time cores: the cell is pinned to RT_CPUS (4-7 on the lab
+    # PC), but the control container is not, so this node would otherwise share
+    # them. Matches COMPUTE_CPUS in the lab .env; "" = leave as is.
+    cpu_affinity: "8-23"
+    opencv_threads: 2
+
+    # -- Detection and tracking (half resolution) --
+    track_scale: 0.5
+    grid_cols: 6
+    grid_rows: 6
+    detect_region: [0.0, 0.0, 1.0, 1.0]   # fractions of the frame: x0, y0, x1, y1
+    per_cell: 8
+    refill_below: 0.5
+    max_cells_per_frame: 6
+    full_detect_fraction: 0.5
+    empty_cell_backoff: 15                # frames
+    # Lower finds more, weaker features: calibrate on blurred frames. AKAZE's
+    # usual 0.001 finds next to nothing on the macro camera.
+    akaze_threshold: 0.0001
+    akaze_octaves: 4
+    akaze_octave_layers: 4
+    min_distance: 8.0                     # px at track scale
+    klt_window: 21
+    klt_levels: 3
+    fb_max_error: 1.0                     # px at track scale
+    confirm_frames: 3
+    coast_frames: 5
+
+    # -- Focus per feature (full resolution) --
+    focus_operator: laplacian             # laplacian | tenengrad
+    focus_window: 61                      # px; 31 px is twice as noisy
+    focus_presmooth: 0.0
+    focus_tau: 0.1                        # s
+    focus_rate_tau: 0.3                   # s
+    peak_drop: 0.7
+    trail_frames: 8
+
+    # -- Annotations (Foxglove) --
+    publish_annotations: true
+    annotation_rate_hz: 15.0              # ~17 KiB each
+    annotation_scale: 1.0
+    show_grid: true
+    show_trails: true
+    show_summary: true
+    label_features: 36
+    label_cells: false
+    trend_threshold: 1.0                  # 1/s

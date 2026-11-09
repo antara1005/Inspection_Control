@@ -1,11 +1,13 @@
 # Admittance plant for the second (Zivid) arm, dual_arm:=true. Same dynamics as
-# admittance_control_coupled_pendulum.yaml. That arm has no orientation
+# admittance_control.yaml. That arm has no orientation
 # controller, autofocus or pivot input: those topics have no publisher, so the
 # node runs its free point-mass model driven by teleop alone.
 /zivid/admittance_control:
   ros__parameters:
     publish_rate: 250.0
 
+    # This arm's own virtual sphere (/zivid/admittance_control/virtual_sphere);
+    # no controller follows it.
     sphere_mass: 2.5
     sphere_radius: 0.65
     fluid_viscosity: 1.0
@@ -22,3 +24,19 @@
 
     pivot_topic: "/zivid/orientation_controller/pivot_r"
     pivot_timeout: 0.2
+
+    # Speed clamps on the plant's output twist, per axis (0 = off). Full stick
+    # settles at about 0.05 m/s and 0.2 rad/s with this mass and drag, so these
+    # only catch runaways (e.g. a large controller wrench). The remote teleop
+    # gate lowers them while a remote operator is driving.
+    max_linear_speed: 0.25   # m/s
+    max_angular_speed: 0.8   # rad/s
+
+    # A teleop wrench older than this counts as zero (teleop stopped publishing).
+    teleop_timeout: 0.5      # s
+
+    # Deadman from teleop: true only while the deadman is held and the
+    # joystick drives this arm. No wrench applies otherwise, or when it is
+    # older than deadman_timeout.
+    deadman_topic: "/zivid/teleop/deadman"
+    deadman_timeout: 0.5     # s

@@ -26,16 +26,12 @@ setup(
     entry_points={
         'console_scripts': [
             'teleop = inspection_control.nodes.teleop_node:main',
-            'focus_monitor = inspection_control.nodes.focus_monitor_node:main',
-            'multi_speed_autofocus = inspection_control.nodes.multi_speed_autofocus_node:main',
             'autofocus_node = inspection_control.nodes.autofocus_node:main',
-            'autofocus_node_old = inspection_control.nodes.autofocus_node_old:main',
+            'focus_volume_node = inspection_control.nodes.focus_volume_node:main',
             'admittance_control_node = inspection_control.nodes.admittance_control_node:main',
-            'admittance_control_coupled_pendulum = inspection_control.nodes.admittance_control_coupled_pendulum:main',
             'orientation_control_node = inspection_control.nodes.orientation_control_node:main',
-            'orientation_control_coupled_pendulum = inspection_control.nodes.orientation_control_coupled_pendulum:main',
             'turntable_joy_node = inspection_control.nodes.turntable_joy_node:main',
-            'tsdf_pose_node = inspection_control.nodes.tsdf_pose_node:main',
+            'remote_teleop_gate = inspection_control.nodes.remote_teleop_gate:main',
             'servo_logger = inspection_control.nodes.servo_logger_node:main',
             'latency_injection = inspection_control.nodes.latency_injection_node:main',
             'latency_analysis = inspection_control.latency_analysis:main',

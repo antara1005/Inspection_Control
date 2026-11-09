@@ -1,7 +1,7 @@
 pd_controller:
   ros__parameters:
-    depth_topic: /camera/d405_camera/depth/image_rect_raw
-    camera_info_topic: /camera/d405_camera/depth/camera_info #intrinsics info
+    depth_topic: /eoat_stereo/depth/image_rect_raw
+    camera_info_topic: /eoat_stereo/depth/camera_info #intrinsics info
     bounding_box_topic: /viewpoint_generation/bounding_box_marker #bounding box topic
     #depth map filtering range
     dmap_filter_min: 0.07

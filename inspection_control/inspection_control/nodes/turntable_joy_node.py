@@ -4,7 +4,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Joy, JointState
 from std_msgs.msg import Float64MultiArray
 from controller_manager_msgs.srv import SwitchController, ListControllers
@@ -21,8 +21,17 @@ class TurntableJoyNode(Node):
         self.declare_parameter('publish_rate', 20.0)
         self.declare_parameter('cw_button', 5)   # RB
         self.declare_parameter('ccw_button', 4)  # LB
+        # Deadman: the jog buttons only count while this button is held
+        # (-1 = no deadman).
+        self.declare_parameter('enable_button', -1)
+        # No Joy message for this long (s): stop jogging, so a lost joystick
+        # or remote link can't leave the turntable turning. 0 disables it.
+        self.declare_parameter('joy_timeout', 0.5)
         self.declare_parameter('joy_topic', '/joy')
-        self.declare_parameter('joint_states_topic', '/joint_states')
+        # The turntable's own topic (its ESP32, via micro-ROS), not /joint_states:
+        # joint_state_broadcaster reports the joint as 0.0 until the ESP32 does,
+        # and seeding from that would jog the table from 0 deg.
+        self.declare_parameter('joint_states_topic', '/turntable/joint_states')
         self.declare_parameter('command_topic',
                                '/turntable_forward_position_controller/commands')
         self.declare_parameter('switch_controller_service',
@@ -42,6 +51,9 @@ class TurntableJoyNode(Node):
         self.publish_rate = self.get_parameter('publish_rate').value
         self.cw_button = self.get_parameter('cw_button').value
         self.ccw_button = self.get_parameter('ccw_button').value
+        self.enable_button = int(self.get_parameter('enable_button').value)
+        self.joy_timeout = float(self.get_parameter('joy_timeout').value)
+        self._last_joy_time = None
         joy_topic = self.get_parameter('joy_topic').value
         joint_states_topic = self.get_parameter('joint_states_topic').value
         command_topic = self.get_parameter('command_topic').value
@@ -75,8 +87,10 @@ class TurntableJoyNode(Node):
         )
 
         # Subscriptions
+        # Best effort: the ESP32 publishes best effort (and this still matches
+        # reliable publishers).
         self.joint_states_sub = self.create_subscription(
-            JointState, joint_states_topic, self.joint_states_cb, qos_profile
+            JointState, joint_states_topic, self.joint_states_cb, qos_profile_sensor_data
         )
         self.create_subscription(
             Joy, joy_topic, self.joy_cb, qos_profile
@@ -201,15 +215,19 @@ class TurntableJoyNode(Node):
             pass
 
     def joy_cb(self, msg: Joy):
-        if len(msg.buttons) <= max(self.cw_button, self.ccw_button):
+        needed = max(self.cw_button, self.ccw_button, self.enable_button)
+        if len(msg.buttons) <= needed:
             self.get_logger().warn(
                 f'Joy message has only {len(msg.buttons)} buttons, '
-                f'need at least {max(self.cw_button, self.ccw_button) + 1}',
+                f'need at least {needed + 1}',
                 throttle_duration_sec=5.0
             )
+            self.cw_pressed = self.ccw_pressed = False
             return
-        self.cw_pressed = bool(msg.buttons[self.cw_button])
-        self.ccw_pressed = bool(msg.buttons[self.ccw_button])
+        self._last_joy_time = self.get_clock().now()
+        enabled = self.enable_button < 0 or bool(msg.buttons[self.enable_button])
+        self.cw_pressed = enabled and bool(msg.buttons[self.cw_button])
+        self.ccw_pressed = enabled and bool(msg.buttons[self.ccw_button])
 
     def timer_cb(self):
         if not self.controller_ready:
@@ -217,6 +235,15 @@ class TurntableJoyNode(Node):
 
         if not self.position_seeded:
             return
+
+        # No joystick input for joy_timeout: stop jogging.
+        if (self.joy_timeout > 0.0 and self._last_joy_time is not None
+                and (self.cw_pressed or self.ccw_pressed)):
+            age = (self.get_clock().now() - self._last_joy_time).nanoseconds * 1e-9
+            if age > self.joy_timeout:
+                self.cw_pressed = self.ccw_pressed = False
+                self.get_logger().warn(
+                    f'No joystick input for {age:.2f} s: stopped jogging the turntable')
 
         # Update target
         if self.cw_pressed:

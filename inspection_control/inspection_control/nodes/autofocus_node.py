@@ -22,7 +22,8 @@ Two stages:
   controller that drives the focal distance to that recorded peak by publishing a
   WrenchStamped force along the camera optical (z) axis into the admittance node.
   The plant is the admittance node's virtual point mass with Stokes drag
-  (``m d'' + c d' = F``, ``c = 6 pi mu r``), mirroring how the orientation
+  (``m d'' + c d' = F``, ``c = 6 pi mu r``), taken from admittance_control's
+  ~/virtual_sphere (see inspection_control/virtual_sphere.py), mirroring how the orientation
   controller derives its gains from the system dynamics — but translational
   (no pivot / parallel-axis term).
 """
@@ -50,6 +51,7 @@ import tf2_ros
 
 import inspection_control.focus_metrics as focus_metrics
 from inspection_control.sweep_log import SweepLogger
+from inspection_control.virtual_sphere import DEFAULT_TOPIC as SPHERE_TOPIC, SphereFollower
 
 
 class AutofocusNode(Node):
@@ -86,11 +88,9 @@ class AutofocusNode(Node):
                 # ~/disable_autofocus), rather than this node parsing raw Joy.
                 # Keeps all button-index/array-bounds handling in teleop_node.
                 ('control_rate', 50.0),     # Hz, PD control loop
-                # Plant dynamics — must match the admittance node so the PD gains
-                # reflect the real virtual plant (m d'' + c d' = F).
-                ('sphere_mass', 2.5),
-                ('sphere_radius', 0.65),
-                ('fluid_viscosity', 1.0),
+                # Plant dynamics (m d'' + c d' = F): admittance_control's
+                # virtual sphere, which it owns and publishes on this topic.
+                ('virtual_sphere_topic', SPHERE_TOPIC),
                 # PD pole-placement tuning
                 ('zeta', 1.0),              # closed-loop damping ratio (>=1)
                 ('v_max', 0.05),            # m/s, focal-axis speed budget
@@ -156,9 +156,6 @@ class AutofocusNode(Node):
         self.frame_id = gp('frame_id').get_parameter_value().string_value
         self.wrench_topic = gp('wrench_topic').get_parameter_value().string_value
         self.control_rate = float(gp('control_rate').value)
-        self.sphere_mass = float(gp('sphere_mass').value)
-        self.sphere_radius = float(gp('sphere_radius').value)
-        self.fluid_viscosity = float(gp('fluid_viscosity').value)
         self.zeta = float(gp('zeta').value)
         self.v_max = float(gp('v_max').value)
         self.max_distance_error = float(gp('max_distance_error').value)
@@ -174,8 +171,9 @@ class AutofocusNode(Node):
         self.run_label = gp('run_label').get_parameter_value().string_value
         self.d_star_m = float(gp('d_star_m').value)
         self.pose_reference_frame = gp('pose_reference_frame').get_parameter_value().string_value
-        # Plant: virtual point mass with Stokes drag (same as admittance node).
-        self.linear_drag = 6.0 * math.pi * self.fluid_viscosity * self.sphere_radius
+        # Plant: admittance_control's virtual sphere (a point mass with Stokes
+        # drag here). None until its first message; no force until then.
+        self.sphere_follower = SphereFollower(self, gp('virtual_sphere_topic').value)
 
         self.bridge = CvBridge()
 
@@ -279,7 +277,7 @@ class AutofocusNode(Node):
             f"autofocus up — metric={self.focus_metric}, "
             f"image_topic={self.image_topic}, distance_topic={self.distance_topic}, "
             f"visualize={self.visualize}; control: wrench_topic={self.wrench_topic}, "
-            f"m={self.sphere_mass}, c={self.linear_drag:.4f}")
+            f"plant from {self.sphere_follower.topic}")
 
     # ----------------------------------------------------------------------
     # Subscriptions
@@ -588,6 +586,11 @@ class AutofocusNode(Node):
             return
         if self.target_distance is None or self._latest_distance is None:
             return
+        sphere = self.sphere_follower.sphere
+        if sphere is None:
+            self.sphere_follower.warn_missing('holding zero force')
+            self._publish_force(0.0)
+            return
 
         # Stale-data guard. If the distance producer stalls, _latest_distance and
         # _dist_rate both freeze, so `err` never changes and the deadband below can
@@ -627,21 +630,21 @@ class AutofocusNode(Node):
             return
         self._within_tol = False
 
-        kp, kd = self._pd_gains()
+        kp, kd = self._pd_gains(sphere)
         u = kp * err + kd * self._dist_rate
-        f_max = self.linear_drag * self.v_max
+        f_max = sphere.linear_drag * self.v_max
         force = self.focus_axis_sign * u
         force = max(-f_max, min(f_max, force))  # saturate to speed budget
         self._publish_force(force)
 
-    def _pd_gains(self):
-        """Pole-placement PD gains for the plant  m d'' + c d' = F.
+    def _pd_gains(self, sphere):
+        """Pole-placement PD gains for the plant  m d'' + c d' = F (`sphere`).
 
         Kp = m * p1*p2,  Kd = -m*(p1+p2) - c, with poles from (zeta, omega_n);
         omega_n is capped by the force/speed budget like the orientation node.
         """
-        m = max(self.sphere_mass, 1e-9)
-        c = self.linear_drag
+        m = max(sphere.mass, 1e-9)
+        c = sphere.linear_drag
         f_max = c * self.v_max
         omega_n = math.sqrt(max(f_max, 1e-12)
                             / (m * max(self.max_distance_error, 1e-6)))
@@ -839,10 +842,6 @@ class AutofocusNode(Node):
                 self.run_label = str(p.value)
             elif p.name == 'd_star_m':
                 self.d_star_m = float(p.value)
-            elif p.name in ('sphere_mass', 'sphere_radius', 'fluid_viscosity'):
-                setattr(self, p.name, float(p.value))
-                self.linear_drag = (6.0 * math.pi * self.fluid_viscosity
-                                    * self.sphere_radius)
         return SetParametersResult(successful=True)
 
 

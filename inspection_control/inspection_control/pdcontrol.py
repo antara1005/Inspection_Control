@@ -22,7 +22,7 @@ from visualization_msgs.msg import Marker
 from geometry_msgs.msg import PoseStamped, Quaternion
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from viewpoint_generation_interfaces.msg import OrientationControlData
+from inspection_control_interfaces.msg import OrientationControlData
 from geometry_msgs.msg import Point, Vector3
 
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
@@ -161,8 +161,8 @@ class OrientationControlNode(Node):
         timer_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ---- Parameters ----
-        self.declare_parameter('depth_topic', '/camera/d405_camera/depth/image_rect_raw')
-        self.declare_parameter('camera_info_topic', '/camera/d405_camera/depth/camera_info')
+        self.declare_parameter('depth_topic', '/eoat_stereo/depth/image_rect_raw')
+        self.declare_parameter('camera_info_topic', '/eoat_stereo/depth/camera_info')
         self.declare_parameter('bounding_box_topic', '/viewpoint_generation/bounding_box_marker')
         self.declare_parameter('dmap_filter_min', 0.07)
         self.declare_parameter('dmap_filter_max', 0.50)
@@ -253,7 +253,7 @@ class OrientationControlNode(Node):
         self.writer = SequentialWriter()
         self.topic_info = TopicMetadata(
             name='orientation_control_data',
-            type='viewpoint_generation_interfaces/msg/OrientationControlData',
+            type='inspection_control_interfaces/msg/OrientationControlData',
             serialization_format='cdr')
         # Live tuning
         self.add_on_set_parameters_callback(self._on_param_update)
@@ -284,11 +284,11 @@ class OrientationControlNode(Node):
 
         # Pubs
         self.eoat_pointcloud_publisher = self.create_publisher(
-            PointCloud2, f'/camera/d405_camera/depth/eoat_points_{self.main_camera_frame}_bbox', 10
+            PointCloud2, f'/eoat_stereo/depth/eoat_points_{self.main_camera_frame}_bbox', 10
         ) if self.publish_pointcloud else None
 
         self.fov_pointcloud_publisher = self.create_publisher(
-            PointCloud2, f'/camera/d405_camera/depth/fov_points_{self.main_camera_frame}_bbox', 10
+            PointCloud2, f'/eoat_stereo/depth/fov_points_{self.main_camera_frame}_bbox', 10
         ) if self.publish_pointcloud else None
         self.normal_estimate_pub = self.create_publisher(
             PoseStamped, f'/{self.get_name()}/crop_normal', 10
@@ -728,7 +728,7 @@ class OrientationControlNode(Node):
                 if self.publish_pointcloud:
                     if self.fov_pointcloud_publisher is None:
                         self.fov_pointcloud_publisher = self.create_publisher(
-                            PointCloud2, f'/camera/d405_camera/depth/fov_points_{self.main_camera_frame}_bbox', 10
+                            PointCloud2, f'/eoat_stereo/depth/fov_points_{self.main_camera_frame}_bbox', 10
                         )
                 if not self.publish_pointcloud:
                     self.fov_pointcloud_publisher = None
@@ -743,7 +743,7 @@ class OrientationControlNode(Node):
                     if self.publish_pointcloud:
                         # Recreate out publisher with new name
                         self.fov_pointcloud_publisher = self.create_publisher(
-                            PointCloud2, f'/camera/d405_camera/depth/fov_points_{self.main_camera_frame}_bbox', 10)
+                            PointCloud2, f'/eoat_stereo/depth/fov_points_{self.main_camera_frame}_bbox', 10)
             elif p.name == 'crop_radius':
                 self.crop_radius = float(p.value)
             elif p.name == 'crop_z_min':

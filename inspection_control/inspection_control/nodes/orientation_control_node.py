@@ -5,7 +5,9 @@ import cv2
 import open3d as o3d
 import numpy.linalg as LA
 import copy
+import json
 import os
+import re
 import threading
 
 from scipy.linalg import expm
@@ -14,6 +16,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.duration import Duration
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import Vector3Stamped
 from geometry_msgs.msg import WrenchStamped, TwistStamped
 
@@ -21,6 +24,7 @@ from sensor_msgs import msg
 from sensor_msgs.msg import JointState
 
 from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.srv import SetParametersAtomically
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import Header, Float64, String
@@ -31,7 +35,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from geometry_msgs.msg import AccelStamped
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from viewpoint_generation_interfaces.msg import OrientationControlData
+from inspection_control_interfaces.msg import OrientationControlData
 from geometry_msgs.msg import PointStamped, Point, Vector3
 from sensor_msgs.msg import Imu
 from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
@@ -43,6 +47,85 @@ from inspection_control.debag_orientation_data import debag
 from inspection_control.surface_patch import (
     transform_points_normals, estimate_patch_normal, nearest_axis_point)
 from inspection_control.kdl_jacobian import KdlChain, KDL_AVAILABLE, KDL_IMPORT_ERROR
+from inspection_control.virtual_sphere import DEFAULT_TOPIC as SPHERE_TOPIC, SphereFollower
+
+# What ~/set_tuning may set: the parameters the lab's Foxglove bridge can reach
+# (it admits ~/set_tuning, never ~/set_parameters). All are applied live by
+# _on_param_update and checked by PARAM_CHECKS. Not here: frames and topics;
+# Kp/Ki/Kd (pole placement recomputes them every cycle); integral_alpha,
+# anti_windup_enabled, d_min and d_max (unused); orientation_control_enabled
+# (~/enable_ and ~/disable_orientation_control); save_data (~/toggle_save_data);
+# data_path; visualize_normal_estimation (opens a window on the lab PC).
+TUNABLE_PARAMETERS = frozenset([
+    'controller_type', 'zeta', 'v_max', 'theta_max_deg', 'ie_clamp',
+    'roll_control_enabled',
+    'surface_source', 'normal_estimation_method', 'crop_radius', 'crop_z_min', 'crop_z_max',
+    'surface_min_points', 'dmap_filter_min', 'dmap_filter_max', 'standoff_mode', 'standoff_m',
+    'no_target_timeout_s', 'ema_enable', 'ema_tau',
+    'kalman_enabled', 'kalman_model', 'kalman_r', 'kalman_q_angle', 'kalman_q_dangle',
+    'kalman_q_ddangle', 'adaptive_q_enabled', 'adaptive_q_tau_thresh', 'adaptive_q_w_thresh',
+    'adaptive_q_scale_moving',
+    'object',
+])
+
+
+def _number(pred, message):
+    def check(v):
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and pred(v))
+    return check, message
+
+
+def _choice(*options):
+    def check(v):
+        return str(v).lower() in {o.lower() for o in options}
+    return check, 'must be one of ' + ', '.join(options)
+
+
+# Values the controller can't run on, refused before anything is applied (any
+# setter: ~/set_tuning, ros2 param set, a YAML loaded later). zeta < 1,
+# v_max <= 0 or theta_max_deg = 0 used to raise in the pole placement and stop
+# the node.
+PARAM_CHECKS = {
+    'zeta': _number(lambda v: v >= 1.0, 'must be >= 1 (the poles are placed real)'),
+    'v_max': _number(lambda v: v > 0.0, 'must be > 0'),
+    'theta_max_deg': _number(lambda v: 0.0 < v <= 180.0, 'must be in (0, 180]'),
+    'ie_clamp': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'crop_radius': _number(lambda v: v > 0.0, 'must be > 0'),
+    'crop_z_min': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'crop_z_max': _number(lambda v: v > 0.0, 'must be > 0'),
+    'dmap_filter_min': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'dmap_filter_max': _number(lambda v: v > 0.0, 'must be > 0'),
+    'surface_min_points': _number(lambda v: v >= 1, 'must be >= 1'),
+    'standoff_m': _number(lambda v: v > 0.0, 'must be > 0'),
+    'no_target_timeout_s': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'ema_tau': _number(lambda v: v > 0.0, 'must be > 0'),
+    'kalman_r': _number(lambda v: v > 0.0, 'must be > 0'),
+    'kalman_q_angle': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'kalman_q_dangle': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'kalman_q_ddangle': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'adaptive_q_tau_thresh': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'adaptive_q_w_thresh': _number(lambda v: v >= 0.0, 'must be >= 0'),
+    'adaptive_q_scale_moving': _number(lambda v: v > 0.0, 'must be > 0'),
+    'controller_type': _choice('PD', 'PID'),
+    'kalman_model': _choice('PLANT', 'KKF', 'CA'),
+    'normal_estimation_method': _choice('PCA', 'RANSAC'),
+    'surface_source': _choice('depth', 'cloud', 'frame'),
+    'standoff_mode': _choice('euclidean', 'along_normal', 'fixed'),
+    # It names the bag file: no paths.
+    'object': (lambda v: isinstance(v, str)
+               and re.fullmatch(r'([A-Za-z0-9_-][A-Za-z0-9._-]*)?', v) is not None,
+               'may only use letters, digits, ".", "_" and "-" (it names the bag file)'),
+}
+
+
+def _finite_or_none(x, digits=None):
+    if x is None:
+        return None
+    x = float(x)
+    if not math.isfinite(x):
+        return None
+    return round(x, digits) if digits is not None else x
 
 class AngleKalmanFilterKKF:
     """
@@ -696,8 +779,8 @@ class OrientationControlNode(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('depth_topic', '/camera/d405_camera/depth/image_rect_raw/compressed'),
-                ('camera_info_topic', '/camera/d405_camera/depth/camera_info'),
+                ('depth_topic', '/eoat_stereo/depth/image_rect_raw/compressedDepth'),
+                ('camera_info_topic', '/eoat_stereo/depth/camera_info'),
                 ('bounding_box_topic', '/viewpoint_generation/bounding_box_marker'),
                 ('dmap_filter_min', 0.07),
                 ('dmap_filter_max', 0.50),
@@ -718,6 +801,11 @@ class OrientationControlNode(Node):
                 # (fused surface cloud with normals on surface_cloud_topic).
                 ('surface_source', 'depth'),
                 ('surface_cloud_topic', '/perception/surface_cloud'),
+                # 'frame' source: consume the tsdf_pose producer's surface-normal TF
+                # directly (its +Z is the into-surface normal, matching this node's
+                # convention) instead of estimating from depth/cloud. EMA/Kalman stay
+                # here. Off by default; set surface_source:=frame to enable.
+                ('surface_normal_source_frame', 'macro_surface_normal'),
                 ('surface_max_angle_deg', 30.0),
                 # Min points in the optical-axis patch for a valid measurement.
                 # Lower this if a small crop_radius starves the patch.
@@ -728,12 +816,16 @@ class OrientationControlNode(Node):
                 ('visualize_normal_estimation', False),
                 ('no_target_timeout_s', 0.25),
                 ('orientation_control_enabled', False),
+                # Roll control keeps the camera's roll (zx plane vs world xy)
+                # constant during teleoperation. Independent of pitch/yaw so it
+                # can stay always-on; default True.
+                ('roll_control_enabled', True),
                 ('save_data', False),
                 ('data_path', '/tmp'),
                 ('object', ''),
-                ('sphere_mass', 5.0),
-                ('sphere_radius', 0.1),
-                ('fluid_viscosity', 0.0010016),
+                # The plant (virtual sphere) comes from admittance_control,
+                # which owns sphere_mass/sphere_radius/fluid_viscosity.
+                ('virtual_sphere_topic', SPHERE_TOPIC),
                 ('d_min', 0.15),
                 ('d_max', 0.30),
                 ('v_max', 0.10),
@@ -792,6 +884,8 @@ class OrientationControlNode(Node):
         self.standoff_mode = str(self.get_parameter('standoff_mode').value).lower()
         self.surface_source = str(self.get_parameter('surface_source').value).lower()
         self.surface_cloud_topic = str(self.get_parameter('surface_cloud_topic').value)
+        self.surface_normal_source_frame = str(
+            self.get_parameter('surface_normal_source_frame').value)
         self.surface_max_angle_deg = float(self.get_parameter('surface_max_angle_deg').value)
         self.surface_min_points = int(self.get_parameter('surface_min_points').value)
         self.ema_enable = bool(self.get_parameter('ema_enable').value)
@@ -863,6 +957,7 @@ class OrientationControlNode(Node):
         self._had_target_last_cycle = False
         self._last_target_time_s = None
         self.orientation_control_enabled = bool(self.get_parameter('orientation_control_enabled').value)
+        self.roll_control_enabled = bool(self.get_parameter('roll_control_enabled').value)
 
         # save data parameters
         self.save_data = bool(self.get_parameter('save_data').value)
@@ -874,14 +969,15 @@ class OrientationControlNode(Node):
         self.topic_info = TopicMetadata(
             id=0,
             name='orientation_control_data',
-            type='viewpoint_generation_interfaces/msg/OrientationControlData',
+            type='inspection_control_interfaces/msg/OrientationControlData',
             serialization_format='cdr'
         )
 
-        self.mass_B = float(self.get_parameter('sphere_mass').value)
-        self.sphere_radius = float(self.get_parameter('sphere_radius').value)
-        self.fluid_viscosity = float(self.get_parameter('fluid_viscosity').value)
-        self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
+        # The plant the gains are placed on: admittance_control's virtual
+        # sphere. None until its first message; the controller holds a zero
+        # wrench until then.
+        self.sphere_follower = SphereFollower(
+            self, str(self.get_parameter('virtual_sphere_topic').value))
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -964,6 +1060,16 @@ class OrientationControlNode(Node):
         # raw Joy messages itself. Keeps button-index/array-bounds handling
         # in one place instead of duplicated across every joy consumer.
         self.create_service(Trigger, '~/toggle_orientation_control', self._on_toggle_orientation_control)
+        # Unconditional disable (idempotent) so a single "all stop" button can
+        # force the controller off regardless of its current state.
+        self.create_service(Trigger, '~/disable_orientation_control', self._on_disable_orientation_control)
+        # Idempotent enable, the counterpart of disable: a remote client (the
+        # Foxglove panel) never toggles blind. The arm still moves only while an
+        # operator holds the deadman (admittance_control).
+        self.create_service(
+            Trigger, '~/enable_orientation_control', self._on_enable_orientation_control)
+        # set_parameters_atomically restricted to TUNABLE_PARAMETERS.
+        self.create_service(SetParametersAtomically, '~/set_tuning', self._on_set_tuning)
         self.create_service(Trigger, '~/toggle_normal_estimation_viz', self._on_toggle_normal_estimation_viz)
         self.create_service(Trigger, '~/toggle_save_data', self._on_toggle_save_data)
         self.depth_msg = None
@@ -973,7 +1079,7 @@ class OrientationControlNode(Node):
         self._startup_timer = self.create_timer(0.5, self._check_tf_ready, callback_group=timer_cb_group)
 
         self.point_cloud_publisher = self.create_publisher(
-            PointCloud2, f'/camera/d405_camera/depth/fov_points_{self.main_camera_frame}_bbox', 10
+            PointCloud2, f'/eoat_stereo/depth/fov_points_{self.main_camera_frame}_bbox', 10
         )
         self.normal_estimate_pub = self.create_publisher(PoseStamped, f'/{self.get_name()}/crop_normal', 10)
         self.pub_eoat_pose_crop = self.create_publisher(
@@ -986,6 +1092,8 @@ class OrientationControlNode(Node):
             Vector3Stamped, f'/{self.get_name()}/z_axis_rotvec_error_in_{self.main_camera_frame}', 10
         )
         self.pub_wrench_cmd = self.create_publisher(WrenchStamped, f'/{self.get_name()}/wrench_cmds', 10)
+        # Tier 3: pivot lever arm r (= camera - A, |r| = d) for the coupled-pendulum plant.
+        self.pub_pivot = self.create_publisher(PointStamped, f'/{self.get_name()}/pivot_r', 10)
         self.distance_pub = self.create_publisher(Float64, f'/{self.get_name()}/focal_distance_m', 10)
         # Raw yaw error publisher (rad)
         self.pub_yaw_err_raw = self.create_publisher(Float64, f'/{self.get_name()}/yaw_error_raw', 10
@@ -1082,16 +1190,15 @@ class OrientationControlNode(Node):
 
         self.add_on_set_parameters_callback(self._on_param_update)
 
-    def update_inertia_and_drag(self, mass: float, radius: float, fluid_viscosity: float):
-        I = (2.0 / 5.0) * mass * (radius ** 2)
-        self.inertia_B = I
-
-        self.linear_drag = 6.0 * math.pi * fluid_viscosity * radius
-        self.angular_drag = 2.4 * math.pi * fluid_viscosity * (radius ** 3)
-
-        self.get_logger().info(
-            f'Updated inertia to {self.inertia_B} kg·m² and drag to {self.linear_drag} N·s/m, {self.angular_drag} N·m·s/rad'
-        )
+        # ~/status (std_msgs/String, JSON, latched): what the controller is doing,
+        # for the Foxglove panel. 5 Hz, and at once on enable/disable/recording.
+        self._cycle = {}       # last control cycle's numbers (process_controller)
+        self._last_recording = ''  # debag's output folder (the bag if debag failed)
+        self.status_pub = self.create_publisher(String, '~/status', QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST, depth=1))
+        self.create_timer(0.2, self._publish_status,
+                          callback_group=MutuallyExclusiveCallbackGroup())
 
     def _check_tf_ready(self):
         if self._tf_ready:
@@ -1139,6 +1246,77 @@ class OrientationControlNode(Node):
             response.message = str(e)
         return response
 
+    def _on_enable_orientation_control(self, request, response):
+        try:
+            if not self.orientation_control_enabled:
+                self.enable_orientation_control()
+            response.success = True
+            response.message = f'orientation_control_enabled -> {self.orientation_control_enabled}'
+        except Exception as e:
+            self.get_logger().error(f'enable_orientation_control failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
+
+    def _on_set_tuning(self, request, response):
+        refused = sorted({p.name for p in request.parameters} - TUNABLE_PARAMETERS)
+        if refused:
+            response.result = SetParametersResult(
+                successful=False,
+                reason=f'not settable through ~/set_tuning: {", ".join(refused)}')
+            return response
+        try:
+            response.result = self.set_parameters_atomically(
+                [Parameter.from_parameter_msg(p) for p in request.parameters])
+        except Exception as e:
+            response.result = SetParametersResult(successful=False, reason=str(e))
+        return response
+
+    def _publish_status(self):
+        if getattr(self, 'status_pub', None) is None:
+            return
+        c = self._cycle
+
+        def deg(rad):
+            return None if rad is None else _finite_or_none(math.degrees(rad), 3)
+
+        status = {
+            'enabled': bool(self.orientation_control_enabled),
+            'roll_enabled': bool(self.roll_control_enabled),
+            'tf_ready': bool(self._tf_ready),
+            'plant': self.sphere_follower.sphere is not None,
+            'target': bool(c.get('target', False)),
+            'surface_source': self.surface_source,
+            'normal_method': self.normal_estimation_method,
+            'controller_type': self.controller_type,
+            'kalman_model': self.kalman_model,
+            'pitch_err_deg': deg(c.get('pitch_err')),
+            'yaw_err_deg': deg(c.get('yaw_err')),
+            'roll_err_deg': deg(c.get('roll_err')),
+            'distance_m': _finite_or_none(c.get('d'), 4),
+            'kp': _finite_or_none(c.get('kp'), 5),
+            'ki': _finite_or_none(c.get('ki'), 5),
+            'kd': _finite_or_none(c.get('kd'), 5),
+            'tau_max': _finite_or_none(c.get('tau_max'), 5),
+            'tau': [_finite_or_none(t, 5) for t in c['tau']] if 'tau' in c else None,
+            'saturated': bool(c.get('saturated', False)),
+            'recording': bool(self.save_data),
+            'bag': self.storage_options.uri if self.save_data else '',
+            'last_recording': self._last_recording,
+        }
+        self.status_pub.publish(String(data=json.dumps(status)))
+
+    def _on_disable_orientation_control(self, request, response):
+        try:
+            self.disable_orientation_control()
+            response.success = True
+            response.message = f'orientation_control_enabled -> {self.orientation_control_enabled}'
+        except Exception as e:
+            self.get_logger().error(f'disable_orientation_control failed: {e}')
+            response.success = False
+            response.message = str(e)
+        return response
+
     def _on_toggle_normal_estimation_viz(self, request, response):
         try:
             if self.visualize_normal_estimation:
@@ -1165,7 +1343,9 @@ class OrientationControlNode(Node):
             self.get_logger().error(f'toggle_save_data failed: {e}')
             response.success = False
             response.message = str(e)
+        self._publish_status()
         return response
+
 
     def _on_robot_description(self, msg: String):
         """Build the KDL chain once the latched /robot_description arrives."""
@@ -1610,10 +1790,52 @@ class OrientationControlNode(Node):
         if axis_pt is not None:
             self.distance_pub.publish(Float64(data=float(LA.norm(axis_pt))))
 
+    # ===========================
+    # Frame path (tsdf surface-normal TF -> measurement)
+    # ===========================
+    def _process_surface_normal_frame(self):
+        """Frame-mode measurement: consume the tsdf_pose producer's surface-normal TF
+        directly. Its origin is the surface point and its +Z is the into-surface
+        normal (same convention this node uses), both looked up in the camera frame
+        with CURRENT TF, then handed to the shared _emit_measurement (EMA/errors/goal
+        pose). Stale or missing TF is treated as no measurement."""
+        stamp = self.get_clock().now().to_msg()
+
+        try:
+            T = self.tf_buffer.lookup_transform(
+                self.main_camera_frame, self.surface_normal_source_frame,
+                Time(sec=0, nanosec=0), timeout=Duration(seconds=0.02))
+        except TransformException as e:
+            self.get_logger().warn(
+                f'No TF {self.main_camera_frame} <- {self.surface_normal_source_frame}: {e}',
+                throttle_duration_sec=2.0)
+            self._emit_no_measurement(stamp, None)
+            return
+
+        # Reject a stale frame (producer stopped publishing) so the controller does
+        # not keep driving on a frozen normal.
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        tf_s = float(T.header.stamp.sec) + 1e-9 * float(T.header.stamp.nanosec)
+        if tf_s > 0.0 and (now_s - tf_s) > self.no_target_timeout_s:
+            self.get_logger().warn(
+                f'Surface-normal frame is stale ({now_s - tf_s:.2f}s old); no measurement.',
+                throttle_duration_sec=2.0)
+            self._emit_no_measurement(stamp, None)
+            return
+
+        t = T.transform.translation
+        centroid = np.array([t.x, t.y, t.z], dtype=np.float32)   # surface point, camera frame
+        q = T.transform.rotation
+        R = _quat_to_R_xyzw(q.x, q.y, q.z, q.w)
+        normal = R[:, 2].astype(np.float32)                      # frame +Z = into-surface normal
+
+        self._emit_measurement(centroid, normal, stamp, None)
+
     def on_depth(self, msg: CompressedImage):
         self.depth_msg = msg
-        # In cloud mode the fused surface drives control; skip the live-depth path.
-        if self.surface_source == 'cloud':
+        # In cloud/frame mode the fused surface (or tsdf frame) drives control; skip
+        # the live-depth estimation path.
+        if self.surface_source in ('cloud', 'frame'):
             return
         self.process_depth(msg)
 
@@ -1778,11 +2000,20 @@ class OrientationControlNode(Node):
     # process_controller (CHANGED)
     # ===========================
     def process_controller(self):
+        # No plant model yet: no torque can be placed on it.
+        sphere = self.sphere_follower.sphere
+        if sphere is None:
+            self.sphere_follower.warn_missing('holding a zero wrench')
+            self._cycle = {}
+            self._handle_no_measurement()
+            return
         # In cloud mode, refresh the measurement from the latest fused surface using
         # CURRENT TF before the controller reads it (keeps the camera-frame normal
         # current even when the surface cloud is stale).
         if self.surface_source == 'cloud':
             self._process_surface_cloud()
+        elif self.surface_source == 'frame':
+            self._process_surface_normal_frame()
         with self._measurement_lock:
             has_measurement = self._latest_measurement['valid']
             if has_measurement:
@@ -1836,8 +2067,8 @@ class OrientationControlNode(Node):
                 dyaw_meas = (yaw_err_raw - float(self.last_yaw)) / dt_ctrl
 
 
-            inertia_A = self.inertia_B + self.mass_B * d ** 2
-            b_damping = self.linear_drag * d * d
+            inertia_A = sphere.swing_inertia(d)
+            b_damping = sphere.swing_drag(d)
             # ===== NEW: Simple adaptive Q (screenshot logic) =====
             if self.kalman_enabled and self.adaptive_q_enabled and dt_ctrl > 0.0:
                 pitch_moving = (abs(self._prev_tau_pitch) > self.adaptive_q_tau_thresh)
@@ -1974,27 +2205,28 @@ class OrientationControlNode(Node):
             self.last_pitch = float(pitch_err_raw)
             self.last_yaw = float(yaw_err_raw)
 
-            tau_max = self.linear_drag * d * self.v_max
+            tau_max = sphere.linear_drag * d * self.v_max
             omega_n_max = math.sqrt(tau_max / (inertia_A * self.theta_max_deg * math.pi / 180.0))
             omega_n = omega_n_max
 
             p_1 = -self.zeta * omega_n + omega_n * math.sqrt(self.zeta ** 2 - 1)
             p_2 = -self.zeta * omega_n - omega_n * math.sqrt(self.zeta ** 2 - 1)
-            p_3 = self.integral_alpha * p_2
+            #p_3 = self.integral_alpha * p_2
+            p_3 = 2.0 * p_2
 
             if self.controller_type == 'PD':
                 self.Kp = inertia_A * (p_1 * p_2)
-                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Kd = -inertia_A * (p_1 + p_2) - b_damping
                 self.Ki = 0.0
             elif self.controller_type == 'PID':
                 self.Kp = inertia_A * (p_1 * p_2 + p_1 * p_3 + p_2 * p_3)
-                self.Ki = -inertia_A * (p_1 * p_2 * p_3)
+                self.Ki = (-inertia_A * (p_1 * p_2 * p_3))
                # self.Ki = 0.0  # TEMP: disable I for now to see if it helps with stability
-                self.Kd = -inertia_A * (p_1 + p_2 + p_3) - self.linear_drag * d * d
+                self.Kd = -inertia_A * (p_1 + p_2 + p_3) - b_damping
             else:
                 self.get_logger().warn(f'Unknown controller_type {self.controller_type}, defaulting to PD')
                 self.Kp = inertia_A * (p_1 * p_2)
-                self.Kd = -inertia_A * (p_1 + p_2) - self.linear_drag * d * d
+                self.Kd = -inertia_A * (p_1 + p_2) - b_damping
                 self.Ki = 0.0
 
             tau_pitch_raw = self.Kp * self.pitch_err + self.Ki * self.int_pitch + self.Kd * self.dpitch
@@ -2023,8 +2255,34 @@ class OrientationControlNode(Node):
             elif dt_ctrl > 0.0:
                 self.int_pitch += self.pitch_err * dt_ctrl
                 self.int_yaw += self.yaw_err * dt_ctrl
+            # --- Improved integral handling: conditional + leaky integrator ---
+            # err_i_zone = math.radians(3.0)      # integrate only near target
+            # err_zero_zone = math.radians(0.5)   # clear integral very close to target
+            # leak = 0.90                        # decay old memory
+
+            # if self.Ki > 1e-9 and dt_ctrl > 0.0:
+
+            # # Pitch
+            #   if abs(self.pitch_err) < err_zero_zone and abs(self.dpitch) < math.radians(2.0):
+            #     self.int_pitch = 0.0
+            #   elif (not is_saturated) and abs(self.pitch_err) < err_i_zone:
+            #     self.int_pitch += self.pitch_err * dt_ctrl
+            #   else:
+            #     self.int_pitch *= leak
+
+            # # Yaw
+            #   if abs(self.yaw_err) < err_zero_zone and abs(self.dyaw) < math.radians(2.0):
+            #     self.int_yaw = 0.0
+            #   elif (not is_saturated) and abs(self.yaw_err) < err_i_zone:
+            #     self.int_yaw += self.yaw_err * dt_ctrl
+            #   else:
+            #     self.int_yaw *= leak
+            # else:
+            #   self.int_pitch = 0.0
+            #   self.int_yaw = 0.0
 
             int_lim = float(self.ie_clamp) * (math.pi / 180)
+            #int_lim = math.radians(1.0)
             self.int_pitch = np.clip(self.int_pitch, -int_lim, int_lim)
             self.int_yaw = np.clip(self.int_yaw, -int_lim, int_lim)
 
@@ -2038,33 +2296,47 @@ class OrientationControlNode(Node):
 
             self._prev_tau_pitch = float(tau_pitch)
             self._prev_tau_yaw = float(tau_yaw)
+            self._cycle = {
+                'target': True, 'pitch_err': self.pitch_err, 'yaw_err': self.yaw_err,
+                'roll_err': roll_error, 'd': d, 'kp': self.Kp, 'ki': self.Ki, 'kd': self.Kd,
+                'tau_max': tau_max, 'tau': [tau_pitch, tau_yaw], 'saturated': is_saturated,
+            }
 
+            # ===== Tier 3 (coupled pendulum): emit a PURE swing torque. =====
+            # The pivot mechanics — parallel-axis inertia I_A = I_B + m d^2,
+            # pivot-relative diagonal drag, and the centrifugal/Coriolis coupling —
+            # now live in the coupled-pendulum admittance plant
+            # (admittance_control_node), which integrates them from this
+            # torque plus the surface frame (r, d) published below. No Newton-Euler
+            # feedforward here, so no absolute-velocity-drag algebraic loop.
             tau_theta_vec = np.array([tau_pitch, tau_yaw, 0.0], dtype=np.float32)
-            moment_tele_A = np.cross(r, self.force_teleop)
-
-            force_drag_B = -self.linear_drag * self.lin_vel_cam
-            moment_drag_B = -self.angular_drag * self.rot_vel_cam
-            moment_dragB_A = np.cross(r, force_drag_B)
-            self.ang_acc = (moment_dragB_A + tau_theta_vec + moment_tele_A) / inertia_A
-
             tau_out = tau_theta_vec.copy()
             self._last_tau = tau_theta_vec.copy()
-            self.force_B = self.mass_B * np.cross(self.ang_acc, r) - force_drag_B - self.force_teleop
-            self.tau_B = self.inertia_B * self.ang_acc - moment_drag_B - self.torque_teleop
-            self.tau_B[2] = tau_roll
+
+            self.force_B = np.zeros(3, dtype=np.float32)
+            self.tau_B = np.array([tau_pitch, tau_yaw, tau_roll], dtype=np.float32)
+
+            # Publish the pivot lever arm r (= camera - A, |r| = d) in the camera
+            # frame so the coupled-pendulum plant can build the surface frame.
+            ps = PointStamped()
+            ps.header.stamp = self.get_clock().now().to_msg()
+            ps.header.frame_id = self.main_camera_frame
+            ps.point.x, ps.point.y, ps.point.z = float(r[0]), float(r[1]), float(r[2])
+            self.pub_pivot.publish(ps)
 
             # Cloud mode publishes focal_distance_m from the full cloud in
             # _process_surface_cloud; only the legacy depth path publishes here.
             if self.surface_source != 'cloud':
                 self.distance_pub.publish(Float64(data=float(LA.norm(cen_s))))
         else:
+            self._cycle = {'target': False, 'roll_err': roll_error}
             self._handle_no_measurement()
 
         # Always build and publish wrench with at least roll torque
         w = WrenchStamped()
         w.header.stamp = self.get_clock().now().to_msg()
         w.header.frame_id = self.main_camera_frame
-        w.wrench.torque.z = float(tau_roll) if self.orientation_control_enabled else 0.0
+        w.wrench.torque.z = float(tau_roll) if self.roll_control_enabled else 0.0
 
         if has_measurement:
             if self.orientation_control_enabled:
@@ -2243,13 +2515,23 @@ class OrientationControlNode(Node):
         self.save_data = False
         self.get_logger().info('Data saving DISABLED.')
         self.writer.close()
+        self._last_recording = self.storage_options.uri
         self.get_logger().info(f'Closed bag file.')
-        debag(
-            self.storage_options.uri,
-            sphere_mass=self.mass_B,
-            sphere_radius=self.sphere_radius,
-            fluid_viscosity=self.fluid_viscosity
-        )
+        sphere = self.sphere_follower.sphere
+        if sphere is None:
+            self.get_logger().warn('No virtual sphere received: debag uses its default plant.')
+            debag(self.storage_options.uri)
+            self._last_recording = os.path.splitext(self.storage_options.uri)[0]
+        else:
+            debag(
+                self.storage_options.uri,
+                sphere_mass=sphere.mass,
+                sphere_radius=sphere.radius,
+                fluid_viscosity=sphere.viscosity
+            )
+        # debag writes its CSV and plots to the bag's path without .bag, and
+        # deletes the bag.
+        self._last_recording = os.path.splitext(self.storage_options.uri)[0]
 
     def enable_normal_estimation_viz(self):
         if not self.visualize_normal_estimation:
@@ -2284,12 +2566,31 @@ class OrientationControlNode(Node):
        # self._prev2_tau_yaw = 0.0
 
         self.get_logger().info('Orientation control ENABLED.')
+        self._publish_status()
 
     def disable_orientation_control(self):
         self.orientation_control_enabled = False
         self.get_logger().info('Orientation control DISABLED.')
+        self._publish_status()
+
+    def _check_parameters(self, params):
+        """Why this update can't be applied, or None. Runs before anything is applied."""
+        new = {p.name: p.value for p in params}
+        for name, value in new.items():
+            check = PARAM_CHECKS.get(name)
+            if check is not None and not check[0](value):
+                return f'{name} {check[1]} (got {value!r})'
+        for lo, hi in (('crop_z_min', 'crop_z_max'), ('dmap_filter_min', 'dmap_filter_max')):
+            if lo in new or hi in new:
+                v_lo, v_hi = new.get(lo, getattr(self, lo)), new.get(hi, getattr(self, hi))
+                if not v_lo < v_hi:
+                    return f'{lo} must be below {hi} (got {v_lo} and {v_hi})'
+        return None
 
     def _on_param_update(self, params):
+        problem = self._check_parameters(params)
+        if problem is not None:
+            return SetParametersResult(successful=False, reason=problem)
         for p in params:
             if p.name == 'dmap_filter_min':
                 self.dmap_filter_min = float(p.value); self.get_logger().info(f'dmap_filter_min -> {self.dmap_filter_min:.3f} m')
@@ -2334,7 +2635,15 @@ class OrientationControlNode(Node):
             elif p.name == 'object':
                 self.object = p.value
             elif p.name == 'save_data':
-                self.save_data = p.value
+                # Through the bag writer, as ~/toggle_save_data does: setting the
+                # flag alone wrote to an unopened bag every cycle.
+                try:
+                    if bool(p.value) and not self.save_data:
+                        self.enable_save_data()
+                    elif not bool(p.value) and self.save_data:
+                        self.disable_save_data()
+                except Exception as e:
+                    return SetParametersResult(successful=False, reason=f'save_data: {e}')
             elif p.name == 'data_path':
                 self.data_path = p.value
 
@@ -2344,18 +2653,9 @@ class OrientationControlNode(Node):
                 elif self.orientation_control_enabled and not p.value:
                     self.disable_orientation_control()
 
-            elif p.name == 'sphere_mass' and p.type_ == p.Type.DOUBLE:
-                self.mass_B = float(p.value)
-                self.get_logger().info(f'Updated sphere_mass to {self.mass_B:.3f} kg')
-                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
-            elif p.name == 'sphere_radius' and p.type_ == p.Type.DOUBLE:
-                self.sphere_radius = float(p.value)
-                self.get_logger().info(f'Updated sphere_radius to {self.sphere_radius:.3f} m')
-                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
-            elif p.name == 'fluid_viscosity' and p.type_ == p.Type.DOUBLE:
-                self.fluid_viscosity = float(p.value)
-                self.get_logger().info(f'Updated fluid_viscosity to {self.fluid_viscosity:.6f} Pa·s')
-                self.update_inertia_and_drag(self.mass_B, self.sphere_radius, self.fluid_viscosity)
+            elif p.name == 'roll_control_enabled':
+                self.roll_control_enabled = bool(p.value)
+                self.get_logger().info(f'Updated roll_control_enabled to {self.roll_control_enabled}')
 
             elif p.name == 'v_max' and p.type_ == p.Type.DOUBLE:
                 self.v_max = float(p.value)
@@ -2395,6 +2695,8 @@ class OrientationControlNode(Node):
                 self.yaw_kalman.set_noise(R=float(p.value))
                 self.pitch_kalman_ca.set_noise(R=float(p.value))
                 self.yaw_kalman_ca.set_noise(R=float(p.value))
+                self.pitch_kalman_kkf.set_noise(R=float(p.value))
+                self.yaw_kalman_kkf.set_noise(R=float(p.value))
                 self.get_logger().info(f'Updated kalman_r to {float(p.value):.2e}')
             elif p.name == 'kalman_q_angle':
                 self._kalman_q_angle_base = float(p.value)
@@ -2442,6 +2744,9 @@ class OrientationControlNode(Node):
                 self._kalman_q_ddangle_base = float(p.value)
                 self.pitch_kalman_ca.set_noise(Q_ddangle=self._kalman_q_ddangle_base)
                 self.yaw_kalman_ca.set_noise(Q_ddangle=self._kalman_q_ddangle_base)
+                # KKF takes it as its acceleration-input noise Wa (as at startup).
+                self.pitch_kalman_kkf.set_noise(Wa=self._kalman_q_ddangle_base)
+                self.yaw_kalman_kkf.set_noise(Wa=self._kalman_q_ddangle_base)
                 self.get_logger().info(f'Updated kalman_q_ddangle(base) to {self._kalman_q_ddangle_base:.2e}')
             elif p.name == 'kalman_model':
                 self.kalman_model = str(p.value).upper()

@@ -1,4 +1,19 @@
-# Space Mouse Configuration for TeleopTwistStampedJoy
+# Controller profile: Xbox controller (xpad driver; joy_node with
+# SDL_JOYSTICK_HIDAPI=0). The default; select another with
+# controller_config_file:= (Inspection_System: controller:=).
+#
+# A profile holds everything controller-specific, one section per node: the
+# joystick node (joy), teleop, the turntable jog buttons (turntable_joy_node)
+# and the remote teleop layout (remote_teleop_gate).
+#
+#   joy_node layout:
+#     axes     0 left X  1 left Y  2 LT  3 right X  4 right Y  5 RT  6 D-pad X  7 D-pad Y
+#     buttons  0 A  1 B  2 X  3 Y  4 LB  5 RB  6 View  7 Start  8 Guide  9 left stick  10 right stick
+
+joy:
+  ros__parameters:
+    deadzone: 0.05
+
 teleop:
   ros__parameters:
     # Publishing rate (Hz)
@@ -14,13 +29,25 @@ teleop:
     z_axis: -1
     z_axis_push: 5         # Camera push (Stick Y)
     z_axis_pull: 2         # Camera pull (Stick Y)
-    roll_axis_positive: 5       # Camera roll along positive Z-axis
-    roll_axis_negative: 4       # Camera roll along negative Z-axis
+    # Roll: hold RB (roll_modifier_button) and the right stick's horizontal
+    # axis rolls the camera instead of yawing it. The bumpers used to roll
+    # directly; LB is now the deadman.
+    roll_axis_positive: -1
+    roll_axis_negative: -1
+    roll_modifier_button: 5     # RB
     pitch_axis: 4       # Camera pitch along x-axis
-    yaw_axis: 3         # Camera yaw along yaxis
+    yaw_axis: 3         # Camera yaw along yaxis (roll while RB is held)
     fine_x_axis: 6      # D-pad L/R: right (-1) -> +x, left (+1) -> -x
     fine_y_axis: 7      # D-pad U/D: up (+1) -> -y, down (-1) -> +y
-    enable_button: -1       # Safety button to enable/disable control (-1 fr no safety button)
+
+    # Deadman: the arm only moves while LB is held, under orientation control
+    # and autofocus too (teleop publishes it on deadman_topic, and admittance
+    # control applies no wrench without it). The button actions below (A, B,
+    # X, Y, ...) work without it, so B "all stop" always does.
+    enable_button: 4    # LB
+    # No joystick message for this long: stop (joy_node repeats its last
+    # message at 20 Hz while a stick is held, so silence means it's gone).
+    joy_timeout: 0.5
 
     # Buttons that call orientation_control_node's Trigger services
     # (teleop_node owns Joy parsing for the whole cell, orientation_control_node
@@ -60,4 +87,19 @@ teleop:
     # Topic names
     joy_topic: "/joy"
     twist_topic: "/teleop/wrench_cmds"  # Updated topic for inspection cell
+
+# The turntable jogs on View / Start, while LB (the deadman) is held.
+turntable_joy_node:
+  ros__parameters:
+    ccw_button: 6      # View
+    cw_button: 7       # Start
+    enable_button: 4   # LB
+
+# Remote teleop: the gate and the Remote Teleop panel use this layout.
+remote_teleop_gate:
+  ros__parameters:
+    layout: "xbox"
+    deadman_button: 4  # LB, as enable_button above
+    min_axes: 8
+    min_buttons: 11
 

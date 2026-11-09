@@ -26,10 +26,9 @@ autofocus:
     # services (~/toggle_recording, ~/toggle_driving, ~/disable_autofocus);
     # button indices live in the teleop config, not here.
     control_rate: 50.0        # Hz
-    # Plant dynamics — MUST match admittance_control.yaml (m d'' + c d' = F).
-    sphere_mass: 2.5
-    sphere_radius: 0.65
-    fluid_viscosity: 1.0
+    # Plant dynamics (m d'' + c d' = F): not set here. They come from
+    # admittance_control (admittance_control.yaml), on
+    # /admittance_control/virtual_sphere.
     # PD pole-placement tuning
     zeta: 1.0                 # closed-loop damping ratio (>=1, critically damped)
     v_max: 0.05               # m/s focal-axis speed budget (start small!)

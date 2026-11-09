@@ -1,8 +1,9 @@
+# Orientation controller (orientation_control_node), Tier 3 coupled-pendulum dynamics.
 orientation_controller:
   ros__parameters:
     # depth_topic: /particle_filter/depth/synthetic/compressedDepth
-    depth_topic: /camera/d405_camera/depth/image_rect_raw/compressedDepth
-    camera_info_topic: /camera/d405_camera/depth/camera_info #intrinsics info
+    depth_topic: /eoat_stereo/depth/image_rect_raw/compressedDepth
+    camera_info_topic: /eoat_stereo/depth/camera_info #intrinsics info
     bounding_box_topic: /viewpoint_generation/bounding_box_marker #bounding box topic
     #depth map filtering range
     dmap_filter_min: 0.07
@@ -11,14 +12,14 @@ orientation_controller:
     viz_enable: true
     publish_pointcloud: true
     pcd_downsampling_stride: 4
-    #frame_ids 
+    #frame_ids
     target_frame: object_frame #frame of the target object
     main_camera_frame: eoat_camera_link #frame of the eoat camera
     #cropped parameters in eoat camera frame
     crop_radius: 0.01
     crop_z_min: 0.05
     crop_z_max: 0.40
-    
+
     standoff_m: 0.10 # standoff_value for fixed standoff mode
     standoff_mode: euclidean
     ema_enable: False
@@ -30,7 +31,7 @@ orientation_controller:
     # Surface source for normal estimation.
     #   depth -> legacy single live depth frame (deproject + plane fit)
     #   cloud -> fused surface cloud with normals on surface_cloud_topic
-    surface_source: depth
+    surface_source: frame
     surface_cloud_topic: /perception/surface_cloud
     surface_max_angle_deg: 30.0  # angular outlier rejection for fused normals
     surface_min_points: 10       # min patch points for a valid measurement;
@@ -42,9 +43,9 @@ orientation_controller:
     save_data: False
     object: ''
     data_path: '/data/OrientationControlData'
-    sphere_mass: 2.5 # mass of the object in kg for force control (kg)
-    sphere_radius: 0.65  # Radius of the virtual sphere for admittance control (meters)
-    fluid_viscosity: 1.0  # Viscosity coefficient for damping (Pa·s)
+    # The plant (sphere_mass, sphere_radius, fluid_viscosity) is not set here:
+    # it comes from admittance_control (admittance_control.yaml), on
+    # /admittance_control/virtual_sphere.
 
     d_min: 0.15 # Minimum focal distance (meters)
     d_max: 0.30 # Maximum focal distance (meters)

@@ -19,7 +19,12 @@
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>foxglove_msgs</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>joy</exec_depend>
   <depend>std_msgs</depend>
+  <depend>inspection_control_interfaces</depend>
+  <!-- MoveToPoseStamped (viewpoint traversal's service), used by the autofocus sweeps. -->
+  <depend>viewpoint_generation_interfaces</depend>
   <depend>controller_manager_msgs</depend>
   <depend>moveit_msgs</depend>
   <exec_depend>python3-pykdl</exec_depend>

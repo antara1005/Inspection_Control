@@ -8,7 +8,7 @@ from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import WrenchStamped
-from std_msgs.msg import Header, String
+from std_msgs.msg import Bool, Header, String
 from std_srvs.srv import Trigger
 from moveit_msgs.srv import ServoCommandType
 from rclpy.time import Time
@@ -53,11 +53,26 @@ class TeleopNode(Node):
                 ('invert_pitch', False),  # Invert X-axis for left/right movement
                 ('invert_yaw', False),  # Invert X-axis for left/right movement
                 ('enable_button', 0),  # Safety button to enable/disable control
+                # Held: the yaw axis drives roll instead (yaw is then zero).
+                # -1 = no modifier.
+                ('roll_modifier_button', -1),
+                # No Joy message for this long (s): publish a zero wrench, so a
+                # lost joystick or remote link stops the arm instead of holding
+                # the last command. joy_node must repeat its last message while
+                # the stick is held (autorepeat_rate). 0 disables the check.
+                ('joy_timeout', 0.5),
                 ('deadzone', 0.05),  # Deadzone to prevent drift
                 ('frame_id', 'base_link'),  # Frame ID for TwistStamped
                 ('joy_topic', 'joy'),  # Topic for incoming Joy messages
                 # Topic for outgoing TwistStamped messages
                 ('twist_topic', '/teleop/wrench_cmds'),
+                # Deadman state for the admittance controller (std_msgs/Bool,
+                # every tick, and at once on release): true only while the
+                # joystick is live and enable_button is held (with no
+                # enable_button: while the joystick is live). The admittance
+                # controller applies no wrench at all, orientation control and
+                # autofocus included, unless it is true.
+                ('deadman_topic', '/teleop/deadman'),
                 # Buttons that trigger orientation_control_node actions via
                 # its Trigger services (this node owns all Joy parsing so
                 # button/axis bounds only need to be validated in one place).
@@ -84,6 +99,9 @@ class TeleopNode(Node):
                 ('arm_switch_button', -1),
                 ('secondary_twist_topic', ''),
                 ('secondary_frame_id', ''),
+                # The second arm's deadman topic. Only the arm the joystick
+                # drives gets true.
+                ('secondary_deadman_topic', ''),
                 # Servo node of the second arm. Switching to that arm sets its
                 # command type to TWIST; the main arm's Servo is managed by
                 # task_planning_node.
@@ -144,6 +162,10 @@ class TeleopNode(Node):
             'invert_yaw').get_parameter_value().bool_value
         self.enable_button = self.get_parameter(
             'enable_button').get_parameter_value().integer_value
+        self.roll_modifier_button = self.get_parameter(
+            'roll_modifier_button').get_parameter_value().integer_value
+        self.joy_timeout = self.get_parameter(
+            'joy_timeout').get_parameter_value().double_value
         self.deadzone = self.get_parameter(
             'deadzone').get_parameter_value().double_value
         self.frame_id = self.get_parameter(
@@ -152,6 +174,8 @@ class TeleopNode(Node):
             'joy_topic').get_parameter_value().string_value
         twist_topic = self.get_parameter(
             'twist_topic').get_parameter_value().string_value
+        deadman_topic = self.get_parameter(
+            'deadman_topic').get_parameter_value().string_value
         self.orientation_control_enable_button = self.get_parameter(
             'orientation_control_enable_button').get_parameter_value().integer_value
         scanning_and_reconstruction_node_name = self.get_parameter(
@@ -176,6 +200,8 @@ class TeleopNode(Node):
             'secondary_twist_topic').get_parameter_value().string_value
         secondary_frame_id = self.get_parameter(
             'secondary_frame_id').get_parameter_value().string_value
+        secondary_deadman_topic = self.get_parameter(
+            'secondary_deadman_topic').get_parameter_value().string_value
         secondary_servo_node = self.get_parameter(
             'secondary_servo_node').get_parameter_value().string_value
         self.secondary_invert_x = self.get_parameter(
@@ -195,7 +221,7 @@ class TeleopNode(Node):
             self.orientation_control_enable_button, self.zivid_capture_button,
             self.save_data_button, self.autofocus_record_button,
             self.autofocus_drive_button, self.disable_controllers_button,
-            self.arm_switch_button,
+            self.arm_switch_button, self.roll_modifier_button,
         ) if i >= 0]
         axis_indices = [self.x_axis, self.y_axis, self.pitch_axis, self.yaw_axis,
                         self.fine_x_axis, self.fine_y_axis]
@@ -221,14 +247,24 @@ class TeleopNode(Node):
             qos_profile
         )
 
-        # Output targets, one per arm: (publisher, frame_id, label). Index 0 is
-        # the main arm; self.active_arm selects which one gets the joystick.
-        self.arms = [(self.wrench_pub, self.frame_id, twist_topic)]
+        # Output targets, one per arm: (publisher, frame_id, label, deadman
+        # publisher or None). Index 0 is the main arm; self.active_arm selects
+        # which one gets the joystick.
+        def deadman_pub(topic):
+            return self.create_publisher(Bool, topic, qos_profile) if topic else None
+        self.arms = [(self.wrench_pub, self.frame_id, twist_topic,
+                      deadman_pub(deadman_topic))]
         if secondary_twist_topic:
             self.arms.append((
                 self.create_publisher(WrenchStamped, secondary_twist_topic, qos_profile),
                 secondary_frame_id or self.frame_id,
-                secondary_twist_topic))
+                secondary_twist_topic,
+                deadman_pub(secondary_deadman_topic)))
+        for _, _, label, pub in self.arms:
+            if pub is None:
+                self.get_logger().warn(
+                    f'No deadman topic for {label}: its admittance controller '
+                    'will apply no wrench unless its deadman_topic is empty')
         self.active_arm = 0
         self.secondary_servo_client = self.create_client(
             ServoCommandType, f'{secondary_servo_node}/switch_command_type'
@@ -272,6 +308,10 @@ class TeleopNode(Node):
 
         # Internal state
         self.last_joy_msg = None
+        self._last_joy_time = None   # receive time of the last valid Joy message
+        self._joy_timed_out = False  # for logging the stop once, not every tick
+        self._deadman_held = False   # from the last valid, fresh Joy message
+        self._deadman_msg = Bool()
         self.current_wrench = WrenchStamped()
         self.current_wrench.header.frame_id = self.frame_id
 
@@ -282,7 +322,14 @@ class TeleopNode(Node):
         # Log startup info
         self.get_logger().info(f'Teleop node started')
         self.get_logger().info(f'Publishing at {self.publish_rate} Hz')
-        self.get_logger().info(f'Enable button: {self.enable_button}')
+        no_button = ' (none: the arm moves whenever the joystick is live)'
+        self.get_logger().info(
+            f'Enable (deadman) button: {self.enable_button}'
+            + (no_button if self.enable_button < 0 else '')
+            + f', published on {deadman_topic or "(nothing)"}')
+        self.get_logger().info(
+            f'Joystick timeout: {self.joy_timeout:.2f} s'
+            + (' (disabled)' if self.joy_timeout <= 0.0 else ''))
 
         # ---------------- Parameter update callback ----------------
         self.add_on_set_parameters_callback(self._on_param_update)
@@ -294,6 +341,19 @@ class TeleopNode(Node):
         self.current_wrench.wrench.torque.x = 0.0
         self.current_wrench.wrench.torque.y = 0.0
         self.current_wrench.wrench.torque.z = 0.0
+
+    def _set_deadman(self, held: bool):
+        """Track the deadman; a release goes out at once, not on the next tick."""
+        was = self._deadman_held
+        self._deadman_held = held
+        if was and not held:
+            self._publish_deadman()
+
+    def _publish_deadman(self):
+        for i, (_, _, _, pub) in enumerate(self.arms):
+            if pub is not None:
+                self._deadman_msg.data = self._deadman_held and i == self.active_arm
+                pub.publish(self._deadman_msg)
 
     def _validate_joy_msg(self, msg: Joy) -> bool:
         """Confirm this Joy message has enough buttons/axes for the indices
@@ -345,10 +405,15 @@ class TeleopNode(Node):
             # command, and don't adopt this message as the edge-detection
             # baseline.
             self._zero_wrench()
+            self._set_deadman(False)
             return
 
         prev_msg = self.last_joy_msg
         self.last_joy_msg = msg
+        self._last_joy_time = self.get_clock().now()
+        if self._joy_timed_out:
+            self._joy_timed_out = False
+            self.get_logger().info('Joystick input is back')
 
         if self._rising_edge(msg, prev_msg, self.orientation_control_enable_button):
             self._call_trigger(self.toggle_orientation_control_client, 'toggle_orientation_control')
@@ -367,9 +432,14 @@ class TeleopNode(Node):
         if len(self.arms) > 1 and self._rising_edge(msg, prev_msg, self.arm_switch_button):
             self._switch_arm()
 
-        # Check if enable button is pressed (safety feature) or if button is not configured
-        if not msg.buttons[self.enable_button] and self.enable_button >= 0:
-            # Enable button not pressed - stop the robot
+        # Deadman: with an enable button configured, the arm only moves while
+        # it is held. The admittance controller enforces it for every wrench
+        # (deadman_topic); teleop's own wrench is zeroed here too, since
+        # orientation control also reads it. (The button actions above work
+        # without it, so B "all stop" always does.)
+        held = self.enable_button < 0 or bool(msg.buttons[self.enable_button])
+        self._set_deadman(held)
+        if not held:
             self._zero_wrench()
             return
 
@@ -388,14 +458,23 @@ class TeleopNode(Node):
             fz_raw = fz_raw_up - fz_raw_down if not self.invert_z else fz_raw_down - \
                 fz_raw_up  # range from 1 to -1 like x and y axes
 
-        tr_raw_positive = msg.buttons[self.roll_axis_positive]
-        tr_raw_negative = msg.buttons[self.roll_axis_negative]
-        tr_raw = tr_raw_positive - tr_raw_negative if not self.invert_roll else tr_raw_negative - \
-            tr_raw_positive  # range from 1 to -1 like x and y axes
+        # Roll from a pair of buttons (an index of -1 means unused; reading
+        # msg.buttons[-1] would silently read the last button instead).
+        tr_raw = 0.0
+        if self.roll_axis_positive >= 0:
+            tr_raw += msg.buttons[self.roll_axis_positive]
+        if self.roll_axis_negative >= 0:
+            tr_raw -= msg.buttons[self.roll_axis_negative]
         tp_raw = msg.axes[self.pitch_axis] if not self.invert_pitch else - \
             msg.axes[self.pitch_axis]
         ty_raw = msg.axes[self.yaw_axis] if not self.invert_yaw else - \
             msg.axes[self.yaw_axis]
+        # Roll modifier: while it is held, the yaw axis rolls instead.
+        if self.roll_modifier_button >= 0 and msg.buttons[self.roll_modifier_button]:
+            tr_raw = msg.axes[self.yaw_axis]
+            ty_raw = 0.0
+        if self.invert_roll:
+            tr_raw = -tr_raw  # range from 1 to -1 like x and y axes
 
         # Apply deadzone
         fx_filtered = self.apply_deadzone(fx_raw)
@@ -462,13 +541,14 @@ class TeleopNode(Node):
         wrench immediately (and every tick after), so it stops instead of
         holding the last stick command."""
         self._zero_wrench()
-        released_pub, released_frame, _ = self.arms[self.active_arm]
+        released_pub, released_frame, _, _ = self.arms[self.active_arm]
         self._zero_msg.header.frame_id = released_frame
         self._zero_msg.header.stamp = self.get_clock().now().to_msg()
         released_pub.publish(self._zero_msg)
 
         self.active_arm = (self.active_arm + 1) % len(self.arms)
-        _, frame_id, label = self.arms[self.active_arm]
+        self._publish_deadman()  # the released arm's deadman drops at once
+        _, frame_id, label, _ = self.arms[self.active_arm]
         self.current_wrench.header.frame_id = frame_id
         self.active_arm_pub.publish(String(data=label))
         self.get_logger().info(f'Joystick now drives {label} (frame {frame_id})')
@@ -513,15 +593,28 @@ class TeleopNode(Node):
         # Update timestamp
        # self.current_wrench.header.stamp = self.get_clock().now().to_msg()
 
+        # No joystick input for joy_timeout: stop, rather than repeat the last
+        # command (an unplugged joystick, a crashed joy_node, a lost remote link).
+        if self.joy_timeout > 0.0 and self._last_joy_time is not None:
+            age = (self.get_clock().now() - self._last_joy_time).nanoseconds * 1e-9
+            if age > self.joy_timeout:
+                self._zero_wrench()
+                self._deadman_held = False
+                if not self._joy_timed_out:
+                    self._joy_timed_out = True
+                    self.get_logger().warn(
+                        f'No joystick input for {age:.2f} s: stopping the arm until it is back')
+
         # Publish to the active arm; the others get a zero wrench so they stay
         # stopped (an idle stick already produces this today).
-        for i, (pub, frame_id, _) in enumerate(self.arms):
+        for i, (pub, frame_id, _, _) in enumerate(self.arms):
             if i == self.active_arm:
                 pub.publish(self.current_wrench)
             else:
                 self._zero_msg.header.frame_id = frame_id
                 self._zero_msg.header.stamp = self.current_wrench.header.stamp
                 pub.publish(self._zero_msg)
+        self._publish_deadman()
 
     def _on_param_update(self, params):
         for p in params:

@@ -1,3 +1,4 @@
+from inspection_control.virtual_sphere import VirtualSphere
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,7 +9,7 @@ import csv
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 import pathlib
-from viewpoint_generation_interfaces.msg import OrientationControlData
+from inspection_control_interfaces.msg import OrientationControlData
 from sensor_msgs_py import point_cloud2
 from scipy.linalg import expm
 from scipy.signal import savgol_filter
@@ -586,9 +587,10 @@ def estimate_kalman_noise_parameters(csv_filepath,
     centroid_z = df['centroid_z'].to_numpy(dtype=np.float64)
     d_array = np.sqrt(centroid_x**2 + centroid_y**2 + centroid_z**2).astype(np.float64)
 
-    # Physical params
-    inertia_B   = (2.0 / 5.0) * sphere_mass * (sphere_radius ** 2)
-    linear_drag = 6.0 * np.pi * fluid_viscosity * sphere_radius
+    # Physical params (the virtual sphere the controller ran on)
+    sphere = VirtualSphere(sphere_mass, sphere_radius, fluid_viscosity)
+    inertia_B   = sphere.inertia
+    linear_drag = sphere.linear_drag
 
     def estimate_axis_noise_plant(angle, dangle, tau, t_sec, d_arr, axis_name):
         n = len(angle)
@@ -626,8 +628,8 @@ def estimate_kalman_noise_parameters(csv_filepath,
                 continue
 
             d = float(d_arr[k])
-            I_A = float(inertia_B + sphere_mass * d**2)
-            b = float(linear_drag * d * d)
+            I_A = float(sphere.swing_inertia(d))
+            b = float(sphere.swing_drag(d))
 
             Ad, Bd = discretize_plant(dt, I_A, b)
 
@@ -671,8 +673,8 @@ def estimate_kalman_noise_parameters(csv_filepath,
     is_stationary_dataset = bool(pitch_est['is_stationary'] and yaw_est['is_stationary'])
 
     d_mean = float(np.mean(d_array))
-    I_A_mean = float(inertia_B + sphere_mass * d_mean**2)
-    b_mean = float(linear_drag * d_mean * d_mean)
+    I_A_mean = float(sphere.swing_inertia(d_mean))
+    b_mean = float(sphere.swing_drag(d_mean))
 
     # Plot
     fig, axes = plt.subplots(4, 2, figsize=(14, 16))
